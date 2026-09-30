@@ -21,7 +21,7 @@ on:
       distinct_variant:
         description: Exact distinct diagnostic treatment
         type: choice
-        options: [baseline, memory64, dictionary]
+        options: [baseline, memory64, dictionary, dictionary_reader]
         default: baseline
       profile_ordered_funnel:
         description: Capture ordered funnel diagnostics after timings (extended scenario only)
@@ -91,7 +91,7 @@ jobs:
           if distinct and (profile or experiment):
               raise SystemExit("Distinct profiling cannot combine with funnel profiling")
           if distinct:
-              if inputs.get("distinct_variant", "baseline") not in ("baseline", "memory64", "dictionary"):
+              if inputs.get("distinct_variant", "baseline") not in ("baseline", "memory64", "dictionary", "dictionary_reader"):
                   raise SystemExit("Unsupported distinct diagnostic variant")
               targets = ["trino", "trino_cached"]
           if profile or distinct:
@@ -186,7 +186,8 @@ jobs:
       DUCKGRES_SCENARIO_COVERAGE_TARGET: ${{ matrix.target }}
       DUCKGRES_SCENARIO_PROFILE_DISTINCT: ${{ inputs.profile_distinct || false }}
       DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY: ${{ inputs.profile_distinct && inputs.distinct_variant == 'memory64' && '64MB' || '16MB' }}
-      DUCKGRES_SCENARIO_DISTINCT_DICTIONARY: ${{ inputs.profile_distinct && inputs.distinct_variant == 'dictionary' || false }}
+      DUCKGRES_SCENARIO_DISTINCT_DICTIONARY: ${{ inputs.profile_distinct && (inputs.distinct_variant == 'dictionary' || inputs.distinct_variant == 'dictionary_reader') || false }}
+      DUCKGRES_SCENARIO_DISTINCT_READER_DICTIONARY: ${{ inputs.profile_distinct && inputs.distinct_variant == 'dictionary_reader' || false }}
       DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL: ${{ inputs.profile_ordered_funnel || false }}
       DUCKGRES_SCENARIO_EXPERIMENT_ORDERED_FUNNEL: ${{ inputs.experiment_ordered_funnel || false }}
       DUCKGRES_SCENARIO_PROFILE_RECIPIENT: ${{ (inputs.profile_ordered_funnel || inputs.profile_distinct) && inputs.profile_recipient || '' }}

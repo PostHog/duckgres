@@ -522,3 +522,5 @@ profile or trace capture failures preserve encrypted partial diagnostics and fai
 the run. Distinct runs suppress raw command and pod logs, skip cluster diagnostic
 collection and public scenario summaries, and upload only encrypted profile files.
 No ordinary CSV, event, or raw diagnostic artifact is uploaded. Existing always-run teardown owns cleanup.
+
+The diagnostic `dictionary_reader` distinct variant enables dictionary aggregation and the opt-in page-local reader probe in a compatible experimental image. The `dictionary` variant uses the same aggregation setting with that reader probe disabled. The reader probe defaults to false, applies only to isolated profiling workers, and must not be used with a release image to infer that preservation is enabled. Verify its JVM property and decoded dictionary position metrics. Use the encrypted profile artifacts for comparison; ordinary scenarios do not receive the diagnostic JVM option.

@@ -188,13 +188,15 @@ resolve_distinct_tracing() {
 # Bootstrap and general E2E keep the small fleet. Only comparison clusters
 # use dev-sized workers; both cache modes use the same profile.
 render_trino_template() {
-  local TRINO_DISTINCT_COMMON="" TRINO_DISTINCT_WORKER=""
+  local TRINO_DISTINCT_COMMON="" TRINO_DISTINCT_WORKER="" TRINO_DICTIONARY_PROBE=""
   if [ "${1:-}" = perf ] && [ "${DUCKGRES_SCENARIO_PROFILE_DISTINCT:-false}" = true ]; then
     case "${DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY:-16MB}" in 16MB|64MB) ;; *) echo "Invalid distinct partial budget" >&2; return 1 ;; esac
     case "${DUCKGRES_SCENARIO_DISTINCT_DICTIONARY:-false}" in true|false) ;; *) echo "Invalid distinct dictionary setting" >&2; return 1 ;; esac
     if [[ ! "${DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT:-}" =~ ^https?://[a-zA-Z0-9._:/-]+$ ]]; then
       echo "Distinct profiling requires a valid OTLP HTTP endpoint" >&2; return 1
     fi
+    case "${DUCKGRES_SCENARIO_DISTINCT_READER_DICTIONARY:-false}" in true|false) ;; *) echo "Invalid distinct reader dictionary setting" >&2; return 1 ;; esac
+    TRINO_DICTIONARY_PROBE="    -Dtrino.parquet.dictionary-probe.enabled=${DUCKGRES_SCENARIO_DISTINCT_READER_DICTIONARY:-false}"
     TRINO_DISTINCT_COMMON="    tracing.enabled=true
     otel.exporter.protocol=http/protobuf
     otel.exporter.endpoint=${DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT}
@@ -202,7 +204,7 @@ render_trino_template() {
     optimizer.dictionary-aggregation=${DUCKGRES_SCENARIO_DISTINCT_DICTIONARY:-false}"
     TRINO_DISTINCT_WORKER="    task.max-partial-aggregation-memory=${DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY:-16MB}"
   fi
-  export TRINO_DISTINCT_COMMON TRINO_DISTINCT_WORKER
+  export TRINO_DISTINCT_COMMON TRINO_DISTINCT_WORKER TRINO_DICTIONARY_PROBE
   local TRINO_WORKER_CPU=1 TRINO_WORKER_MEMORY=4Gi TRINO_WORKER_HEAP=3G
   local TRINO_QUERY_MEMORY=6GB TRINO_WORKER_QUERY_MEMORY=2GB
   local TRINO_WORKER_THREADS=24 TRINO_WORKER_MIN_DRIVERS=48
@@ -215,6 +217,7 @@ render_trino_template() {
   export TRINO_QUERY_MEMORY TRINO_WORKER_QUERY_MEMORY TRINO_WORKER_THREADS TRINO_WORKER_MIN_DRIVERS
   envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD $TRINO_WORKER_CPU $TRINO_WORKER_MEMORY $TRINO_WORKER_HEAP $TRINO_QUERY_MEMORY $TRINO_WORKER_QUERY_MEMORY $TRINO_WORKER_THREADS $TRINO_WORKER_MIN_DRIVERS' < "$HERE/manifests.trino.tmpl.yaml" | awk '
     { print }
+    /^    -Xmx/ && ENVIRON["TRINO_DICTIONARY_PROBE"] != "" { print ENVIRON["TRINO_DICTIONARY_PROBE"] }
     /^    coordinator=true$/ && ENVIRON["TRINO_DISTINCT_COMMON"] != "" { print ENVIRON["TRINO_DISTINCT_COMMON"] }
     /^    coordinator=false$/ && ENVIRON["TRINO_DISTINCT_COMMON"] != "" { print ENVIRON["TRINO_DISTINCT_COMMON"]; print ENVIRON["TRINO_DISTINCT_WORKER"] }
   '
@@ -966,6 +969,7 @@ spec:
             - { name: DUCKGRES_SCENARIO_COVERAGE_TARGET, value: "${DUCKGRES_SCENARIO_COVERAGE_TARGET:-}" }
             - { name: DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT, value: "${DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT:-}" }
             - { name: DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY, value: "${DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY:-16MB}" }
+            - { name: DUCKGRES_SCENARIO_DISTINCT_READER_DICTIONARY, value: "${DUCKGRES_SCENARIO_DISTINCT_READER_DICTIONARY:-false}" }
             - { name: DUCKGRES_SCENARIO_DISTINCT_DICTIONARY, value: "${DUCKGRES_SCENARIO_DISTINCT_DICTIONARY:-false}" }
             - { name: DUCKGRES_SCENARIO_PROFILE_DISTINCT, value: "${DUCKGRES_SCENARIO_PROFILE_DISTINCT:-false}" }
             - { name: DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL, value: "${DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL:-false}" }

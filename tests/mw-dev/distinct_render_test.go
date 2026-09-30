@@ -239,3 +239,36 @@ func TestDistinctBenchmarkImageSelection(t *testing.T) {
 		}
 	}
 }
+
+func TestDistinctDictionaryReaderSwitch(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(raw), "render_trino_template() {")
+	end := strings.Index(string(raw)[start:], "\n}\n") + start + 3
+	here, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)[start:end] + "\nrender_trino_template perf\n"
+	for _, value := range []string{"true", "false", "invalid"} {
+		t.Run(value, func(t *testing.T) {
+			cmd := exec.Command("bash", "-c", script)
+			cmd.Env = append(os.Environ(), "HERE="+here, "DUCKGRES_SCENARIO_PROFILE_DISTINCT=true", "DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT=http://collector.example:4318", "DUCKGRES_SCENARIO_DISTINCT_READER_DICTIONARY="+value)
+			output, err := cmd.CombinedOutput()
+			if value == "invalid" {
+				if err == nil {
+					t.Fatal("invalid reader setting accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(string(output), "-Dtrino.parquet.dictionary-probe.enabled="+value) != 2 {
+				t.Fatal("reader switch missing from coordinator or worker JVM")
+			}
+		})
+	}
+}

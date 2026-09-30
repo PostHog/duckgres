@@ -104,8 +104,9 @@ func captureProfile(ctx context.Context, driver perfcore.ProtocolDriver, query p
 	}
 	if os.Getenv("DUCKGRES_SCENARIO_PROFILE_DISTINCT") == "true" {
 		document["diagnostic_configuration"] = map[string]string{
-			"partial_aggregation_memory": os.Getenv("DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY"),
-			"dictionary_aggregation":     os.Getenv("DUCKGRES_SCENARIO_DISTINCT_DICTIONARY"),
+			"partial_aggregation_memory":     os.Getenv("DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY"),
+			"dictionary_aggregation":         os.Getenv("DUCKGRES_SCENARIO_DISTINCT_DICTIONARY"),
+			"reader_dictionary_preservation": os.Getenv("DUCKGRES_SCENARIO_DISTINCT_READER_DICTIONARY"),
 		}
 	}
 	versionQuery := perfcore.Query{PGWireSQL: "SELECT version()"}
