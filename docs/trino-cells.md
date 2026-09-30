@@ -97,6 +97,37 @@ and clear old readiness/failure timestamps and status. Initial selection rejects
 previously provisioned rows. Preserve the backend choice and every warehouse
 storage field, and verify those invariants in the same maintenance transaction.
 
+## Pool alert metrics
+
+`duckgres_trino_pool_serving_instance_info` maps durable `SERVING` rows to their
+stored coordinator and worker Deployment names. Its labels are `pool`,
+`pool_instance`, `workload_namespace`, `coordinator_deployment`, and
+`worker_deployment`. A value of `1` identifies an instance; it does not prove
+that its pods are healthy. Join Kubernetes availability metrics to assess health.
+The workload namespace comes from each instance's immutable blueprint, so old
+instances remain observable when desired placement changes.
+
+`duckgres_trino_pool_min_serving{pool,workload_namespace}` exposes the durable
+configured serving minimum, including snapshots with no serving instances.
+Its namespace label is current desired placement, not each instance's pinned namespace.
+Both metrics belong to the current operator term and disappear on term loss.
+Replacing the snapshot removes departed serving instances rather than retaining
+their labels indefinitely.
+
+`duckgres_trino_pool_configured{pool,workload_namespace}=1` identifies enabled
+pools from this process's startup registry, independently of operator ownership.
+It remains when one pool loses authority and is removed on API shutdown. Pool
+registry additions and removals require a process restart. Aggregate expectations
+by pool; individual serving instances can retain an older pinned namespace.
+
+Require a fresh `duckgres_trino_pool_snapshot_timestamp_seconds` from the same
+scraped control-plane instance before using the inventory. Failed reads retain
+the previous samples without refreshing that timestamp. Alert separately when
+an expected configured pool has no fresh telemetry; absent data is not zero
+healthy instances or evidence that the pool was intentionally disabled.
+Frozen configuration or Gateway failures can stop reconciliation before the
+snapshot is read. Freshness alerts also cover those pauses.
+
 ## Validation
 
 Run `just test-trino`, `just test-trino-opa`, `just test-configstore-integration`,

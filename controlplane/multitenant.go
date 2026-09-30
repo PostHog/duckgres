@@ -886,6 +886,7 @@ func SetupMultiTenant(
 		Addr:    ":8080",
 		Handler: engine,
 	}
+	apiServer.RegisterOnShutdown(trinoPoolMetrics.configurePools(poolOperators))
 	go func() {
 		slog.Info("Starting API server.", "addr", apiServer.Addr)
 		if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

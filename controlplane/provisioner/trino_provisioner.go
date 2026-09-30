@@ -1662,17 +1662,6 @@ func (p *TrinoProvisioner) reconcileBackendCatalogs(
 		}
 		props := p.buildCatalogProperties(o.OrgID, warehouse, duckling)
 		if err := catalog.CreateCatalog(ctx, name, props); err != nil {
-			if p.tenantSecretNotMountedYet(err, o.OrgID) {
-				// Not a failure: the Secret key is projected (checked
-				// above) and the pods just have not seen it yet.
-				slog.Info("Trino reconcile: tenant password file not visible in the Trino pods yet, retrying next tick.",
-					"org", o.OrgID, "catalog", name)
-				outcomes[o.OrgID] = catalogOutcome{
-					Pending:       true,
-					PendingReason: "waiting for the tenant password file to appear in the Trino pods",
-				}
-				continue
-			}
 			perOrgErr := fmt.Errorf("create catalog %s: %w", name, err)
 			errs = append(errs, perOrgErr)
 			outcomes[o.OrgID] = catalogOutcome{Err: perOrgErr}
@@ -1814,40 +1803,6 @@ func (p *TrinoProvisioner) buildCatalogProperties(orgID string, w *configstore.M
 // trinoDuckLakePasswordFileProperty is the DuckLake catalog property naming
 // the in-pod file that holds one tenant's metadata-store password.
 const trinoDuckLakePasswordFileProperty = "ducklake.metadata.connection-password-file"
-
-// tenantSecretNotMountedYet reports whether err is Trino refusing the catalog
-// because this org's password file is not visible inside the Trino pods yet.
-//
-// This is the ordinary onboarding race, not a failure. The provisioner writes
-// the org's key onto the tenant Secret and creates the catalog in the same
-// tick, but the pods read that Secret through a mounted volume, and the
-// kubelet refreshes it on its own sync period — up to a minute or so later.
-// For that window Trino rejects the catalog because the file genuinely is not
-// there, and the next tick succeeds unaided (verified in prod: the org went
-// Ready on its own once the mount caught up).
-//
-// Treating it as a failure is actively misleading: it stamps failed_at and
-// parks a Trino configuration error in status_message for an org that is
-// merely a few seconds early, which is noise for anything watching Trino org
-// state. Reporting Pending says the true thing — still converging.
-//
-// The match is deliberately the single exact sentence Trino emits, built from
-// our own property name and our own computed path, rather than a set of loose
-// substrings. Catalog properties carry tenant-influenced values (bucket names,
-// endpoints) that Trino echoes back in configuration errors, so a loose match
-// could be tripped by an org's own data — the same trap
-// isInstanceFatalError documents for DuckDB's echoed query text. If Trino ever
-// rewords this, the match simply stops firing and the org fails loudly again,
-// which is the pre-existing behavior rather than a new silent state.
-func (p *TrinoProvisioner) tenantSecretNotMountedYet(err error, orgID string) bool {
-	var stmtErr *TrinoStatementError
-	if !errors.As(err, &stmtErr) {
-		return false
-	}
-	return strings.Contains(stmtErr.Message, fmt.Sprintf(
-		"Invalid configuration property %s: file does not exist: %s",
-		trinoDuckLakePasswordFileProperty, p.tenantPasswordFilePath(orgID)))
-}
 
 // tenantPasswordFilePath is the in-pod path of one org's metadata-store
 // password, i.e. the key <orgID> of the mounted TrinoTenantSecretName.
@@ -2946,20 +2901,4 @@ func (p *TrinoProvisioner) upsertConfigMap(ctx context.Context, name string, dat
 		return fmt.Errorf("update configmap %s: %w", name, err)
 	}
 	return nil
-}
-
-// TrinoStatementError is a statement the coordinator rejected, carrying
-// Trino's own error classification instead of flattening it into a string.
-//
-// It exists so callers can branch on WHAT Trino objected to rather than
-// grepping a wrapped error chain. Error() reproduces the previous flattened
-// text verbatim, so logs and status messages are unchanged.
-type TrinoStatementError struct {
-	ErrorName string
-	ErrorType string
-	Message   string
-}
-
-func (e *TrinoStatementError) Error() string {
-	return fmt.Sprintf("trino: %s (%s): %s", e.ErrorName, e.ErrorType, e.Message)
 }

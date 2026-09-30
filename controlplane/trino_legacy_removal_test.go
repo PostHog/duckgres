@@ -3,10 +3,24 @@
 package controlplane
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
+
+func TestTrinoRejectsRetiredCoordinatorCatalogRetryCode(t *testing.T) {
+	data, err := os.ReadFile("provisioner/trino_provisioner.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, removed := range []string{"TrinoStatementError", "tenantSecretNotMountedYet"} {
+		if strings.Contains(string(data), removed) {
+			t.Errorf("shared-pool provisioner retains retired coordinator retry code: %s", removed)
+		}
+	}
+}
 
 func TestTrinoUnconfiguredOwnerCountDoesNotChangeAssignments(t *testing.T) {
 	cells := []trinoCell{{ID: "registered:pool-a"}, {ID: "registered:pool-b"}}
