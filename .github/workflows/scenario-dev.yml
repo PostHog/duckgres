@@ -6,7 +6,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: distinct-metadata-image-builder
+  group: distinct-dictionary-image-builder
   cancel-in-progress: false
 jobs:
   build:
@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           repository: PostHog/trino
-          ref: f660286468b9933c66436ba75ef1f63c7cefc1ba
+          ref: cca1d62422163f5c18c0a4c671d61a9c91340d54
           persist-credentials: false
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
         with:
@@ -31,7 +31,9 @@ jobs:
           ./mvnw clean install -pl core/trino-server-posthog,client/trino-cli -am \
             -T 1C -DskipTests -Dmaven.javadoc.skip=true -Dair.check.skip-all=true
       - name: Verify changed modules
-        run: ./mvnw -pl lib/trino-filesystem,plugin/trino-hoglake test
+        run: |
+          ./mvnw -pl lib/trino-parquet,core/trino-main test -Dtest=TestFlatColumnReader,TestGroupByHash -Dsurefire.failIfNoSpecifiedTests=false
+          ./mvnw -pl lib/trino-parquet test -Dtest=TestFlatColumnReader#testPageLocalDictionaryProbe -Dtrino.parquet.dictionary-probe.enabled=true
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Configure benchmark registry credentials
         uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d
