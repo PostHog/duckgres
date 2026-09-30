@@ -19,6 +19,10 @@ they move to issues, docs, or implementation.
 - Support hot-reloading config without restart.
 - Add admin commands such as `\duckgres status` and `\duckgres users`.
 - Add a health check endpoint for load balancers.
+- Automate scheduled PRs that update the Trino E2E image to a published digest,
+  with E2E validation before merge. Consolidate workflow and script defaults into
+  one shared pin file, retain explicit debugging overrides, and avoid resolving
+  a moving image on every test run. Deferred; not required for legacy retirement.
 
 ## Observability
 
