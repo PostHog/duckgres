@@ -77,12 +77,12 @@ wait_trino_pool() {
 }
 # Frozen perf tracks the newest PostHog/trino master build; cmd_deploy resolves
 # it to a digest pin when TRINO_IMAGE is unset. Regular Trino tests keep a
-# promoted pin because they require atomic writes.
+# promoted pin because they require atomic writes and shared-catalog sync.
 TRINO_MASTER_IMAGE_RESOLVER="${TRINO_MASTER_IMAGE_RESOLVER:-$HERE/../../scripts/resolve_trino_master_image.sh}"
 if [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_extended ]; then
   TRINO_IMAGE="${TRINO_IMAGE:-}"
 else
-  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b}"
+  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:0ed6ee0cbaed3daf124304a421407ea395ae7697@sha256:28392ff10e5502ca1e468031c29fc50800005427beb96a363cfd331c434a3462}"
 fi
 TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
 # Managed admission requires atomic-table-creation-v1, including frozen perf.

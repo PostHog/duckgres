@@ -169,10 +169,17 @@ load-bearing: pointing a PR control plane at the shared cell could overwrite
 authoritative projections or drop catalogs absent from the PR's config store.
 
 The lane defaults `TRINO_IMAGE` to the pinned PostHog fork promoted for these
-tests. That fork contains atomic Hoglake writes and the PostgreSQL dynamic catalog
-store; upstream `trinodb/trino` is not compatible. Update the default in
+tests. That fork contains atomic Hoglake writes and read-only synchronization
+from the PostgreSQL catalog store (`catalog.sync.enabled=true`); upstream
+`trinodb/trino` and older fork builds are not compatible. Update the default in
 `run.sh` and `e2e-mw-dev.yml` together when promoting the regular E2E
-Trino build. The frozen benchmark (`posthog_frozen_perf`) is not pinned: it
+Trino build, and update `TestTrinoFixturePinsSharedCatalogSyncImage` after checking
+the published image's source revision supports shared-catalog synchronization.
+The rendered-blueprint test checks that both workloads retain this pin and
+the coordinator keeps read-only synchronization enabled. A coordinator startup
+error saying `catalog.sync.enabled` was not used means the image lacks sync support;
+do not disable synchronization or relax admission to work around it.
+The frozen benchmark (`posthog_frozen_perf`) is not pinned: it
 always tests the newest PostHog/trino master build, which
 `scripts/resolve_trino_master_image.sh` resolves to a digest-pinned reference
 from the fork's source-ordered `r<position>-<sha>` GHCR tags. `scenario-dev.yml`

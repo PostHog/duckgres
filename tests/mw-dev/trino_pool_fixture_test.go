@@ -3,9 +3,26 @@ package e2emwdev_test
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+func TestTrinoFixturePinsSharedCatalogSyncImage(t *testing.T) {
+	// This reviewed build includes catalog.sync.enabled and read-only catalog stores.
+	const supportedImage = "ghcr.io/posthog/trino:0ed6ee0cbaed3daf124304a421407ea395ae7697@sha256:28392ff10e5502ca1e468031c29fc50800005427beb96a363cfd331c434a3462"
+	imagePattern := regexp.MustCompile(`ghcr\.io/posthog/trino:[a-f0-9]{40}@sha256:[a-f0-9]{64}`)
+	for _, path := range []string{"run.sh", "../../.github/workflows/e2e-mw-dev.yml"} {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		images := imagePattern.FindAllString(string(body), -1)
+		if len(images) != 1 || images[0] != supportedImage {
+			t.Errorf("%s must use the reviewed shared-catalog sync image %s; got %v", path, supportedImage, images)
+		}
+	}
+}
 
 func TestTrinoFixtureUsesOnlySharedPools(t *testing.T) {
 	for _, path := range []string{"run.sh", "trino-controlplane-patch.tmpl.json", "e2e/trino.sh"} {

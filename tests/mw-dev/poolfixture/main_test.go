@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -35,7 +36,16 @@ func fixture(t *testing.T) string {
 func TestPoolFixtureProducesValidIndependentBlueprint(t *testing.T) {
 	var output bytes.Buffer
 	publisher := "example.invalid/controlplane@sha256:" + strings.Repeat("b", 64)
-	if err := render(strings.NewReader(fixture(t)), &output, "fixture", publisher); err != nil {
+	runScript, err := os.ReadFile("../run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	promotedImage := regexp.MustCompile(`ghcr\.io/posthog/trino:[a-f0-9]{40}@sha256:[a-f0-9]{64}`).FindString(string(runScript))
+	if promotedImage == "" {
+		t.Fatal("promoted Trino image missing")
+	}
+	input := strings.ReplaceAll(fixture(t), "example.invalid/trino@sha256:"+strings.Repeat("a", 64), promotedImage)
+	if err := render(strings.NewReader(input), &output, "fixture", publisher); err != nil {
 		t.Fatal(err)
 	}
 	var list struct{ Items []json.RawMessage }
@@ -74,6 +84,23 @@ func TestPoolFixtureProducesValidIndependentBlueprint(t *testing.T) {
 		}
 		if config.Data["publisher-image"] != publisher {
 			t.Fatal("publisher fence diverges from deployment image")
+		}
+		if b.Image != promotedImage {
+			t.Fatal("blueprint did not retain the promoted Trino image")
+		}
+		for role, workload := range map[string]trinopool.BlueprintWorkload{"coordinator": b.Coordinator, "worker": b.Worker} {
+			foundTrino := false
+			for _, container := range workload.PodTemplate.Spec.Containers {
+				if container.Name == "trino-"+role {
+					foundTrino = true
+					if container.Image != promotedImage {
+						t.Errorf("%s does not use the promoted Trino image", role)
+					}
+				}
+			}
+			if !foundTrino {
+				t.Errorf("%s Trino container missing", role)
+			}
 		}
 		if b.Worker.Replicas != 3 {
 			t.Fatal("distributed execution worker count changed")

@@ -131,8 +131,8 @@ jobs:
       # secret so no account id or internal role ARN lands in this public repo.
       # Only the trino matrix cell consumes it.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
-      # Atomic Hoglake writes and the PostgreSQL-backed dynamic catalog store.
-      TRINO_IMAGE: ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b
+      # Atomic Hoglake writes and synchronization from the shared catalog store.
+      TRINO_IMAGE: ghcr.io/posthog/trino:0ed6ee0cbaed3daf124304a421407ea395ae7697@sha256:28392ff10e5502ca1e468031c29fc50800005427beb96a363cfd331c434a3462
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
