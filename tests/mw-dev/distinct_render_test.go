@@ -200,3 +200,42 @@ func TestDistinctTracingDiscoversBackendWithoutLegacyTrino(t *testing.T) {
 		})
 	}
 }
+
+func TestDistinctBenchmarkImageSelection(t *testing.T) {
+	raw, err := os.ReadFile("../../.github/workflows/scenario-dev.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	start := strings.Index(text, `          if [[ "$image" == benchmark:* ]]; then`)
+	if start < 0 {
+		t.Fatal("missing benchmark image selection")
+	}
+	end := strings.Index(text[start:], `          echo "image=$image"`) + start
+	body := text[start:end]
+	tag := "trino-distinct-" + strings.Repeat("a", 40) + "@sha256:" + strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		ref   string
+		valid bool
+	}{
+		{"benchmark:" + tag, true}, {"benchmark:latest", false}, {"benchmark:" + tag + ";echo invalid", false},
+	} {
+		dir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(dir, ".github/workflows"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".github/workflows/_image-build.yml"), []byte("env:\n  ECR_REGISTRY: 000000000000.dkr.ecr.us-east-1.amazonaws.com\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("bash", "-c", "set -euo pipefail\n"+body+"\nprintf '%s' \"$image\"")
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "image="+tc.ref)
+		out, err := cmd.CombinedOutput()
+		if (err == nil) != tc.valid {
+			t.Fatalf("valid=%v err=%v", tc.valid, err)
+		}
+		if tc.valid && !strings.Contains(string(out), "/duckgres-prs:"+tag) {
+			t.Fatal("wrong image")
+		}
+	}
+}
