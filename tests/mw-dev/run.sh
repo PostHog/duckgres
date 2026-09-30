@@ -158,7 +158,17 @@ resolve_distinct_tracing() {
   local config endpoint="" candidate enabled protocol name
   for name in trino-coordinator trino-worker; do
     if ! config="$("${KUBECTL[@]}" -n trino get configmap "$name" -o 'jsonpath={.data.config\.properties}' 2>/dev/null)"; then
-      echo "Unable to read existing dev Trino tracing configuration" >&2; return 1
+      # Standalone Trino may have been retired. Discover the existing backend
+      # by its chart label; require exactly one result instead of choosing one.
+      candidate="$("${KUBECTL[@]}" get services -A -l app.kubernetes.io/name=vt-single -o json | jq -er '
+        .items | select(length == 1) | .[0] |
+        .metadata.name as $name | .metadata.namespace as $namespace |
+        [.spec.ports[] | select(.name == "http")] | select(length == 1) | .[0].port as $port |
+        select(($name | test("^[a-z0-9-]+$")) and ($namespace | test("^[a-z0-9-]+$")) and ($port > 0 and $port < 65536)) |
+        "http://\($name).\($namespace).svc:\($port)/insert/opentelemetry/v1/traces"
+      ')" || { echo "Unable to discover one trace backend" >&2; return 1; }
+      endpoint="$candidate"
+      break
     fi
     enabled="$(printf '%s\n' "$config" | awk -F= '$1 ~ /^[[:space:]]*tracing[.]enabled[[:space:]]*$/ {value=substr($0,index($0,"=")+1);gsub(/^[[:space:]]+|[[:space:]]+$/,"",value);print value}')"
     protocol="$(printf '%s\n' "$config" | awk -F= '$1 ~ /^[[:space:]]*otel[.]exporter[.]protocol[[:space:]]*$/ {value=substr($0,index($0,"=")+1);gsub(/^[[:space:]]+|[[:space:]]+$/,"",value);print value}')"

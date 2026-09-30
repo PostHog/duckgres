@@ -163,3 +163,40 @@ func TestDistinctWorkflowUploadsOnlyEncryptedProfiles(t *testing.T) {
 		}
 	}
 }
+
+func TestDistinctTracingDiscoversBackendWithoutLegacyTrino(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(raw), "resolve_distinct_tracing() {")
+	end := strings.Index(string(raw)[start:], "\n}\n") + start + 3
+	resolver := string(raw)[start:end]
+	service := `{"metadata":{"name":"trace-store","namespace":"observability"},"spec":{"ports":[{"name":"http","port":10428}]}}`
+	for _, tc := range []struct {
+		name, items string
+		valid       bool
+	}{
+		{"single", service, true}, {"absent", "", false}, {"ambiguous", service + "," + service, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "services"), []byte(`{"items":[`+tc.items+`]}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			script := "#!/bin/bash\ncase \"$*\" in *'get services'*) cat \"$FIXTURES/services\";; *) exit 1;; esac\n"
+			if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", "-c", "set -euo pipefail\nKUBECTL=(\"$FIXTURES/kubectl\")\n"+resolver+"\nresolve_distinct_tracing\ntest \"$DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT\" = http://trace-store.observability.svc:10428/insert/opentelemetry/v1/traces\n")
+			cmd.Env = append(os.Environ(), "FIXTURES="+dir, "DUCKGRES_SCENARIO_PROFILE_DISTINCT=true", "GITHUB_ACTIONS=true")
+			out, err := cmd.CombinedOutput()
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v output=%s", tc.valid, err, out)
+			}
+			if tc.valid && !strings.Contains(string(out), "::add-mask::http://trace-store.") {
+				t.Fatal("endpoint not masked")
+			}
+		})
+	}
+}

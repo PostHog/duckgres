@@ -1178,3 +1178,12 @@ it removes the isolated Duckling and namespace before cleaning the scoped manage
 storage prefix. Do not use the frozen source prefix as `HOGLAKE_DATA_PATH`.
 Collect `run.sh diagnostics` and preserve scenario artifacts before teardown, then
 redeploy a fresh isolated stack before retrying.
+
+### Exact-distinct diagnostic tracing
+
+The opt-in `profile_distinct` workflow captures query timings and traces only in
+age-encrypted artifacts. It first reuses the standalone Trino tracing configuration.
+If that configuration is absent, it discovers the existing VictoriaTraces service
+using `app.kubernetes.io/name=vt-single`. Discovery requires exactly one service
+with one `http` port and masks the resolved endpoint in CI. Missing or ambiguous
+backends fail deployment; ordinary scenarios do not perform this discovery.
