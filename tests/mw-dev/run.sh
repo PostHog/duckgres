@@ -16,7 +16,6 @@ CTX="${KUBE_CONTEXT:?}"
 # NAMESPACE is required by deploy|test|diagnostics|teardown but NOT by
 # e2e-cleanup (which discovers stale namespaces itself). Don't require it here.
 NS="${NAMESPACE:-}"
-TRINO_CELL_NS="duckgres-ci-pr-0${PR_NUMBER:-}"
 KUBECTL=(kubectl --context "$CTX")
 EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME:-posthog-mw-dev}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -37,38 +36,53 @@ case "$E2E_SUITE" in
   neutral|duckdb|trino|reshard) ;;
   *) echo "E2E_SUITE must be neutral, duckdb, trino, or reshard (got $E2E_SUITE)" >&2; exit 2 ;;
 esac
-TRINO_SHARED_CATALOGS_ENABLED="${TRINO_SHARED_CATALOGS_ENABLED:-false}"
 TRINO_SERVICE_CREDENTIALS_ENABLED="${TRINO_SERVICE_CREDENTIALS_ENABLED:-false}"
 case "$TRINO_SERVICE_CREDENTIALS_ENABLED" in
   true|false) ;;
   *) echo "TRINO_SERVICE_CREDENTIALS_ENABLED must be true or false" >&2; exit 2 ;;
 esac
 TRINO_GATEWAY_IMAGE="${TRINO_GATEWAY_IMAGE:-}"
-case "$TRINO_SHARED_CATALOGS_ENABLED" in
-  false) ;;
-  true)
-    case "${1:-}" in
-      teardown|e2e-cleanup|diagnostics) ;;
-      *)
-        if [ "$E2E_SUITE" != trino ] || [ "$SCENARIO_NAME" != full-suite ]; then
-          echo "Shared catalogs require the full-suite Trino lane" >&2; exit 2
-        fi
-        if ! [[ "$TRINO_GATEWAY_IMAGE" =~ ^[a-zA-Z0-9./:_-]+@sha256:[a-f0-9]{64}$ ]]; then
-          echo "Shared catalogs require a digest-pinned candidate Gateway image" >&2; exit 2
-        fi
-        ;;
-    esac
-    ;;
-  *) echo "TRINO_SHARED_CATALOGS_ENABLED must be true or false" >&2; exit 2 ;;
-esac
+
+resolve_gateway_image() {
+  [ -z "$TRINO_GATEWAY_IMAGE" ] || return 0
+  TRINO_GATEWAY_IMAGE="$("${KUBECTL[@]}" -n trino-gateway get deployment trino-gateway -o json \
+    | jq -er '[.spec.template.spec.containers[] | select(.name == "trino-gateway") | .image] | select(length == 1) | .[0]')" \
+    || { echo "Cannot resolve the deployed Gateway image; set a digest-pinned TRINO_GATEWAY_IMAGE" >&2; return 1; }
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::add-mask::%s\n' "$TRINO_GATEWAY_IMAGE" >&2
+  fi
+}
+
+require_pool_images() {
+  local image
+  for image in "$TRINO_GATEWAY_IMAGE" "$CONTROLPLANE_IMAGE"; do
+    if ! [[ "$image" =~ ^[a-zA-Z0-9./:_-]+@sha256:[a-f0-9]{64}$ ]]; then
+      echo "Trino pool requires digest-pinned Gateway and control-plane images" >&2
+      return 2
+    fi
+  done
+}
+
+wait_trino_pool() {
+  local attempt count
+  for attempt in $(seq 1 180); do
+    count="$("${KUBECTL[@]}" -n "$NS" exec deploy/duckgres-config-store -- \
+      psql -U duckgres -d duckgres -At -v ON_ERROR_STOP=1 \
+      -c "SELECT count(*) FROM duckgres_trino_pool_instances WHERE pool_id='registered:pool-test' AND phase='SERVING'")" || return 1
+    [ "$count" = 1 ] && return 0
+    sleep 5
+  done
+  echo "Isolated Trino pool did not admit its serving instance" >&2
+  return 1
+}
 # Frozen perf tracks the newest PostHog/trino master build; cmd_deploy resolves
 # it to a digest pin when TRINO_IMAGE is unset. Regular Trino tests keep a
-# promoted pin because they require atomic writes.
+# promoted pin because they require atomic writes and shared-catalog sync.
 TRINO_MASTER_IMAGE_RESOLVER="${TRINO_MASTER_IMAGE_RESOLVER:-$HERE/../../scripts/resolve_trino_master_image.sh}"
 if [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_extended ]; then
   TRINO_IMAGE="${TRINO_IMAGE:-}"
 else
-  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b}"
+  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:0ed6ee0cbaed3daf124304a421407ea395ae7697@sha256:28392ff10e5502ca1e468031c29fc50800005427beb96a363cfd331c434a3462}"
 fi
 TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
 # Managed admission requires atomic-table-creation-v1, including frozen perf.
@@ -87,7 +101,6 @@ if [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "$HOGLAKE_DATA_PATH" ]; then
 fi
 # The control plane owns its managed catalog. Frozen perf uses independent
 # uncached and cached clusters with the same tenant auth and isolated stores.
-TRINO_FILESYSTEM_CACHE_ENABLED=false
 if [ "$SCENARIO_NAME" = "posthog_frozen_perf_trino_cached" ]; then
   echo "use posthog_frozen_perf; it includes both Trino cache modes" >&2
   exit 2
@@ -128,7 +141,6 @@ require_pr_identity() {
     echo "NAMESPACE '$NS' does not match PR_NUMBER '$PR_NUMBER'." >&2
     return 2
   fi
-  TRINO_CELL_NS="duckgres-ci-pr-0${PR_NUMBER}"
 }
 
 frozen_perf_scenario() {
@@ -137,10 +149,6 @@ frozen_perf_scenario() {
 
 hoglake_perf_enabled() {
   [ "$E2E_SUITE" = trino ] && frozen_perf_scenario
-}
-
-trino_multicell_enabled() {
-  [ "$E2E_SUITE" = trino ] && [ "$SCENARIO_NAME" = full-suite ]
 }
 
 # Bootstrap and general E2E keep the small fleet. Only comparison clusters
@@ -168,34 +176,6 @@ trino_perf_modes() {
   else
     echo 'perf cached'
   fi
-}
-
-render_trino_backend() {
-  local color="$1"
-  local forwarded_config=""
-  if [ "$TRINO_SHARED_CATALOGS_ENABLED" = true ]; then
-    forwarded_config=$'s/^    http-server.https.port=8443$/&\\\n    http-server.process-forwarded=true/'
-  fi
-  TRINO_CA_CERT_B64="$(base64 < "$trino_ca_cert_file" | tr -d '\n')" \
-  TRINO_SERVER_P12_B64="$(base64 < "$trino_server_p12_file" | tr -d '\n')" \
-  TRINO_IMAGE="$TRINO_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
-  CONFIG_STORE_PASSWORD="$(cat "$config_store_password_file")" \
-  NAMESPACE="$TRINO_CELL_NS" PR_NUMBER="$PR_NUMBER" \
-    render_trino_template \
-    | sed -e "s/duckgres-trino-coordinator/duckgres-trino-$color-coordinator/g" \
-      -e "s/duckgres-trino-worker/duckgres-trino-$color-worker/g" \
-      -e "s/labels: { app: duckgres-trino, component: coordinator }/labels: { app: duckgres-trino, component: coordinator, posthog.com\/trino-cell: cell-test, posthog.com\/trino-color: $color, app.kubernetes.io\/component: coordinator, app.kubernetes.io\/name: trino-coordinator }/" \
-      -e "s/labels: { app: duckgres-trino, component: worker }/labels: { app: duckgres-trino, component: worker, posthog.com\/trino-cell: cell-test, posthog.com\/trino-color: $color, app.kubernetes.io\/component: worker, app.kubernetes.io\/name: trino-worker }/" \
-      -e "s/app: duckgres-trino/app: duckgres-trino-$color/g" \
-      -e "s/name: duckgres-trino$/name: duckgres-trino-$color/" \
-      -e "s/duckgres-trino\.$TRINO_CELL_NS\.svc/duckgres-trino-$color.$TRINO_CELL_NS.svc/g" \
-      -e "s/trino-internal-communication/trino-$color-internal/g" \
-      -e "s/cell-id=ci-pr-$PR_NUMBER/cell-id=ci-pr-$PR_NUMBER-$color/" \
-      -e "s/node.environment=ci_pr_$PR_NUMBER/node.environment=ci_pr_${PR_NUMBER}_$color/" \
-      -e "s/duckgres-config-store\.$TRINO_CELL_NS\.svc/duckgres-config-store.$NS.svc/g" \
-      -e "s/duckgres-control-plane\.$TRINO_CELL_NS\.svc/duckgres-control-plane.$NS.svc/g" \
-      -e 's@resource: /bundles/trino$@resource: /bundles/trino/cell-test@' \
-      -e "$forwarded_config"
 }
 
 # Reuse the template with the larger comparison-worker profile for both modes.
@@ -232,21 +212,6 @@ EOF
       -e "s/catalog-store.cell-id=ci-pr-${PR_NUMBER}$/catalog-store.cell-id=ci-pr-${PR_NUMBER}-$mode/"
 }
 
-render_trino_multicell() {
-  local color
-  for color in blue green; do
-    [ -f "$secret_dir/trino-$color-internal" ] || (umask 077; openssl rand -base64 32 > "$secret_dir/trino-$color-internal")
-  done
-  TRINO_BLUE_INTERNAL_SECRET="$(cat "$secret_dir/trino-blue-internal")" \
-  TRINO_GREEN_INTERNAL_SECRET="$(cat "$secret_dir/trino-green-internal")" \
-  TRINO_CELL_NAMESPACE="$TRINO_CELL_NS" NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
-    envsubst '$TRINO_CELL_NAMESPACE $NAMESPACE $PR_NUMBER $TRINO_BLUE_INTERNAL_SECRET $TRINO_GREEN_INTERNAL_SECRET' \
-      < "$HERE/trino-multicell.tmpl.yaml"
-  render_trino_backend blue
-  render_trino_backend green
-  if [ "$TRINO_SHARED_CATALOGS_ENABLED" = true ]; then render_trino_gateway; fi
-}
-
 render_trino_gateway() {
   local key
   for key in admin-token identity-key; do
@@ -265,28 +230,9 @@ render_trino_gateway() {
   TRINO_GATEWAY_PUBLIC_KEY="$(sed 's/^/    /' "$secret_dir/gateway-public.pem")" \
   CONFIG_STORE_PASSWORD="$(cat "$config_store_password_file")" \
   TRINO_GATEWAY_IMAGE="$TRINO_GATEWAY_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
-  NAMESPACE="$NS" TRINO_CELL_NAMESPACE="$TRINO_CELL_NS" PR_NUMBER="$PR_NUMBER" \
-    envsubst '$NAMESPACE $TRINO_CELL_NAMESPACE $PR_NUMBER $TRINO_GATEWAY_ADMIN_TOKEN $TRINO_GATEWAY_IDENTITY_KEY $TRINO_GATEWAY_PRIVATE_KEY $TRINO_GATEWAY_PUBLIC_KEY $CONFIG_STORE_PASSWORD $TRINO_GATEWAY_IMAGE $TRINO_TLS_PASSWORD' \
+  NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
+    envsubst '$NAMESPACE $PR_NUMBER $TRINO_GATEWAY_ADMIN_TOKEN $TRINO_GATEWAY_IDENTITY_KEY $TRINO_GATEWAY_PRIVATE_KEY $TRINO_GATEWAY_PUBLIC_KEY $CONFIG_STORE_PASSWORD $TRINO_GATEWAY_IMAGE $TRINO_TLS_PASSWORD' \
       < "$HERE/trino-gateway.tmpl.yaml"
-}
-
-trino_cell_namespace_uid() {
-  local target="duckgres-ci-pr-0${PR_NUMBER}" namespace_json
-  namespace_json="$("${KUBECTL[@]}" get namespace "$target" --ignore-not-found -o json)" || return 1
-  [ -n "$namespace_json" ] || return 0
-  printf %s "$namespace_json" | jq -er --arg pr "$PR_NUMBER" --arg name "$target" \
-    'select(.metadata.name == $name and .metadata.labels["app.kubernetes.io/managed-by"] == "e2e-mw-dev" and .metadata.labels["duckgres.posthog.com/ci-pr"] == $pr and .metadata.labels["duckgres.posthog.com/ci-component"] == "trino-cell") | .metadata.uid | select(type == "string" and length > 0)'
-}
-
-delete_trino_cell_stack() {
-  local target="duckgres-ci-pr-0${PR_NUMBER}" uid
-  uid="$(trino_cell_namespace_uid)" \
-    || { echo "Refusing to delete a namespace without matching Trino fixture ownership." >&2; return 1; }
-  [ -n "$uid" ] || return 0
-  NS="$target" delete_pod_identity
-  jq -n --arg uid "$uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' \
-    | "${KUBECTL[@]}" delete --raw "/api/v1/namespaces/$target" -f - >/dev/null
-  "${KUBECTL[@]}" wait --for=delete namespace/"$target" --timeout=720s
 }
 
 render() {
@@ -313,13 +259,14 @@ render() {
     < "$HERE/manifests.tmpl.yaml"
 
   if [ "$E2E_SUITE" = "trino" ]; then
+    require_pool_images
     ensure_trino_tls
     TRINO_CA_CERT_B64="$(base64 < "$trino_ca_cert_file" | tr -d '\n')" \
     TRINO_SERVER_P12_B64="$(base64 < "$trino_server_p12_file" | tr -d '\n')" \
     TRINO_IMAGE="$TRINO_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
       CONFIG_STORE_PASSWORD="$(cat "$config_store_password_file")" \
       NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
-      render_trino_template
+      render_trino_template | NAMESPACE="$NS" CONTROLPLANE_IMAGE="$CONTROLPLANE_IMAGE" go run "$HERE/poolfixture"
     if hoglake_perf_enabled; then
       local mode
       for mode in $(trino_perf_modes); do render_trino_perf_cluster "$mode"; done
@@ -332,7 +279,7 @@ render() {
     NAMESPACE="$NS" HOGLAKE_IMAGE="$HOGLAKE_IMAGE" AWS_REGION="$AWS_REGION" HOGLAKE_SERVICE_ACCOUNT="$HOGLAKE_SERVICE_ACCOUNT" \
       HOGLAKE_HYDRATOR_INTERVAL_MS="$HOGLAKE_HYDRATOR_INTERVAL_MS" \
       envsubst '$NAMESPACE $HOGLAKE_IMAGE $AWS_REGION $HOGLAKE_SERVICE_ACCOUNT $HOGLAKE_HYDRATOR_INTERVAL_MS' < "$HERE/manifests.hoglake.tmpl.yaml"
-    if trino_multicell_enabled; then render_trino_multicell; fi
+    render_trino_gateway
   fi
 }
 
@@ -342,17 +289,10 @@ ensure_trino_tls() {
   if hoglake_perf_enabled; then
     sans="$sans,DNS:duckgres-trino-perf.$NS.svc,DNS:duckgres-trino-cached.$NS.svc"
   fi
-  if trino_multicell_enabled; then
-    sans="$sans,DNS:duckgres-trino-blue.$TRINO_CELL_NS.svc,DNS:duckgres-trino-green.$TRINO_CELL_NS.svc"
-  fi
-  if [ "$TRINO_SHARED_CATALOGS_ENABLED" = true ]; then
-    sans="$sans,DNS:duckgres-trino-gateway.$NS.svc"
-  fi
+  sans="$sans,DNS:duckgres-trino-gateway.$NS.svc"
   if [ -s "$trino_ca_cert_file" ] && [ -s "$trino_server_p12_file" ]; then
-    if [ "$TRINO_SHARED_CATALOGS_ENABLED" = true ]; then
-      openssl verify -CAfile "$trino_ca_cert_file" -verify_hostname "duckgres-trino-gateway.$NS.svc" "$trino_server_cert_file" >/dev/null \
-        || { echo "Existing test certificate does not cover the Gateway; use a fresh private test directory." >&2; return 1; }
-    fi
+    openssl verify -CAfile "$trino_ca_cert_file" -verify_hostname "duckgres-trino-gateway.$NS.svc" "$trino_server_cert_file" >/dev/null \
+      || { echo "Existing test certificate does not cover the Gateway; use a fresh private test directory." >&2; return 1; }
     return
   fi
   # Per-run CA and leaf: password auth stays on verified HTTPS without sharing
@@ -566,7 +506,6 @@ reset_pr_stack() {
   wait_ci_ducklings_deleted "$PR_NUMBER" 300s
   for org in $(ci_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
   delete_pod_identity
-  delete_trino_cell_stack
   delete_ci_bindings "$PR_NUMBER"
   # Reshard runners intentionally get 600s to roll back safely on termination.
   # A cancelled workflow can leave one in that grace period, so the next run's
@@ -587,6 +526,8 @@ cleanup_hoglake_storage() {
 
 cmd_deploy() {
   if [ "$E2E_SUITE" = trino ]; then
+    resolve_gateway_image
+    require_pool_images
     if [ -z "$TRINO_IMAGE" ]; then
       TRINO_IMAGE="$("$TRINO_MASTER_IMAGE_RESOLVER")"
     fi
@@ -631,34 +572,16 @@ cmd_deploy() {
     # Frozen fixture catalogs are imported separately and keep read-only identity.
     patch="$(jq -cn --arg uri "http://duckgres-hoglake.$NS.svc:8080" --arg path "$HOGLAKE_DATA_PATH" '{spec:{template:{spec:{containers:[{name:"controlplane",env:[{name:"DUCKGRES_TRINO_MANAGED_HOGLAKE_URI",value:$uri},{name:"DUCKGRES_TRINO_HOGLAKE_DATA_PATH",value:$path},{name:"DUCKGRES_TRINO_HOGLAKE_NAMESPACE",value:"main"}]}]}}}}')"
     "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p "$patch"
-    if trino_multicell_enabled; then
-      NS="$TRINO_CELL_NS" ensure_trino_pod_identity
-      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
-        '{"spec":{"template":{"spec":{"containers":[{"name":"controlplane","env":[{"name":"DUCKGRES_TRINO_CELLS_FILE","value":"/etc/duckgres/trino-cells/cells.json"}],"volumeMounts":[{"name":"trino-cell-registry","mountPath":"/etc/duckgres/trino-cells","readOnly":true}]}],"volumes":[{"name":"trino-cell-registry","configMap":{"name":"trino-cell-registry"}}]}}}}'
-    fi
-    TRINO_FILESYSTEM_CACHE_ENABLED="$TRINO_FILESYSTEM_CACHE_ENABLED" \
-    envsubst '$NAMESPACE $PR_NUMBER $TRINO_FILESYSTEM_CACHE_ENABLED' < "$HERE/trino-controlplane-patch.tmpl.json" \
+    "${KUBECTL[@]}" -n "$NS" exec deploy/duckgres-config-store -- \
+      psql -U duckgres -d duckgres -v ON_ERROR_STOP=1 -c 'CREATE SCHEMA IF NOT EXISTS gateway_rollout_test' >/dev/null
+    "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-gateway --type=merge -p '{"spec":{"replicas":1}}'
+    "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-gateway --timeout=300s
+    CONTROLPLANE_IMAGE="$CONTROLPLANE_IMAGE" \
+    envsubst '$NAMESPACE $PR_NUMBER $CONTROLPLANE_IMAGE' < "$HERE/trino-controlplane-patch.tmpl.json" \
       | "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane \
           --type=strategic --patch-file=/dev/stdin
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-control-plane --timeout=180s
-    # Bootstrap creates the fixed-name Trino Secrets/ConfigMap. Keep workloads
-    # at zero replicas until all projections exist, then admit them with the
-    # already-propagated Trino Pod Identity association.
-    "${KUBECTL[@]}" -n "$NS" wait --for=create secret/trino-auth --timeout=120s
-    "${KUBECTL[@]}" -n "$NS" wait --for=create secret/trino-internal-communication --timeout=120s
-    "${KUBECTL[@]}" -n "$NS" wait --for=create secret/trino-opa-bundle-token --timeout=120s
-    "${KUBECTL[@]}" -n "$NS" wait --for=create configmap/trino-resource-groups --timeout=120s
-    # Patch the Deployment resources directly. The CI deployer intentionally
-    # cannot patch the deployments/scale subresource, while it already needs
-    # narrowly scoped Deployment patch access for the control-plane config.
-    # The bootstrap cluster keeps three small workers for catalog admission.
-    # Comparison clusters below use their own larger worker profile.
-    "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-coordinator \
-      --type=merge -p '{"spec":{"replicas":1}}'
-    "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-worker \
-      --type=merge -p '{"spec":{"replicas":3}}'
-    "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-coordinator --timeout=300s
-    "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=300s
+    wait_trino_pool
     if hoglake_perf_enabled; then
       for mode in $(trino_perf_modes); do
         "${KUBECTL[@]}" -n "$NS" patch deployment "duckgres-trino-$mode-coordinator" --type=merge -p '{"spec":{"replicas":1}}'
@@ -666,14 +589,6 @@ cmd_deploy() {
         "${KUBECTL[@]}" -n "$NS" rollout status "deploy/duckgres-trino-$mode-coordinator" --timeout=300s
         "${KUBECTL[@]}" -n "$NS" rollout status "deploy/duckgres-trino-$mode-worker" --timeout=300s
       done
-    fi
-    if trino_multicell_enabled; then
-      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" wait --for=create secret/trino-auth --timeout=120s
-      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" wait --for=create configmap/trino-resource-groups --timeout=120s
-      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" patch deployment duckgres-trino-blue-coordinator --type=merge -p '{"spec":{"replicas":1}}'
-      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" patch deployment duckgres-trino-blue-worker --type=merge -p '{"spec":{"replicas":1}}'
-      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" rollout status deploy/duckgres-trino-blue-coordinator --timeout=300s
-      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" rollout status deploy/duckgres-trino-blue-worker --timeout=300s
     fi
   fi
 }
@@ -692,15 +607,11 @@ cmd_test_e2e() {
   fi
   "${KUBECTL[@]}" -n "$NS" create configmap duckgres-harness \
     --from-file=harness.sh="$harness_file" \
-    --from-file=trino-multicell.sh="$HERE/e2e/trino-multicell.sh" \
-    --from-file=trino-shared-catalogs.sh="$HERE/e2e/trino-shared-catalogs.sh" \
     --from-file=trino-service-credentials.sh="$HERE/e2e/trino-service-credentials.sh" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply --server-side --force-conflicts -f -
 
   INTERNAL_SECRET="$(cat "$internal_secret_file")"
   INTERNAL_SECRET_FALLBACK="$(cat "$internal_secret_fallback_file")"
-  TRINO_MULTICELL_ENABLED=false
-  if trino_multicell_enabled; then TRINO_MULTICELL_ENABLED=true; fi
   "${KUBECTL[@]}" -n "$NS" delete job duckgres-harness --ignore-not-found
   cat <<YAML | "${KUBECTL[@]}" apply -f -
 apiVersion: batch/v1
@@ -734,9 +645,6 @@ spec:
             - { name: NAMESPACE, value: "$NS" }
             - { name: PR_NUMBER, value: "$PR_NUMBER" }
             - { name: E2E_SUITE, value: "$E2E_SUITE" }
-            - { name: TRINO_CELL_NAMESPACE, value: "$TRINO_CELL_NS" }
-            - { name: TRINO_MULTICELL_ENABLED, value: "$TRINO_MULTICELL_ENABLED" }
-            - { name: TRINO_SHARED_CATALOGS_ENABLED, value: "$TRINO_SHARED_CATALOGS_ENABLED" }
             - { name: TRINO_SERVICE_CREDENTIALS_ENABLED, value: "$TRINO_SERVICE_CREDENTIALS_ENABLED" }
             - { name: INTERNAL_SECRET, value: "$INTERNAL_SECRET" }
             - { name: INTERNAL_SECRET_FALLBACK, value: "$INTERNAL_SECRET_FALLBACK" }
@@ -1116,18 +1024,6 @@ release_artifact_keeper() {
 }
 
 cmd_diagnostics() {
-  local cell_uid color
-  cell_uid="$(trino_cell_namespace_uid 2>/dev/null || true)"
-  if [ -n "$cell_uid" ]; then
-    echo "::group::isolated Trino cell diagnostics"
-    "${KUBECTL[@]}" -n "$TRINO_CELL_NS" get pods,deployments,services,events -o wide || true
-    for color in blue green; do
-      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" logs "deploy/duckgres-trino-$color-coordinator" -c trino-coordinator --tail=200 || true
-      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" logs "deploy/duckgres-trino-$color-coordinator" -c duckgres-trino-opa --tail=100 || true
-      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" logs "deploy/duckgres-trino-$color-worker" -c trino-worker --tail=100 || true
-    done
-    echo "::endgroup::"
-  fi
   echo "::group::namespace state"
   "${KUBECTL[@]}" -n "$NS" get pods,svc,job -o wide || true
   echo "::endgroup::"
@@ -1139,9 +1035,10 @@ cmd_diagnostics() {
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-control-plane --tail=200 || true
   echo "::endgroup::"
   echo "::group::Trino coordinator, worker, and OPA logs"
-  "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-coordinator -c trino-coordinator --tail=300 || true
-  "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-coordinator -c duckgres-trino-opa --tail=300 || true
-  "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-worker -c trino-worker --tail=300 || true
+  "${KUBECTL[@]}" -n "$NS" logs -l 'posthog.com/trino-pool=pool-test,app.kubernetes.io/component=coordinator' -c trino-coordinator --tail=300 --prefix=true || true
+  "${KUBECTL[@]}" -n "$NS" logs -l 'posthog.com/trino-pool=pool-test,app.kubernetes.io/component=coordinator' -c duckgres-trino-opa --tail=300 --prefix=true || true
+  "${KUBECTL[@]}" -n "$NS" logs -l 'posthog.com/trino-pool=pool-test,app.kubernetes.io/component=worker' -c trino-worker --tail=300 --prefix=true || true
+  "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-gateway --tail=300 || true
   if hoglake_perf_enabled; then
     for mode in $(trino_perf_modes); do
       "${KUBECTL[@]}" -n "$NS" logs "deploy/duckgres-trino-$mode-coordinator" -c trino-coordinator --tail=300 || true
@@ -1239,7 +1136,6 @@ cmd_teardown() {
   # Drop the Pod Identity association (it's an EKS resource, not in the ns).
   delete_pod_identity
 
-  delete_trino_cell_stack
 
   # Cross-namespace bindings carry the ci-pr label — sweep them, then the ns.
   delete_ci_bindings "$PR_NUMBER"
@@ -1269,23 +1165,18 @@ cmd_e2e_cleanup() {
   | while read -r ns created pr component; do
       [ -n "$ns" ] || continue
       case "$pr" in ''|0*|*[!0-9]*) echo "e2e-cleanup: skip namespace without a canonical PR label: $ns"; continue ;; esac
-      if [ "$ns" != "duckgres-ci-pr-$pr" ] && { [ "$ns" != "duckgres-ci-pr-0$pr" ] || [ "$component" != trino-cell ]; }; then
+      if [ "$ns" != "duckgres-ci-pr-$pr" ]; then
         echo "e2e-cleanup: skip unexpected namespace: $ns"; continue
       fi
       age=$(( (now - $(date -d "$created" +%s)) / 3600 ))
       if [ "$age" -lt "$max_age_h" ]; then
         echo "e2e-cleanup: keep $ns (age ${age}h < ${max_age_h}h)"; continue
       fi
-      if [ "$component" = trino-cell ]; then
-        PR_NUMBER="$pr" delete_trino_cell_stack
-        continue
-      fi
       echo "e2e-cleanup: reaping $ns (age ${age}h, PR $pr)"
       delete_ci_ducklings "$pr"
       wait_ci_ducklings_deleted "$pr" 300s || true
       for org in $(ci_orgs "$pr"); do drop_cnpg_role "$org"; done
       NS="$ns" delete_pod_identity
-      PR_NUMBER="$pr" delete_trino_cell_stack
       delete_ci_bindings "$pr"
       "${KUBECTL[@]}" delete namespace "$ns" --ignore-not-found --wait=false
       NS="$ns" PR_NUMBER="$pr" cleanup_hoglake_storage || return 1

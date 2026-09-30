@@ -54,13 +54,11 @@ func withPoolEnv(t *testing.T, values map[string]string) {
 }
 
 // A registry that declares a shared pool while the feature flag is off must
-// fail startup, not silently fall back to legacy behavior: the operator asked
-// for a pool and would otherwise get fixed blue/green without being told.
+// fail startup rather than silently disabling the requested pool.
 func TestSharedPoolCellRequiresTheFeatureFlag(t *testing.T) {
 	withPoolEnv(t, map[string]string{
-		envTrinoCellsFile:    sharedPoolRegistry(t, blueprintFile(t)),
-		envTrinoRegistryOnly: "true",
-		envTrinoPoolEnabled:  "",
+		envTrinoCellsFile:   sharedPoolRegistry(t, blueprintFile(t)),
+		envTrinoPoolEnabled: "",
 	})
 	if _, err := resolveTrinoPoolConfigs(); err == nil {
 		t.Fatal("a shared-pool cell was accepted with the feature disabled")
@@ -69,9 +67,8 @@ func TestSharedPoolCellRequiresTheFeatureFlag(t *testing.T) {
 
 func TestSharedPoolConfigResolves(t *testing.T) {
 	withPoolEnv(t, map[string]string{
-		envTrinoCellsFile:    sharedPoolRegistry(t, blueprintFile(t)),
-		envTrinoRegistryOnly: "true",
-		envTrinoPoolEnabled:  "true",
+		envTrinoCellsFile:   sharedPoolRegistry(t, blueprintFile(t)),
+		envTrinoPoolEnabled: "true",
 	})
 	configs, err := resolveTrinoPoolConfigs()
 	if err != nil {
@@ -97,11 +94,10 @@ func TestSharedPoolConfigResolves(t *testing.T) {
 	}
 }
 
-// A cell with no mode is the existing fixed blue/green cell, byte for byte.
-func TestFixedCellsAreNotPools(t *testing.T) {
+// Static backends cannot silently bypass the shared-pool configuration.
+func TestFixedCellsAreRejected(t *testing.T) {
 	withPoolEnv(t, map[string]string{
-		envTrinoRegistryOnly: "true",
-		envTrinoPoolEnabled:  "true",
+		envTrinoPoolEnabled: "true",
 		envTrinoCellsFile: writeRegistry(t, `{"cells":[{
 			"id":"cell-002","namespace":"trino-cell-002",
 			"client_url":"https://{database_name}.example.invalid","routing_group":"cell-002",
@@ -110,12 +106,8 @@ func TestFixedCellsAreNotPools(t *testing.T) {
 				{"id":"green","coordinator_url":"https://green.invalid","running":false,"routing_active":false,"internal_secret_name":"green-secret"}
 			]}]}`),
 	})
-	configs, err := resolveTrinoPoolConfigs()
-	if err != nil {
-		t.Fatalf("resolve: %v", err)
-	}
-	if len(configs) != 0 {
-		t.Fatalf("a fixed cell produced %d pools", len(configs))
+	if _, err := resolveTrinoPoolConfigs(); err == nil {
+		t.Fatal("removed fixed topology was accepted")
 	}
 }
 
@@ -143,9 +135,8 @@ func TestSharedPoolRegistryValidation(t *testing.T) {
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
 			withPoolEnv(t, map[string]string{
-				envTrinoCellsFile:    writeRegistry(t, body),
-				envTrinoRegistryOnly: "true",
-				envTrinoPoolEnabled:  "true",
+				envTrinoCellsFile:   writeRegistry(t, body),
+				envTrinoPoolEnabled: "true",
 			})
 			if _, err := resolveTrinoPoolConfigs(); err == nil {
 				t.Fatalf("accepted %s", name)
@@ -161,9 +152,8 @@ func TestSharedPoolRegistryValidation(t *testing.T) {
 func TestUnreadableBlueprintFreezesTheConfig(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "absent.json")
 	withPoolEnv(t, map[string]string{
-		envTrinoCellsFile:    sharedPoolRegistry(t, missing),
-		envTrinoRegistryOnly: "true",
-		envTrinoPoolEnabled:  "true",
+		envTrinoCellsFile:   sharedPoolRegistry(t, missing),
+		envTrinoPoolEnabled: "true",
 	})
 	configs, err := resolveTrinoPoolConfigs()
 	if err != nil {
@@ -190,9 +180,8 @@ func TestInvalidBlueprintFreezesTheConfig(t *testing.T) {
 		t.Fatalf("write blueprint: %v", err)
 	}
 	withPoolEnv(t, map[string]string{
-		envTrinoCellsFile:    sharedPoolRegistry(t, path),
-		envTrinoRegistryOnly: "true",
-		envTrinoPoolEnabled:  "true",
+		envTrinoCellsFile:   sharedPoolRegistry(t, path),
+		envTrinoPoolEnabled: "true",
 	})
 	configs, err := resolveTrinoPoolConfigs()
 	if err != nil {
@@ -211,8 +200,7 @@ func TestBlueprintNamespaceMustMatchTheCell(t *testing.T) {
 		envTrinoCellsFile: writeRegistry(t, `{"cells":[{"id":"cell-009","namespace":"trino-cell-009",
 			"client_url":"https://{database_name}.example.invalid","routing_group":"cell-009","mode":"shared-pool",
 			"pool":{"desired_instances":3,"min_serving":3,"max_surge":1,"max_repair":1,"blueprint_file":"`+blueprintFile(t)+`","coordinator_service_port":8443,"node_environment":"e"}}]}`),
-		envTrinoRegistryOnly: "true",
-		envTrinoPoolEnabled:  "true",
+		envTrinoPoolEnabled: "true",
 	})
 	configs, err := resolveTrinoPoolConfigs()
 	if err != nil {

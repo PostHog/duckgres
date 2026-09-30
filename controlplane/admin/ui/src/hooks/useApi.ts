@@ -776,7 +776,7 @@ export function useCancelReshard() {
 // routes unregistered, and the pages render a "no cell configured" state
 // rather than an error.
 
-const NO_TRINO_CELL: TrinoCell = { id: "", coordinator_url: "" };
+const NO_TRINO_CELL: TrinoCell = { id: "" };
 
 export function useTrinoStatus(cell?: string) {
   return useQuery({

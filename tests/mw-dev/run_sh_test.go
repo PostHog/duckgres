@@ -128,8 +128,7 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 		t.Fatalf("Trino deploy requires deployments/scale RBAC; calls:\n%s", calls)
 	}
 	for deployment, replicas := range map[string]int{
-		"duckgres-trino-coordinator": 1,
-		"duckgres-trino-worker":      3,
+		"duckgres-trino-gateway": 1,
 	} {
 		want := "patch deployment " + deployment + " --type=merge -p {\"spec\":{\"replicas\":" + strconv.Itoa(replicas) + "}}"
 		if !strings.Contains(calls, want) {
@@ -1580,10 +1579,10 @@ func TestTrinoSuiteUsesOnlyItsOwnCoordinatorAndProjectionNamespace(t *testing.T)
 	for _, want := range []string{
 		`name: duckgres-trino`,
 		`name: duckgres-trino-opa`,
-		`"value": "https://duckgres-trino.${NAMESPACE}.svc:8443"`,
-		`"name": "DUCKGRES_TRINO_NAMESPACE"`,
+		`"value": "https://duckgres-trino-gateway.${NAMESPACE}.svc:8443"`,
+		`"name": "DUCKGRES_TRINO_POOL_CONFIG_NAMESPACE"`,
 		`"value": "${NAMESPACE}"`,
-		`"name": "DUCKGRES_TRINO_CELL_ID"`,
+		`"name": "DUCKGRES_TRINO_POOL_CATALOG_CELL_ID"`,
 		`"value": "ci-pr-${PR_NUMBER}"`,
 	} {
 		if !strings.Contains(manifest, want) {
@@ -1620,7 +1619,7 @@ func TestTrinoSuiteUsesOnlyItsOwnCoordinatorAndProjectionNamespace(t *testing.T)
 	}
 	harness := string(harnessRaw)
 	for _, want := range []string{
-		`"$API/api/v1/trino/queries/$query_id"`,
+		`"$API/api/v1/trino/queries/$query_id?cell=pool-test"`,
 		`'.query_id == $q and .org == $org'`,
 		`catalog_absent=false`,
 	} {
@@ -1959,6 +1958,10 @@ if [[ "$*" == *" exec duckgres-control-plane-test -- sh -c "* ]]; then
   printf 'http://pod-identity-credentials'
   exit 0
 fi
+if [[ "$*" == *"SELECT count(*) FROM duckgres_trino_pool_instances"* ]]; then
+  printf '1\n'
+  exit 0
+fi
 
 exit 0
 `)
@@ -1993,6 +1996,7 @@ printf 'test-secret\n'
 printf 'envsubst %s\n' "$*" >> "$RUN_SH_TEST_CALLS"
 cat
 `)
+	writeFake(t, binDir, "go", "#!/usr/bin/env bash\ncat\n")
 
 	writeFake(t, binDir, "curl", `#!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$RUN_SH_TEST_CALLS"
@@ -2045,7 +2049,8 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 		"NAMESPACE=duckgres-ci-pr-123",
 		"PR_NUMBER=123",
 		"WORKER_IMAGE=example.invalid/duckgres:test",
-		"CONTROLPLANE_IMAGE=example.invalid/duckgres:test",
+		"CONTROLPLANE_IMAGE=example.invalid/duckgres@sha256:"+strings.Repeat("a", 64),
+		"TRINO_GATEWAY_IMAGE=example.invalid/gateway@sha256:"+strings.Repeat("b", 64),
 		"CP_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/duckgres-control-plane-dev",
 		"EKS_CLUSTER_NAME=test-cluster",
 		"AWS_REGION=us-east-1",
@@ -2219,33 +2224,6 @@ cat
 				if image != tc.want {
 					t.Fatalf("rendered Trino image %q, want %q", image, tc.want)
 				}
-			}
-		})
-	}
-}
-
-func TestTrinoCacheModeFollowsScenario(t *testing.T) {
-	for _, tc := range []struct{ scenario, enabled string }{
-		{"posthog_frozen_perf", "false"},
-	} {
-		t.Run(tc.scenario, func(t *testing.T) {
-			fakes := newRunSHFakes(t)
-			writeFake(t, fakes.binDir, "envsubst", `#!/usr/bin/env bash
-printf 'cache-mode %s\n' "${TRINO_FILESYSTEM_CACHE_ENABLED:-unset}" >> "$RUN_SH_TEST_CALLS"
-cat
-`)
-			secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
-			for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
-				if err := os.WriteFile(filepath.Join(secretDir, name), []byte("test-tls-material\n"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "E2E_SUITE=trino", "SCENARIO_NAME="+tc.scenario, "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-test", "SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/scenario-test")
-			if out, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("deploy: %v\n%s", err, out)
-			}
-			if calls := fakes.calls(t); !strings.Contains(calls, "cache-mode "+tc.enabled+"\n") {
-				t.Fatalf("catalog cache mode was not %s: %s", tc.enabled, calls)
 			}
 		})
 	}

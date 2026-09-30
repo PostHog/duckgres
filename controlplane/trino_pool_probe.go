@@ -9,101 +9,20 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/posthog/duckgres/controlplane/provisioner"
 )
 
-var rolloutCoordinatorIDPattern = regexp.MustCompile(`^[a-zA-Z0-9]{5}$`)
+var trinoPoolCoordinatorIDPattern = regexp.MustCompile(`^[a-zA-Z0-9]{5}$`)
 
-type rolloutCanaryEligibility func(context.Context, rolloutCanaryCredential, string) (bool, error)
-
-func newRolloutProbe(eligible rolloutCanaryEligibility) func(context.Context, rolloutReadinessSlot) (*rolloutCoordinatorFacts, error) {
-	return func(ctx context.Context, slot rolloutReadinessSlot) (*rolloutCoordinatorFacts, error) {
-		allowed, err := eligible(ctx, slot.canary, registeredTrinoCellPrefix+slot.cell)
-		if err != nil || !allowed {
-			return nil, errors.New("canary is not eligible")
-		}
-		user, password := slot.observer()
-		client := rolloutSQLClient{baseURL: slot.coordinatorURL, client: slot.client, username: user, password: password}
-		before, err := client.info(ctx)
-		if err != nil {
-			return nil, err
-		}
-		rows, err := client.statement(ctx, "SELECT node_id, http_uri, coordinator, state FROM system.runtime.nodes")
-		if err != nil {
-			return nil, err
-		}
-		seen := make(map[string]bool)
-		seenIPs := make(map[string]bool)
-		coordinators, workers := 0, 0
-		if len(rows) > 1000 {
-			return nil, errors.New("node inventory exceeds limit")
-		}
-		for _, row := range rows {
-			if len(row) != 4 {
-				return nil, errors.New("invalid node row")
-			}
-			id, idOK := row[0].(string)
-			endpoint, endpointOK := row[1].(string)
-			coordinator, coordinatorOK := row[2].(bool)
-			state, stateOK := row[3].(string)
-			parsed, parseErr := url.Parse(endpoint)
-			if !idOK || id == "" || seen[id] || !endpointOK || parseErr != nil || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") || (parsed.Scheme != "http" && parsed.Scheme != "https") || !coordinatorOK || !stateOK || state != "active" {
-				return nil, errors.New("invalid or non-active node inventory")
-			}
-			ip, ipErr := netip.ParseAddr(parsed.Hostname())
-			if ipErr != nil || seenIPs[ip.Unmap().String()] {
-				return nil, errors.New("invalid or duplicate member pod IP")
-			}
-			seenIPs[ip.Unmap().String()] = true
-			before.members = append(before.members, rolloutNodeMember{ip: ip.Unmap().String(), coordinator: coordinator})
-			seen[id] = true
-			if coordinator {
-				coordinators++
-				if id != before.NodeID {
-					return nil, errors.New("coordinator node identity mismatch")
-				}
-			} else {
-				workers++
-			}
-		}
-		if coordinators != 1 || workers == 0 {
-			return nil, errors.New("incomplete node inventory")
-		}
-		client.username, client.password = slot.canary.Principal, slot.canary.Password
-		catalog := provisioner.TrinoCatalogName(slot.canary.Principal)
-		schemas, err := client.statement(ctx, `SELECT schema_name FROM "`+strings.ReplaceAll(catalog, `"`, `""`)+`".information_schema.schemata`)
-		if err != nil {
-			return nil, err
-		}
-		if len(schemas) == 0 {
-			return nil, errors.New("catalog metadata is empty")
-		}
-		for _, row := range schemas {
-			if len(row) != 1 {
-				return nil, errors.New("invalid catalog metadata row")
-			}
-			name, ok := row[0].(string)
-			if !ok || strings.TrimSpace(name) == "" {
-				return nil, errors.New("invalid catalog metadata name")
-			}
-		}
-		client.username, client.password = user, password
-		after, err := client.info(ctx)
-		if err != nil || before.NodeID != after.NodeID || before.CoordinatorID != after.CoordinatorID {
-			return nil, errors.New("coordinator changed during observation")
-		}
-		before.RegisteredWorkers = workers
-		return before, nil
-	}
+type trinoPoolCoordinatorFacts struct {
+	NodeID        string
+	CoordinatorID string
 }
 
-func newRolloutHTTPClient(tlsServerName string) *http.Client {
+func newTrinoPoolHTTPClient(tlsServerName string) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// These registry-owned cluster endpoints use a scoped direct transport.
 	transport.Proxy = nil
@@ -112,7 +31,7 @@ func newRolloutHTTPClient(tlsServerName string) *http.Client {
 	return &http.Client{Transport: transport, Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
-type rolloutSQLClient struct {
+type trinoPoolSQLClient struct {
 	baseURL            string
 	client             *http.Client
 	username, password string
@@ -122,7 +41,7 @@ type rolloutSQLClient struct {
 	// authenticated request has to carry the forwarded-HTTPS metadata the
 	// Gateway would supply. Authentication is NOT relaxed anywhere: without
 	// these headers Trino refuses the credential rather than accepting it in
-	// the clear. The legacy fixed-cell path leaves this false and keeps its
+	// the clear. HTTPS endpoints leave this false and keep their
 	// HTTPS-only checks byte for byte.
 	internalHTTP bool
 }
@@ -132,14 +51,14 @@ type rolloutSQLClient struct {
 // not a way to bypass the coordinator's own authentication.
 const forwardedScheme = "https"
 
-func (c rolloutSQLClient) scheme() string {
+func (c trinoPoolSQLClient) scheme() string {
 	if c.internalHTTP {
 		return "http"
 	}
 	return "https"
 }
 
-func (c rolloutSQLClient) read(ctx context.Context, method, endpoint, sql string) ([]byte, error) {
+func (c trinoPoolSQLClient) read(ctx context.Context, method, endpoint, sql string) ([]byte, error) {
 	base, baseErr := url.Parse(c.baseURL)
 	parsed, err := url.Parse(endpoint)
 	if baseErr != nil || err != nil || base.Scheme != c.scheme() || !strings.EqualFold(parsed.Hostname(), base.Hostname()) || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || (parsed.Path != "/v1/statement" && !strings.HasPrefix(parsed.Path, "/v1/statement/") && parsed.Path != "/v1/info") {
@@ -147,13 +66,13 @@ func (c rolloutSQLClient) read(ctx context.Context, method, endpoint, sql string
 	}
 	internalContinuation := c.internalHTTP && method == http.MethodGet &&
 		strings.HasPrefix(parsed.Path, "/v1/statement/") &&
-		parsed.Scheme == forwardedScheme && rolloutHTTPSPort(parsed) == "443"
+		parsed.Scheme == forwardedScheme && trinoPoolHTTPSPort(parsed) == "443"
 	if internalContinuation {
 		// Trino returns the HTTPS origin declared by our forwarded headers.
 		// Keep validated result paths on the configured internal coordinator transport.
 		parsed.Scheme, parsed.Host = base.Scheme, base.Host
 		endpoint = parsed.String()
-	} else if parsed.Scheme != base.Scheme || rolloutHTTPSPort(parsed) != rolloutHTTPSPort(base) {
+	} else if parsed.Scheme != base.Scheme || trinoPoolHTTPSPort(parsed) != trinoPoolHTTPSPort(base) {
 		return nil, errors.New("invalid coordinator response endpoint")
 	}
 	if c.username == "" || c.password == "" {
@@ -190,7 +109,7 @@ func (c rolloutSQLClient) read(ctx context.Context, method, endpoint, sql string
 	return body, nil
 }
 
-func rolloutHTTPSPort(endpoint *url.URL) string {
+func trinoPoolHTTPSPort(endpoint *url.URL) string {
 	if port := endpoint.Port(); port != "" {
 		return port
 	}
@@ -200,7 +119,7 @@ func rolloutHTTPSPort(endpoint *url.URL) string {
 	return "443"
 }
 
-func (c rolloutSQLClient) info(ctx context.Context) (*rolloutCoordinatorFacts, error) {
+func (c trinoPoolSQLClient) info(ctx context.Context) (*trinoPoolCoordinatorFacts, error) {
 	body, err := c.read(ctx, http.MethodGet, c.baseURL+"/v1/info", "")
 	if err != nil {
 		return nil, err
@@ -211,13 +130,13 @@ func (c rolloutSQLClient) info(ctx context.Context) (*rolloutCoordinatorFacts, e
 		NodeID        string `json:"nodeId"`
 		CoordinatorID string `json:"coordinatorId"`
 	}
-	if json.Unmarshal(body, &value) != nil || !value.Coordinator || value.Starting == nil || *value.Starting || value.NodeID == "" || !rolloutCoordinatorIDPattern.MatchString(value.CoordinatorID) {
+	if json.Unmarshal(body, &value) != nil || !value.Coordinator || value.Starting == nil || *value.Starting || value.NodeID == "" || !trinoPoolCoordinatorIDPattern.MatchString(value.CoordinatorID) {
 		return nil, errors.New("invalid coordinator identity")
 	}
-	return &rolloutCoordinatorFacts{NodeID: value.NodeID, CoordinatorID: value.CoordinatorID}, nil
+	return &trinoPoolCoordinatorFacts{NodeID: value.NodeID, CoordinatorID: value.CoordinatorID}, nil
 }
 
-func (c rolloutSQLClient) statement(ctx context.Context, sql string) ([][]any, error) {
+func (c trinoPoolSQLClient) statement(ctx context.Context, sql string) ([][]any, error) {
 	endpoint, method := c.baseURL+"/v1/statement", http.MethodPost
 	var rows [][]any
 	totalBytes := 0

@@ -63,8 +63,8 @@ func TestEnableTrinoIsIdempotentAndPreservesReconcileState(t *testing.T) {
 	}
 
 	// The reconcile loop advances the row...
-	if err := store.AssignTrinoCell("acme", "cell-001"); err != nil {
-		t.Fatalf("AssignTrinoCell: %v", err)
+	if err := store.DB().Model(&configstore.ManagedWarehouseTrino{}).Where("org_id = ?", "acme").Update("trino_cell_id", "cell-001").Error; err != nil {
+		t.Fatalf("seed assigned cell: %v", err)
 	}
 	now := time.Now().UTC()
 	if err := store.UpdateTrinoState("acme", configstore.TrinoStateUpdate{
@@ -90,27 +90,6 @@ func TestEnableTrinoIsIdempotentAndPreservesReconcileState(t *testing.T) {
 	}
 	if row.TrinoCellID != "cell-001" {
 		t.Errorf("trino_cell_id = %q, want the claim to survive a re-enable", row.TrinoCellID)
-	}
-}
-
-func TestAssignTrinoCellNeverStealsAnOwnedOrg(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-	seedTrinoOrg(t, store, "acme")
-	if err := store.EnableTrino("acme", configstore.TrinoSettings{}); err != nil {
-		t.Fatalf("EnableTrino: %v", err)
-	}
-
-	if err := store.AssignTrinoCell("acme", "cell-001"); err != nil {
-		t.Fatalf("AssignTrinoCell (first): %v", err)
-	}
-	// A second cell tries to claim the same org. The conditional WHERE is
-	// the only thing stopping two coordinators from both projecting this
-	// tenant's credentials and catalog.
-	if err := store.AssignTrinoCell("acme", "cell-002"); err != nil {
-		t.Fatalf("AssignTrinoCell (second) must be a silent no-op, got %v", err)
-	}
-	if got := trinoRow(t, store, "acme").TrinoCellID; got != "cell-001" {
-		t.Fatalf("trino_cell_id = %q, want cell-001 (the second claim must not steal it)", got)
 	}
 }
 
@@ -237,9 +216,6 @@ func TestListTrinoEnabledOrgsJoinsRootUserAndCarriesCell(t *testing.T) {
 		if err := store.EnableTrino(org, settings); err != nil {
 			t.Fatalf("EnableTrino(%s): %v", org, err)
 		}
-	}
-	if claimed, err := store.ClaimTrinoCell("acme", "legacy-cell"); err != nil || claimed {
-		t.Fatalf("legacy claimed default-placed tenant: claimed=%v err=%v", claimed, err)
 	}
 	// beta stays unassigned — the listing must still return it so a cell
 	// can claim it. Filtering by cell in SQL would make a freshly enabled

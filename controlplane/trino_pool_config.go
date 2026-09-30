@@ -14,10 +14,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/trinopool"
 )
 
-// Shared-pool configuration, resolved from the SAME registry file the existing
-// fixed blue/green cells come from. A cell opts in with `mode: "shared-pool"`
-// plus a `pool` block; everything without it keeps today's behavior byte for
-// byte.
+// Shared-pool configuration comes from the mounted registry.
 //
 // The pool deliberately inherits the cell's LOGICAL ASSIGNMENT identity — its
 // pool id, its routing group and its namespace — because replacing compute must
@@ -31,7 +28,6 @@ const (
 	envTrinoPoolGatewayURL            = "DUCKGRES_TRINO_POOL_GATEWAY_URL"
 	envTrinoPoolNodeDisruptionEnabled = "DUCKGRES_TRINO_POOL_NODE_DISRUPTION_ENABLED"
 
-	trinoPoolModeFixed  = "fixed"
 	trinoPoolModeShared = "shared-pool"
 
 	maxBlueprintFileBytes = 1 << 20
@@ -91,8 +87,7 @@ func trinoPoolOperatorEnabled() bool {
 }
 
 // resolveTrinoPoolConfigs returns the shared pools declared in the registry.
-// Cells without a pool block are ignored here and continue through the existing
-// fixed-cell path untouched.
+// Every registry entry must declare a shared pool.
 func resolveTrinoPoolConfigs() ([]trinoPoolConfig, error) {
 	return resolveTrinoPoolConfigsFrom(context.Background(), trinoPoolFileConfigReader{})
 }
@@ -121,15 +116,10 @@ func resolveTrinoPoolConfigsFrom(ctx context.Context, reader trinoPoolConfigRead
 	var configs []trinoPoolConfig
 	for _, cell := range cells {
 		mode := strings.TrimSpace(cell.Mode)
-		if mode == "" || mode == trinoPoolModeFixed {
-			continue
-		}
 		if mode != trinoPoolModeShared {
 			return nil, fmt.Errorf("Trino cell %s has an unsupported mode %q", cell.ID, mode)
 		}
-		// Asking for a pool while the feature is off must fail loudly. Falling
-		// back to fixed blue/green would give the operator a deployment shape
-		// they did not ask for and would not be told about.
+		// Reject requested pools when the feature gate is disabled.
 		if !trinoPoolEnabled() {
 			return nil, fmt.Errorf("Trino cell %s declares shared-pool mode but %s is not enabled", cell.ID, envTrinoPoolEnabled)
 		}
@@ -172,12 +162,6 @@ func resolveTrinoPoolConfig(snapshot trinoPoolConfigSnapshot, cell trinoRegister
 	pool := cell.Pool
 	if pool == nil {
 		return trinoPoolConfig{}, fmt.Errorf("Trino cell %s is in shared-pool mode but declares no pool block", cell.ID)
-	}
-	if len(cell.Backends) != 0 {
-		// A pooled cell's members are created by the operator and recorded in
-		// the config store. A static backend list would be a second, silently
-		// competing source of truth for the same routing group.
-		return trinoPoolConfig{}, fmt.Errorf("Trino cell %s is in shared-pool mode and must not declare static backends", cell.ID)
 	}
 	if pool.DesiredInstances < 1 {
 		return trinoPoolConfig{}, fmt.Errorf("Trino cell %s must declare at least one desired instance", cell.ID)

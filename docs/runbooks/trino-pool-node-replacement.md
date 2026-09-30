@@ -1,7 +1,7 @@
 # Shared-pool node replacement
 
 This optional controller replaces a shared-pool Trino instance before its original
-compute is removed for a voluntary infrastructure change. It does not change legacy
+compute is removed for a voluntary infrastructure change. It does not change other
 Trino, intercept SIGTERM, expire transactions, or convert failure into successful drain.
 
 ## Enable safely

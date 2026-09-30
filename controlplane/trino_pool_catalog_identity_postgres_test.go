@@ -109,7 +109,7 @@ func TestCatalogWriterRequiresAStorePartition(t *testing.T) {
 			t.Setenv(envTrinoPoolCatalogCellID, partition)
 
 			writer, err := buildTrinoPoolCatalogWriter("registered:example-pool", nil,
-				func() (configstore.TrinoPoolLease, bool) { return configstore.TrinoPoolLease{}, false }, nil)
+				func() (configstore.TrinoPoolLease, bool) { return configstore.TrinoPoolLease{}, false })
 			if err == nil {
 				t.Fatal("the writer was built with no usable store partition")
 			}

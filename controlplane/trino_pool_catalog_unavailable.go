@@ -37,10 +37,6 @@ func (c unavailableTrinoCatalogClient) ListCatalogs(context.Context) ([]string, 
 	return nil, c.err()
 }
 
-func (c unavailableTrinoCatalogClient) ListNodes(context.Context) ([]provisioner.TrinoNode, error) {
-	return nil, c.err()
-}
-
 func (c unavailableTrinoCatalogClient) CreateCatalog(context.Context, string, map[string]string) error {
 	return c.err()
 }

@@ -29,7 +29,7 @@ function orgStatus(over: Partial<TrinoOrgStatus> = {}): TrinoOrgStatus {
 
 function detail(over: Partial<TrinoOrgDetail> = {}): TrinoOrgDetail {
   return {
-    cell: { id: "legacy", coordinator_url: "https://coordinator" },
+    cell: { id: "legacy" },
     enabled: true,
     available: true,
     status: orgStatus(),

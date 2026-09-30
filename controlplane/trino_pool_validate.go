@@ -176,7 +176,7 @@ func validateTrinoPoolCandidate(
 	requiredCatalogRevision := expected.CatalogRevision
 
 	username, password := credential()
-	sql := rolloutSQLClient{
+	sql := trinoPoolSQLClient{
 		baseURL: coordinatorURL, client: client, username: username, password: password,
 		internalHTTP: expected.InternalHTTP,
 	}
@@ -424,7 +424,7 @@ func fetchCatalogSync(ctx context.Context, client *http.Client, coordinatorURL, 
 
 // registeredWorkerCount reads the coordinator's own node inventory and counts
 // the active workers that have registered with it.
-func registeredWorkerCount(ctx context.Context, sql rolloutSQLClient, coordinatorNodeID string) (int, error) {
+func registeredWorkerCount(ctx context.Context, sql trinoPoolSQLClient, coordinatorNodeID string) (int, error) {
 	rows, err := sql.statement(ctx, "SELECT node_id, coordinator, state FROM system.runtime.nodes")
 	if err != nil {
 		return 0, fmt.Errorf("%w: node inventory unavailable: %v", errTrinoPoolCandidateNotReady, err)

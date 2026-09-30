@@ -107,7 +107,6 @@ func poolAPIReader(t *testing.T, client kubernetes.Interface) trinoPoolConfigRea
 // still holds the previous configuration, and re-reading it more often does not
 // make it current. Only the API object is one value for the whole fleet.
 func TestDesiredStateComesFromTheAPIObjectNotTheMount(t *testing.T) {
-	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	client := poolConfigMap(t, 5, 4)
 
@@ -139,7 +138,6 @@ func TestDesiredStateComesFromTheAPIObjectNotTheMount(t *testing.T) {
 // A configuration change is picked up without anything re-reading a file and
 // without the process restarting: the next resolution reads the object again.
 func TestDesiredStateFollowsTheAPIObjectAsItChanges(t *testing.T) {
-	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	t.Setenv(envTrinoCellsFile, mountedRegistry(t, 3, 3))
 	client := poolConfigMap(t, 3, 3)
@@ -168,7 +166,6 @@ func TestDesiredStateFollowsTheAPIObjectAsItChanges(t *testing.T) {
 // never resolve to an empty configuration, because "no pools" and "desired
 // zero" would delete a running fleet over an API blip.
 func TestUnreadableDesiredStateSourceIsAnError(t *testing.T) {
-	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	client := fake.NewClientset()
 	if _, err := resolveTrinoPoolConfigByID(context.Background(), poolAPIReader(t, client), "cell-001"); err == nil {
@@ -217,7 +214,6 @@ func TestBlueprintKeyIsTheDeclaredFileName(t *testing.T) {
 // that never existed anywhere, published as desired state. The reader is
 // asserted to make a single Get per resolution.
 func TestDesiredStateIsOneAtomicRead(t *testing.T) {
-	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	client := poolConfigMap(t, 3, 3)
 	gets := 0

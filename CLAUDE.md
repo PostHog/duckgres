@@ -998,8 +998,8 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   coordinator, so its observer (`trino_pool_observer.go`) lists the pool's
   live instances on every call and fans out to each instance's Service over
   forwarded HTTPS; usage metering polls the same observer. Never build a
-  pool observer from `CoordinatorURL` - it is empty (#1216). Unset
-  legacy URL and registry configuration leaves the routes unregistered.
+  pool observer from a fixed coordinator address. Unset
+  pool registry configuration leaves the routes unregistered.
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp
   `authz_test.go`, `kill_switch_test.go`, `operators_api_test.go`,
   `trino_test.go`, `trino_client_test.go`),
@@ -1633,19 +1633,10 @@ An org enabled for Trino gets a catalog, a login, authorization and resource
 limits on a shared multi-tenant Trino cluster called a **cell**. The control
 plane is the only writer of that state: `provisioner/trino_provisioner.go`
 projects it every controller tick from `duckgres_managed_warehouse_trino` +
-the org's warehouse row + its Duckling CR. Enablement is env-inferred —
-`DUCKGRES_TRINO_COORDINATOR_URL` identifies legacy (`controlplane/trino_inputs.go`).
-The optional `DUCKGRES_TRINO_CELLS_FILE` adds namespace-isolated logical cells
-with blue/green backends. It requires legacy unless
-`DUCKGRES_TRINO_REGISTRY_ONLY=true` explicitly selects a registry-only deployment.
-That mode requires a valid registry and forbids a legacy coordinator URL.
-Registered reconcilers never claim unassigned warehouses. The optional
-`DUCKGRES_TRINO_DEFAULT_CELL` assigns unowned tenants atomically at enablement;
-see [the placement runbook](docs/trino-cells.md#automatic-placement-runbook).
-With no Trino configuration, the branch never wires. **Trino is binary: if
-you asked for it, a wiring failure is fatal at startup**, because silently
-skipping leaves the cell's OPA sidecar serving a last-good bundle while
-password/tenant/catalog changes never propagate.
+the org's warehouse row + its Duckling CR. Enablement uses `DUCKGRES_TRINO_CELLS_FILE`. Only `mode: "shared-pool"`
+registrations are accepted. Missing or invalid requested configuration fails
+startup. There is no standalone coordinator or fixed blue/green runtime.
+See [docs/trino-cells.md](docs/trino-cells.md) for configuration and retirement.
 
 - **The catalog is DuckLake and carries NO secret.** Per org:
   `connector.name=ducklake`, `ducklake.metadata.connection-url` (a JDBC URL
@@ -1671,12 +1662,11 @@ password/tenant/catalog changes never propagate.
   key is removed on the next tick.
 - **Tenant client coordinates are non-secret and readiness-gated.** The org
   detail endpoint returns `status.connection` only while the catalog is ready
-  and the coordinator is reachable. `DUCKGRES_TRINO_CLIENT_URL` names the HTTPS
-  endpoint clients should dial; when unset, the control plane falls back to its
-  coordinator URL and TLS server name. The response contains host, port and the
+  and a coordinator is reachable. Registry `client_url` names the explicit HTTPS
+  endpoint clients should dial. There is no direct-coordinator fallback.
+  The response contains host, port and the
   tenant principal, never a password or password hash. A client URL whose
-  leading host label is `{database_name}` (registry `client_url` or the env
-  var; `ResolveTrinoClientURL`) advertises each org's own
+  leading host label is `{database_name}` (`ResolveTrinoClientURL`) advertises each org's own
   `<database_name>.<domain>` with username `root`: the Trino fork qualifies a
   login with the org its host names
   (`http-server.authentication.password.host-qualified-user.domains`), so a
@@ -1686,9 +1676,7 @@ password/tenant/catalog changes never propagate.
 - **`Reconcile` order is load-bearing**: cluster secrets → auth files →
   resource groups → OPA bundle → tenant passwords → catalogs, and the
   `globalErr` gate SKIPS the catalog step if any projection failed. A
-  coordinator that just lost its `password.db` keys 401s every catalog REST
-  call, which would surface as a misleading "catalog reconcile failed" masking
-  the real problem.
+  pool must not publish catalogs before the required projections are complete.
 - **`ensureClusterSecrets` is write-once with a sentinel.** The K8s Secret is
   the source of truth for each cluster credential; the configstore holds only
   a one-bit `duckgres_trino_cluster_bootstrap` row per namespace. Missing
@@ -1703,20 +1691,9 @@ password/tenant/catalog changes never propagate.
   API errors also fail without attempting repair. No advisory lock serializes
   these Kubernetes writes. Never overwrite an existing complete pair to repair
   a suspected bootstrap race. Confirm stored corruption before operator recovery.
-- **Static catalog reconcile is `SHOW CATALOGS` first**: create only what's missing,
-  drop only names matching `opa.ManagedCatalogPattern` that aren't wanted, so
-  `system`, `jmx` and hand-made catalogs survive. An org whose password is
-  momentarily unresolvable keeps its existing catalog (never dropped) but is
-  NOT reported ready.
-- **Shared catalog mode is explicit and fenced.** Registered cells can use
-  `catalog_management: paused` for compatibility rollout or `gateway-shared`
-  for sole-active-backend catalog writes. Freeze new admissions and DDL before
-  warming the standby; bulk-check catalog states and admitted tenant credentials,
-  cut over, then release before draining. See
-  [docs/runbooks/trino-shared-catalogs.md](docs/runbooks/trino-shared-catalogs.md).
-  Never replay CREATE across both slots. A remote FAILED query is not proof
-  that synchronous DDL stopped; retain the durable intent until fenced recovery.
-  Paused and non-owner replicas still refresh auth and OPA projections.
+- **Catalog publication uses the pool writer fence.** No coordinator receives
+  CREATE/DROP CATALOG from the provisioner. A replica without writer authority
+  leaves the tenant readiness row unchanged.
 - **Provisioner catalog inventory is narrowly authorized.** The admin can read
   `catalog_name` and `state` from `system.metadata.catalogs`, in addition to
   the existing node inventory. The observer and customer principals cannot.
@@ -1828,46 +1805,14 @@ password/tenant/catalog changes never propagate.
   `root.tenants.free.<principal>` — and those leaves are `JmxExport: true`,
   so it would appear as a phantom tenant in the per-tenant resource-group
   metrics.
-- **Resource groups must keep the `root.admin.__admin_provisioner` selector.**
-  Trino rejects a query matching no resource group, so dropping it silently
-  breaks every reconcile tick's own DDL.
-- **Cells, minimally**: `trino_cell_id` on the row names the owning cell
-  (`DUCKGRES_TRINO_CELL_ID`, default `configstore.DefaultTrinoCellID`). A
-  provisioner claims unassigned orgs (`ClaimTrinoCell`, conditional in SQL so
-  no cell can steal another's tenant), reconciles its own, and ignores the
-  rest — including writing NO state for them. Claims return an authoritative
-  boolean: a lost claim must never project the losing cell's tenant. Only
-  legacy claims unassigned warehouses. Registered logical IDs have the reserved
-  storage prefix `registered:`; the old stored `cell-001` remains legacy.
-  Admin-only initial selection runs before first enablement and refuses changes
-  to any already owned warehouse, including a disabled one. An owned org moves
-  only through `POST /orgs/:id/trino/cell/move` (`ConfigStore.MoveTrinoCell`): a
-  compare-and-swap on the named source under the admission lock that resets
-  the row to pending. The source's authoritative projection then cleans the org
-  up and the destination provisions it, with NO overlap - the org has no Trino
-  in between. Per-org state writes carry `TrinoStateUpdate.CellID` so a stale
-  source tick cannot mark a moved row ready; keep that fence. No live
-  migration, capacity model, rebalancer, drain, or Gateway routing controller
-  is included.
-  See [docs/trino-cells.md](docs/trino-cells.md) for configuration and recovery.
-- **Blue/green projections share one logical cell's namespace**, but internal
-  communication Secrets remain distinct, chart-owned read-only references.
-  Stopped backends do not receive catalog calls or observer polling. Every
-  running backend must reconcile its independent catalog set before the org is
-  ready. Cell failures do not block sibling-cell projections. Configuration is
-  startup-loaded and must agree across control-plane replicas.
-- **The existing deployment's API identity is `legacy`.** The Trino console
-  exposes this name in `cell.id` and in owned orgs' `status.cell` / `orgs[].cell`.
-  `TrinoCell.StoredID` keeps the configured ownership ID private to the adapter.
-  Match connection readiness against the raw persisted ID, never the alias.
-  Do not rename org assignments, catalog-store keys or environment settings.
-  The general org endpoint still exposes the original `trino.trino_cell_id`.
-  Unknown and unassigned ownership values are not relabeled.
-- **The bundle endpoint is mounted OUTSIDE `/api/v1`** (`/bundles/trino`) with
-  its own bearer auth, and `buildTrinoWiring` bootstraps SYNCHRONOUSLY so the
-  handler is constructed with the real token — there is no window where it
-  serves under a placeholder. Registered cells use `/bundles/trino/<cell-id>`;
-  each cell's token can read only its own bundle. Legacy retains the old path.
+- **Resource groups retain the operational admin selector.** Pool validation
+  queries need their operational lane; catalog publication itself uses the shared store.
+- **Ownership is explicit.** `trino_cell_id` stores `registered:<cell-id>`.
+  Initial selection or the configured default assigns the pool. Reconciliation
+  never claims an unassigned warehouse and never changes an existing owner.
+- **Bundles are pool-scoped.** `/bundles/trino/<cell-id>` uses that pool's token.
+  The console requires explicit cell selection. Unknown ownership never falls
+  back to another pool. Bootstrap finishes before the bundle handler is mounted.
 - Touching any of this → update `provisioner/trino_provisioner_test.go`,
   `provisioner/trino_cluster_secrets_test.go`, `provisioner/opa/*_test.go`,
   `provisioning/api_test.go`, `tests/configstore/trino_postgres_test.go` +
@@ -1882,9 +1827,9 @@ password/tenant/catalog changes never propagate.
 
 ## Shared Trino Compute Pool (`mode: "shared-pool"`, `kubernetes` tag) — LOAD-BEARING CONTRACT
 
-Operator-managed pool of immutable Trino instances, replacing fixed blue/green
-for a cell that opts in. **Ships disabled**: a cell without `mode:
-"shared-pool"` in `DUCKGRES_TRINO_CELLS_FILE` behaves byte for byte as today.
+Operator-managed pool of immutable Trino instances. Every configured cell must
+declare `mode: "shared-pool"`. Other topology modes fail startup. The operator
+and publication flags remain explicit feature gates.
 Code: `controlplane/trinopool/` (pure: blueprint, phases, planner, catalog-version
 port), `controlplane/trinocatalog/` (fenced catalog publisher),
 `controlplane/trinogateway/` (Gateway protocol v1 client),
@@ -1893,7 +1838,7 @@ publication barrier), migration `000041` (upstream owns `000040`,
 the Trino backend selection).
 
 - **Env, all default-off**: `DUCKGRES_TRINO_POOL_ENABLED` (a pooled cell with
-  this off FAILS startup — falling back to blue/green would hand the operator a
+  this off FAILS startup — silently ignoring the pool would hand the operator a
   shape they did not ask for), `DUCKGRES_TRINO_POOL_OPERATOR_ENABLED` (off =
   desired state is recorded, nothing external is touched),
   `DUCKGRES_TRINO_POOL_GATEWAY_URL`, `DUCKGRES_TRINO_POOL_CATALOG_WRITER_ENABLED`
@@ -2215,7 +2160,7 @@ the Trino backend selection).
   state at any moment, and failing would mark every pooled warehouse Failed).
   Candidate admission compares against the
   accepted projection, not against what the local process last published.
-  Legacy cells install no fence and are byte-for-byte unchanged.
+  Every configured cell uses the pool fence.
 - **A retried step repeats the IDENTICAL request — every field, not just the
   generation.** The Gateway journals each step under its identity and hashes
   the WHOLE request body, minus the authority envelope, so a step whose effect

@@ -237,7 +237,7 @@ func TestBundleHandlerRefusesAProjectionThatIsNoLongerAccepted(t *testing.T) {
 	}
 }
 
-// A legacy cell installs no gate, and its bundle serving is unchanged.
+// The generic bundle handler still works without an optional publication fence.
 func TestBundleHandlerIsUnchangedWithoutAFence(t *testing.T) {
 	built, _ := opa.NewBuilder().BuildBundle(opa.GroupCatalogs{"org_42": {"org_42": true}}, nil)
 	store := &opa.BundleStore{}

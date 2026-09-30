@@ -18,26 +18,22 @@ import (
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	"github.com/posthog/duckgres/controlplane/provisioning"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 )
 
-type registryOnlyOrgStore struct {
+type poolOwnerOrgStore struct {
 	row *configstore.ManagedWarehouseTrino
 	err error
 }
 
-func (s registryOnlyOrgStore) GetManagedWarehouseTrino(string) (*configstore.ManagedWarehouseTrino, error) {
+func (s poolOwnerOrgStore) GetManagedWarehouseTrino(string) (*configstore.ManagedWarehouseTrino, error) {
 	return s.row, s.err
 }
 
-func TestTrinoRegistryOnlyAdmissionUsesStoredOwnership(t *testing.T) {
+func TestTrinoPoolAdmissionUsesStoredOwnership(t *testing.T) {
 	fleet := trinoFleet{&trinoWiring{Cell: trinoCell{ID: "registered:cell-test", PublicID: "cell-test"}}}
 	for _, defaultCell := range []string{"", "registered:cell-test"} {
-		if defaultCell != "" {
-			fleet = append(fleet, &trinoWiring{Cell: trinoCell{ID: "cell-001"}})
-		}
 		for _, tc := range []struct {
 			owner string
 			want  error
@@ -45,10 +41,10 @@ func TestTrinoRegistryOnlyAdmissionUsesStoredOwnership(t *testing.T) {
 			{"", provisioning.ErrTrinoCellSelectionRequired}, {"cell-001", provisioning.ErrTrinoCellNotConfigured},
 			{"legacy", provisioning.ErrTrinoCellNotConfigured}, {"registered:unknown", provisioning.ErrTrinoCellNotConfigured}, {"registered:cell-test", nil},
 		} {
-			if defaultCell != "" && (tc.owner == "" || tc.owner == "cell-001") {
+			if defaultCell != "" && tc.owner == "" {
 				tc.want = nil
 			}
-			store := registryOnlyOrgStore{row: &configstore.ManagedWarehouseTrino{TrinoCellID: tc.owner}}
+			store := poolOwnerOrgStore{row: &configstore.ManagedWarehouseTrino{TrinoCellID: tc.owner}}
 			if err := fleet.enablementCheck(store, defaultCell)("tenant"); !errors.Is(err, tc.want) {
 				t.Fatalf("default %q owner %q: %v", defaultCell, tc.owner, err)
 			}
@@ -57,37 +53,28 @@ func TestTrinoRegistryOnlyAdmissionUsesStoredOwnership(t *testing.T) {
 		if defaultCell == "" {
 			missingWant = provisioning.ErrTrinoCellSelectionRequired
 		}
-		if err := fleet.enablementCheck(registryOnlyOrgStore{}, defaultCell)("tenant"); !errors.Is(err, missingWant) {
+		if err := fleet.enablementCheck(poolOwnerOrgStore{}, defaultCell)("tenant"); !errors.Is(err, missingWant) {
 			t.Fatalf("missing row: %v", err)
 		}
 		dbErr := errors.New("database unavailable")
-		if err := fleet.enablementCheck(registryOnlyOrgStore{err: dbErr}, defaultCell)("tenant"); !errors.Is(err, dbErr) {
+		if err := fleet.enablementCheck(poolOwnerOrgStore{err: dbErr}, defaultCell)("tenant"); !errors.Is(err, dbErr) {
 			t.Fatal("read failure admitted")
 		}
 	}
-	if fleet.enablementCheck(registryOnlyOrgStore{}, "") != nil || (trinoFleet(nil)).enablementCheck(registryOnlyOrgStore{}, "") != nil {
+	if (trinoFleet(nil)).enablementCheck(poolOwnerOrgStore{}, "") != nil {
 		t.Fatal("legacy or disabled behavior changed")
 	}
 }
 
-func TestTrinoRegistryOnlyBootstrapHasNoLegacyDependency(t *testing.T) {
+func TestTrinoPoolBootstrapHasNoLegacyDependency(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cells.json")
-	if err := os.WriteFile(path, []byte(testTrinoRegistryJSON), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(testTrinoPoolRegistryJSON), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv(envTrinoCellsFile, path)
-	t.Setenv(envTrinoCoordinatorURL, "")
-	t.Setenv(envTrinoRegistryOnly, "true")
-	t.Setenv(envTrinoNamespace, "unused-legacy")
 	t.Setenv(envTrinoFilesystemCacheEnabled, "false")
-	store := &fleetBootstrapStore{initialized: map[string]bool{}}
+	store := &poolObserverWiringStore{fleetBootstrapStore: &fleetBootstrapStore{initialized: map[string]bool{}}}
 	kc := kubefake.NewClientset()
-	for _, name := range []string{"blue-internal", "green-internal"} {
-		_, err := kc.CoreV1().Secrets("trino-test").Create(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name}, Data: map[string][]byte{"shared-secret": []byte("fixture-" + name)}}, metav1.CreateOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
 	fleet, _, err := buildTrinoFleetWiring(store, kc, func(context.Context, string) (*provisioner.DucklingStatus, error) { return nil, nil })
 	if err != nil {
 		t.Fatal(err)
@@ -138,10 +125,9 @@ func (c *fleetCatalog) ListCatalogs(ctx context.Context) ([]string, error) {
 func (c *fleetCatalog) CreateCatalog(context.Context, string, map[string]string) error { return nil }
 func (c *fleetCatalog) AlterCatalog(context.Context, string, map[string]string) error  { return nil }
 func (c *fleetCatalog) DropCatalog(context.Context, string) error                      { return nil }
-func (c *fleetCatalog) ListNodes(context.Context) ([]provisioner.TrinoNode, error)     { return nil, nil }
 
 func TestTrinoFleetSlowCellDoesNotBlockSibling(t *testing.T) {
-	store := &fleetBootstrapStore{initialized: map[string]bool{}}
+	store := &poolObserverWiringStore{fleetBootstrapStore: &fleetBootstrapStore{initialized: map[string]bool{}}}
 	kc := kubefake.NewClientset()
 	catalogs := []*fleetCatalog{{called: make(chan struct{}), block: true}, {called: make(chan struct{})}}
 	var fleet trinoFleet
@@ -187,7 +173,6 @@ func (s *fleetBootstrapStore) ListTrinoEnabledOrgs() ([]configstore.TrinoEnabled
 func (s *fleetBootstrapStore) UpdateTrinoState(string, configstore.TrinoStateUpdate) error {
 	return nil
 }
-func (s *fleetBootstrapStore) ClaimTrinoCell(string, string) (bool, error) { return false, nil }
 func (s *fleetBootstrapStore) GetManagedWarehouseForTrino(string) (*configstore.ManagedWarehouse, error) {
 	return nil, nil
 }
@@ -201,22 +186,16 @@ func (s *fleetBootstrapStore) MarkTrinoClusterBootstrapped(_ context.Context, na
 
 func TestTrinoFleetBootstrapSeparatesBundleTokensAndLegacyPath(t *testing.T) {
 	t.Setenv(envTrinoFilesystemCacheEnabled, "false")
-	store := &fleetBootstrapStore{initialized: map[string]bool{}}
+	store := &poolObserverWiringStore{fleetBootstrapStore: &fleetBootstrapStore{initialized: map[string]bool{}}}
 	kc := kubefake.NewClientset()
-	registered, err := parseTrinoCellRegistry([]byte(testTrinoRegistryJSON))
+	registered, err := parseTrinoCellRegistry([]byte(testTrinoPoolRegistryJSON))
 	if err != nil {
 		t.Fatal(err)
 	}
 	entry := registered[0]
-	for _, backend := range entry.Backends {
-		_, err := kc.CoreV1().Secrets(entry.Namespace).Create(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: backend.InternalSecretName}, Data: map[string][]byte{"shared-secret": []byte("chart-managed-" + backend.ID)}}, metav1.CreateOptions{})
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
 	cells := []trinoCell{
-		{ID: "cell-001", Namespace: "legacy", CoordinatorURL: "https://legacy.example.test"},
-		{ID: "registered:cell-test", PublicID: "cell-test", Namespace: entry.Namespace, ClientURL: entry.ClientURL, CoordinatorURL: entry.Backends[0].CoordinatorURL, Backends: entry.Backends},
+		{ID: "registered:cell-first", PublicID: "cell-first", Namespace: "trino-first", Mode: trinoPoolModeShared},
+		{ID: "registered:cell-test", PublicID: "cell-test", Namespace: entry.Namespace, ClientURL: entry.ClientURL, Mode: trinoPoolModeShared},
 	}
 	engine := gin.New()
 	var wires []*trinoWiring
@@ -241,7 +220,7 @@ func TestTrinoFleetBootstrapSeparatesBundleTokensAndLegacyPath(t *testing.T) {
 			t.Fatal("stopped backend acquired a live observer")
 		}
 	}
-	if wires[0].bundlePath() != "/bundles/trino" || wires[1].bundlePath() != "/bundles/trino/cell-test" {
+	if wires[0].bundlePath() != "/bundles/trino/cell-first" || wires[1].bundlePath() != "/bundles/trino/cell-test" {
 		t.Fatal("bundle paths changed")
 	}
 	if tokens[0] == tokens[1] {

@@ -4,13 +4,13 @@ package controlplane
 
 import "testing"
 
-func TestTrinoLegacyConsoleIdentityKeepsProvisionerID(t *testing.T) {
-	cell := trinoCell{ID: "stored-cell", CoordinatorURL: "https://coordinator.example.test", TLSServerName: "tls.example.test", ClientURL: "https://client.example.test"}
+func TestTrinoPoolConsoleIdentityKeepsProvisionerID(t *testing.T) {
+	cell := trinoCell{ID: "registered:cell-test", PublicID: "cell-test", ClientURL: "https://client.example.test"}
 	console := cell.consoleCell()
-	if console.ID != "legacy" || console.StoredID != "stored-cell" {
+	if console.ID != "cell-test" || console.StoredID != "registered:cell-test" {
 		t.Fatalf("console identity: %+v", console)
 	}
-	if cell.ID != "stored-cell" || console.CoordinatorURL != cell.CoordinatorURL || console.TLSServerName != cell.TLSServerName || console.ClientURL != cell.ClientURL {
+	if cell.ID != "registered:cell-test" || console.ClientURL != cell.ClientURL {
 		t.Fatal("alias changed storage identity or connection configuration")
 	}
 }

@@ -110,16 +110,15 @@ or ownership mismatches explicitly; do not drop catalogs to force a switch.
    role. Custom roles outside the managed composition require equivalent grants.
 4. Allow the control plane and Trino cells to reach the Hoglake REST service, and
    allow Trino and Hoglake to reach the required storage services.
-5. Supply registered-cell rollout canary credentials and verify healthy control
-   plane and cell readiness. Creating an empty secret resource is insufficient.
+5. Verify healthy control plane and shared-pool admission. The pool controller
+   creates its own validation tenant; no static canary credentials are required.
 6. Enable the managed configuration, create a dedicated pilot tenant, select its
    cell, then enable Trino. Hoglake is assigned automatically. Wait for
    reconciled readiness.
 7. Run the tenant smoke test. Keep pilot enablement limited until it succeeds.
 
-The historical global `DUCKGRES_TRINO_HOGLAKE_URI` switch is deprecated and
-ignored, with a startup warning. It cannot override a client's stored backend.
-Existing catalogs are retained, while new clients use the managed Hoglake path.
+The stored warehouse backend controls catalog provisioning. Enabling managed
+Hoglake does not change an existing warehouse's backend.
 The frozen performance runner still sets the historical switch: its old setup
 is insufficient for new-client onboarding. Updating that runner's storage and
 fixture setup is separate work; do not repurpose immutable fixture prefixes

@@ -90,7 +90,7 @@ is unavailable.
 
 `GET /api/v1/trino/instances?cell=<configured-cell-id>` lists nonterminal
 instances for selection. It returns only each instance ID, local phase, Gateway
-state, and phase timestamp. Legacy cells have no shared-pool inventory.
+state, and phase timestamp. Only configured shared pools expose this inventory.
 
 Read `GET /api/v1/trino/instances/<instance-id>/recovery?cell=<configured-cell-id>` through the existing authenticated admin connection.
 The `cell` parameter is the configured public pool ID shown by the admin API.

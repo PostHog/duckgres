@@ -54,6 +54,10 @@ func buildTrinoPoolOperators(
 		// refusing to start.
 		return nil, fmt.Errorf("%s is enabled but %s is not configured", envTrinoPoolOperatorEnabled, envTrinoPoolGatewayURL)
 	}
+	writerEnabled, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv(envTrinoPoolCatalogWriter)))
+	if operatorEnabled && !writerEnabled {
+		return nil, fmt.Errorf("%s requires %s", envTrinoPoolOperatorEnabled, envTrinoPoolCatalogWriter)
+	}
 
 	// The owner identity must be unique per PROCESS, not merely per control
 	// plane: two processes sharing an identity would both satisfy the fence's
@@ -127,7 +131,7 @@ func buildTrinoPoolOperators(
 		// forwarded HTTPS hop rather than relaxing authentication, so a
 		// coordinator that rejects credentials over unforwarded HTTP keeps
 		// rejecting them.
-		client := newRolloutHTTPClient("")
+		client := newTrinoPoolHTTPClient("")
 		operator.validate = func(ctx context.Context, endpoint string, observed trinoPoolObservation, expected trinoPoolExpectation) (trinoPoolValidation, error) {
 			return validateTrinoPoolCandidate(ctx, client, endpoint, observerCredential, observed, expected)
 		}
@@ -232,13 +236,7 @@ func buildTrinoPoolOperators(
 					return configstore.TrinoPoolLease{}, false
 				}
 				return *lease, true
-			},
-			// Node inventory still comes from a live coordinator: the catalog
-			// store knows nothing about cluster membership. For a pooled cell
-			// that is whichever instance the operator is currently validating,
-			// so the bridge is given no static node client and the provisioner's
-			// readiness check reads the pool's instances instead.
-			nil)
+			})
 		if err != nil {
 			return nil, fmt.Errorf("configure catalog writer for pool %s: %w", config.PublicID, err)
 		}
@@ -282,9 +280,6 @@ func buildTrinoPoolOperators(
 func buildTrinoPoolGateway() (trinoPoolGateway, error) {
 	endpoint := strings.TrimSpace(os.Getenv(envTrinoPoolGatewayURL))
 	if endpoint == "" {
-		endpoint = strings.TrimSpace(os.Getenv("DUCKGRES_TRINO_MANAGED_GATEWAY_URL"))
-	}
-	if endpoint == "" {
 		return nil, nil
 	}
 	token, err := readTrinoPoolGatewayToken()
@@ -311,7 +306,7 @@ func readTrinoPoolGatewayToken() (string, error) {
 	if path == "" {
 		return "", fmt.Errorf("a shared-pool Gateway is configured but DUCKGRES_TRINO_ROLLOUT_TOKEN_FILE is unset")
 	}
-	token, err := readRolloutSecretFile(path, 4096)
+	token, err := readTrinoPoolSecretFile(path, 4096)
 	if err != nil {
 		return "", err
 	}

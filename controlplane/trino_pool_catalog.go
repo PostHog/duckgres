@@ -20,23 +20,8 @@ import (
 	"github.com/posthog/duckgres/controlplane/trinocatalog"
 )
 
-// The catalog writer bridge.
-//
-// Today the provisioner creates a catalog by issuing CREATE CATALOG against a
-// coordinator, which then writes the shared catalog table itself. That routes
-// provisioning through a replaceable compute instance and inherits the
-// asynchronous SQL-DDL cancellation ambiguity: a timed-out statement leaves an
-// outcome nobody can resolve.
-//
-// This adapter presents the fenced direct publisher through the interface the
-// provisioner already uses, so the reconcile loop is unchanged and the writes
-// become a single fenced transaction with a journal. It is selected per cell
-// and only when explicitly enabled; every other cell keeps the coordinator path
-// byte for byte.
-//
-// Node inventory is NOT something the catalog store can answer. It is delegated
-// to the existing coordinator client, so readiness still comes from the live
-// cluster rather than from a table.
+// The catalog writer publishes through one fenced database transaction and journal.
+// Pool admission verifies that serving instances applied each published revision.
 const (
 	envTrinoPoolCatalogWriter    = "DUCKGRES_TRINO_POOL_CATALOG_WRITER_ENABLED"
 	envTrinoPoolCatalogBootstrap = "DUCKGRES_TRINO_POOL_CATALOG_BOOTSTRAP"
@@ -104,10 +89,6 @@ type trinoPoolCatalogWriter struct {
 	// startup, is what makes that true - a process that has not won the pool
 	// cannot write catalogs, and a superseded one stops being able to.
 	authority func() (configstore.TrinoPoolLease, bool)
-	// nodes is the live coordinator client. The catalog store knows nothing
-	// about cluster membership, and inventing an answer here would make the
-	// provisioner's readiness check meaningless.
-	nodes provisioner.TrinoCatalogClient
 }
 
 // publisher builds a fenced publisher for the CURRENT authority. It refuses
@@ -186,18 +167,6 @@ func (w *trinoPoolCatalogWriter) checkpoint(ctx context.Context, revision int64)
 		return fmt.Errorf("checkpoint published catalog revision %d: %w", revision, err)
 	}
 	return nil
-}
-
-func (w *trinoPoolCatalogWriter) ListNodes(ctx context.Context) ([]provisioner.TrinoNode, error) {
-	if w.nodes == nil {
-		// A pooled cell has no fixed coordinator to take an inventory from. The
-		// sentinel is what tells the provisioner's readiness step that this
-		// probe does not APPLY here, as opposed to failing - the pool proves the
-		// same thing per member, at admission, against the instance that will
-		// actually serve the tenant.
-		return nil, provisioner.ErrTrinoNodeInventoryUnavailable
-	}
-	return w.nodes.ListNodes(ctx)
 }
 
 // ListCatalogs reads the published set straight from the store, which is the
@@ -380,8 +349,7 @@ func connectorProperties(properties map[string]string) map[string]string {
 }
 
 // buildTrinoPoolCatalogWriter constructs the bridge for one pool. It returns
-// (nil, nil) when the writer is not enabled, which leaves the existing
-// coordinator-mediated path in place.
+// (nil, nil) when disabled; catalog publication remains unavailable.
 //
 // The DSN is read from a file rather than an environment variable because it
 // carries the publisher credential, which infra provisions separately from the
@@ -389,7 +357,7 @@ func connectorProperties(properties map[string]string) map[string]string {
 //
 // poolID is duckgres's own identity for the pool; the catalog store's partition
 // is a separate, separately configured identity, resolved and REQUIRED below.
-func buildTrinoPoolCatalogWriter(poolID string, store trinoPoolRevisionStore, authority func() (configstore.TrinoPoolLease, bool), nodes provisioner.TrinoCatalogClient) (*trinoPoolCatalogWriter, error) {
+func buildTrinoPoolCatalogWriter(poolID string, store trinoPoolRevisionStore, authority func() (configstore.TrinoPoolLease, bool)) (*trinoPoolCatalogWriter, error) {
 	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(envTrinoPoolCatalogWriter)))
 	if err != nil || !enabled {
 		return nil, nil
@@ -398,7 +366,7 @@ func buildTrinoPoolCatalogWriter(poolID string, store trinoPoolRevisionStore, au
 	if path == "" {
 		return nil, fmt.Errorf("%s is enabled but %s is unset", envTrinoPoolCatalogWriter, envTrinoPoolCatalogDSNFile)
 	}
-	raw, err := readRolloutSecretFile(path, 8192)
+	raw, err := readTrinoPoolSecretFile(path, 8192)
 	if err != nil {
 		return nil, fmt.Errorf("read catalog writer credential: %w", err)
 	}
@@ -436,7 +404,7 @@ func buildTrinoPoolCatalogWriter(poolID string, store trinoPoolRevisionStore, au
 	// cell's writer row anyway.
 	db.SetMaxOpenConns(4)
 
-	writer := &trinoPoolCatalogWriter{db: db, cellID: cellID, poolID: poolID, store: store, authority: authority, nodes: nodes}
+	writer := &trinoPoolCatalogWriter{db: db, cellID: cellID, poolID: poolID, store: store, authority: authority}
 
 	if bootstrap, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv(envTrinoPoolCatalogBootstrap))); bootstrap {
 		// Somebody has to create the additive tables, because a managed-reader

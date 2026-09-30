@@ -205,20 +205,10 @@ API, as a dedicated **observer principal** (`opa.ObserverPrincipal` =
 `__duckgres_observer`) that the provisioner mints alongside the admin pair
 and projects into `password.db` / `group.db`.
 
-The existing deployment appears as `legacy` in the Trino API's `cell.id` and
-its owned orgs' `status.cell` / `orgs[].cell`. This is an API alias, not a storage
-migration: `DUCKGRES_TRINO_CELL_ID`, persisted org assignments, and Trino's
-catalog-store key retain their existing values. The general org endpoint still
-returns the persisted `trino.trino_cell_id`. Registered cells use separate
-`registered:<cell-id>` ownership values. Unknown stored owners fail closed.
-
-`GET /api/v1/trino/cells` lists configured logical cells. Operational Trino
-routes accept `?cell=<logical-id>` and default to `legacy` only when configured.
-Registry-only deployments require an explicit cell parameter; the Trino pages
-provide a cell selector. Unassigned org details expose no coordinator or client
-coordinates and allow initial selection before enablement. Org detail resolves
-its authoritative stored assignment regardless of a supplied cell parameter.
-Each coordinator has separate caches; tenant counts include only its cell.
+Configured cells expose their logical ID and use `registered:<cell-id>` for
+stored ownership. Unknown owners fail closed. `GET /api/v1/trino/cells` lists
+configured pools. Every operational request requires `?cell=<logical-id>`;
+there is no implicit selection. Org detail follows its persisted owner.
 
 Admins can select an initial cell at the top of **Org configuration** or send
 `PUT /api/v1/orgs/:id/trino/cell` with `{"cell":"cell-001"}`. This stores a
@@ -244,15 +234,15 @@ middleware. The browser receives no provisioning token. Vitest covers these
 UI actions and request shapes; the isolated Trino suite exercises the unchanged
 enable/disable endpoints against real infrastructure.
 
-For newly registered cells, configure the shared customer endpoint separately
-from the observer coordinator URL. This API does not configure Gateway routing.
+Configure the shared customer endpoint in the registry. The pool controller
+discovers observer endpoints from its managed instances. This API does not
+configure Gateway routing.
 
 For local verification, run `just test-controlplane-k8s` and `just ui-test`.
-The isolated Trino end-to-end suite checks both the API alias and unchanged
-persisted ownership. If connection details disappear after an upgrade, check
-the org's persisted ID against the configured `DUCKGRES_TRINO_CELL_ID`; do not
-rename stored IDs to match the API alias. Roll back the application version if
-an API consumer requires the previous displayed ID.
+The isolated Trino end-to-end suite checks pool provisioning and persisted
+ownership. If connection details disappear after an upgrade, check the org's
+persisted ID against the shared-pool registry. Stored IDs use the `registered:`
+prefix; API identifiers do not. Do not rename stored ownership IDs.
 
 - **Why a second principal.** Trino routes operator reads through the same
   access-control SPI as everything else — `GET /v1/query` filters through
@@ -288,9 +278,8 @@ an API consumer requires the previous displayed ID.
   coordinator holds. A refresh in flight does not block readers — they get
   the previous value — so a slow coordinator can't turn N polling tabs into
   N stuck requests during the incident the console exists for.
-- **Both sides of the console tag `X-Trino-Source`**
-  (`duckgres-admin` here, `duckgres-provisioner` in the reconcile loop), so
-  control-plane traffic is distinguishable from tenant SQL in
+- **The console tags `X-Trino-Source` as `duckgres-admin`**, so
+  console traffic is distinguishable from tenant SQL in
   `system.runtime.queries` and in the console's own live view.
 - **Trino binds exactly one node-listing route, chosen by `discovery.type`.**
   `/v1/node` (heartbeat health, plus `/v1/node/failed`) exists only under
@@ -312,7 +301,7 @@ an API consumer requires the previous displayed ID.
 - Neither route carries a node id or version, so worker version skew is not
   observable there; the Nodes page's pod projection (running images) is where
   that lives.
-- No legacy URL or registry configured leaves every
+- No pool registry configured leaves every
   route unregistered, and the SPA renders a "no cell" state off the 404.
 
 Touching this → update `trino_test.go`, `trino_client_test.go`,

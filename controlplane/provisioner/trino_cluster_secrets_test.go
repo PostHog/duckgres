@@ -32,6 +32,7 @@ func newClusterSecretsTestProvisioner(t *testing.T) (*TrinoProvisioner, *kubefak
 		Ducklings:         func(context.Context, string) (*DucklingStatus, error) { return nil, nil },
 		Kubernetes:        kc,
 		Namespace:         TrinoCustomerNamespace,
+		CellID:            "registered:test-pool",
 		Catalog:           &fakeCatalogClient{},
 		BundleStore:       &opa.BundleStore{},
 		BundleBuilder:     opa.NewBuilder(),
@@ -282,6 +283,7 @@ func TestBootstrap_ConcurrentReplicasConverge(t *testing.T) {
 			Ducklings:         func(context.Context, string) (*DucklingStatus, error) { return nil, nil },
 			Kubernetes:        kc, // shared
 			Namespace:         TrinoCustomerNamespace,
+			CellID:            "registered:test-pool",
 			Catalog:           &fakeCatalogClient{},
 			BundleStore:       &opa.BundleStore{},
 			BundleBuilder:     opa.NewBuilder(),

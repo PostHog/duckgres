@@ -1250,9 +1250,7 @@ func (o *trinoPoolOperator) publishedCatalogRevision() int64 {
 // step's error - so a pool still repairs and drains while admissions hold.
 func (o *trinoPoolOperator) ensureCatalogWatermark(ctx context.Context) error {
 	if o.catalogWatermark == nil {
-		// This cell publishes through a coordinator, which owns the catalog
-		// store itself. There is no duckgres-side authority to compare against,
-		// so the behaviour is exactly what it was.
+		// Read-only operators may omit the publisher. Enabled operators require it at startup.
 		return nil
 	}
 	published, err := o.catalogWatermark(ctx)

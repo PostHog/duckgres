@@ -169,7 +169,7 @@ log()  { echo ">>> $*" >&2; }
 apk add --no-cache curl jq postgresql-client openssl python3 py3-psycopg2 >/dev/null 2>&1 || true
 
 # kubectl, for the pod-level assertions the Go suite used to make via client-go.
-# The Job runs as the `duckgres` SA (pods get/list/delete/patch + pods/exec +
+# The Job runs as the `duckgres` SA (pods get/list/delete/patch +
 # pods/log in-namespace, and ducklings get/list/watch cross-namespace), and
 # kubectl auto-detects in-cluster config from that mounted SA token. arm64:
 # mw-dev worker nodes are arm64. The version is pinned (no stable.txt lookup —
@@ -1005,7 +1005,7 @@ trino_default_cell_placement() {
 #
 # E2E_TRINO_CELL_MOVE_ORG names an org that is Trino-enabled and ready on some
 # cell; E2E_TRINO_CELL_MOVE_TO names another configured cell (console id, e.g.
-# "cell-001" for the pool or "legacy"). The round trip leaves the org where it
+# "pool-a"). The round trip leaves the org where it
 # started. Each leg asserts the user-visible contract of a move:
 #   - the move is refused while the named source does not own the org (409);
 #   - an accepted move reports the org on the destination, pending, not ready;

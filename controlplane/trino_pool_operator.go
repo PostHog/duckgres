@@ -353,7 +353,7 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list pool instances: %w", err)
 	}
-	poolObservation(ctx).snapshot(instances, time.Now())
+	poolObservation(ctx).snapshot(instances, o.config.Namespace, o.pool.MinServing, time.Now())
 	nodeErr := o.protectPoolNodes(ctx, instances)
 	if o.fenced {
 		return errors.Join(tenantErr, nodeErr)

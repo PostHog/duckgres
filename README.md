@@ -1,7 +1,7 @@
 # Duckgres
 
 Trino operators: see [cell registration and placement](docs/trino-cells.md) for
-the optional registry, unchanged legacy defaults, and migration limitations.
+the shared-pool registry, initial placement, and retirement prerequisites.
 
 `DUCKGRES_TRINO_POOL_NODE_DISRUPTION_ENABLED` defaults to `false`. Enabled shared-pool
 operators protect owned pods and replace instances on drifted or deleting Karpenter
@@ -73,10 +73,6 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 For automatic initial placement, configure [`DUCKGRES_TRINO_DEFAULT_CELL`
 (default unset)](docs/trino-cells.md#automatic-placement-runbook).
 
-The optional [rollout readiness endpoint](docs/runbooks/trino-rollout-readiness.md)
-observes registered backend pods, coordinator identity, workers, and a dedicated
-warehouse canary. It is disabled by default and does not provision or move tenants.
-
 Existing Trino clients retain their DuckLake backend. New Trino clients use
 Hoglake automatically; there is no backend chooser or DuckLake fallback for new
 onboarding. Hoglake requires `DUCKGRES_TRINO_MANAGED_HOGLAKE_URI` and a dedicated
@@ -85,21 +81,13 @@ Disable/re-enable preserves the stored backend. This creates a separate catalog
 and does not migrate DuckLake data. Manual migration is outside this rollout.
 See the [managed Hoglake provisioning runbook](docs/runbooks/trino-hoglake-provisioning.md).
 
-The existing Trino deployment appears as `legacy` in the Trino console API.
-This name does not change its stored org assignments or catalog-store key.
-`DUCKGRES_TRINO_CELL_ID` remains the ownership setting, with the existing default
-`cell-001`; do not change it to `legacy` to match the API display name.
-Connection details remain readiness-gated and use the existing endpoint.
-Trino readiness requires a reconciled catalog and the current tenant password
-file on every active coordinator and worker of every running backend. Secret
-projection lag remains `provisioning`; catalog creation alone does not make a
-tenant ready. Checks use namespace-scoped pod read/exec access, with batches of
-128 files, up to four concurrent observations and a five-second timeout per
-observation within the existing 30-second backend budget. These limits are
-fixed defaults. See the [readiness runbook](docs/runbooks/trino-readiness.md)
-for deployment requirements, local verification, and recovery.
-See the [Trino admin API documentation](controlplane/admin/README.md#trino-cell-views-trinogo--trino_clientgo)
-for local verification, compatibility details, and recovery instructions.
+All configured Trino cells use the shared compute pool. The console requires
+an explicit cell selection. Stored ownership uses `registered:<cell-id>` and
+is not changed by compute replacement. Duckgres publishes catalogs directly to
+the shared catalog store and admits tenants only after the serving instances
+acknowledge their catalog and authorization revisions.
+See [cell registration](docs/trino-cells.md) and the
+[node replacement runbook](docs/runbooks/trino-pool-node-replacement.md).
 
 Trino `SHOW CREATE TABLE` and `SHOW CREATE VIEW` use the same catalog, schema,
 and relation read grants as table reads. Project-scoped logins can inspect only
