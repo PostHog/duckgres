@@ -211,7 +211,7 @@ func TestDistinctBenchmarkImageSelection(t *testing.T) {
 	if start < 0 {
 		t.Fatal("missing benchmark image selection")
 	}
-	end := strings.Index(text[start:], `          echo "image=$image"`) + start
+	end := strings.Index(text[start:], `          echo "TRINO_IMAGE=$image"`) + start
 	body := text[start:end]
 	tag := "trino-distinct-" + strings.Repeat("a", 40) + "@sha256:" + strings.Repeat("b", 64)
 	for _, tc := range []struct {

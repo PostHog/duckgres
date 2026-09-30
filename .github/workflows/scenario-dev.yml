@@ -126,16 +126,6 @@ jobs:
         run: |
           set -euo pipefail
           image="${TRINO_IMAGE_OVERRIDE:-$(scripts/resolve_trino_master_image.sh)}"
-          if [[ "$image" == benchmark:* ]]; then
-            tag="${image#benchmark:}"
-            [[ "$tag" =~ ^trino-distinct-[a-f0-9]{40}@sha256:[a-f0-9]{64}$ ]] || exit 1
-            # Use the existing benchmark registry configuration without putting its
-            # internal address in dispatch inputs or summaries.
-            registry="$(awk '$1 == "ECR_REGISTRY:" {print $2; exit}' .github/workflows/_image-build.yml)"
-            [[ "$registry" =~ ^[0-9]+[.]dkr[.]ecr[.][a-z0-9-]+[.]amazonaws[.]com$ ]] || exit 1
-            echo "::add-mask::$registry"
-            image="$registry/duckgres-prs:$tag"
-          fi
           echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "Trino image: \`$image\`" >> "$GITHUB_STEP_SUMMARY"
 
@@ -269,6 +259,23 @@ jobs:
               echo "DUCKGRES_SCENARIO_PROPERTIES_S3_URI=invalid" >> "$GITHUB_ENV"
             fi
           fi
+
+      - name: Resolve diagnostic image inside the measurement job
+        env:
+          image: ${{ env.TRINO_IMAGE }}
+        run: |
+          set -euo pipefail
+          if [[ "$image" == benchmark:* ]]; then
+            tag="${image#benchmark:}"
+            [[ "$tag" =~ ^trino-distinct-[a-f0-9]{40}@sha256:[a-f0-9]{64}$ ]] || exit 1
+            # Use the existing benchmark registry configuration without putting its
+            # internal address in dispatch inputs or summaries.
+            registry="$(awk '$1 == "ECR_REGISTRY:" {print $2; exit}' .github/workflows/_image-build.yml)"
+            [[ "$registry" =~ ^[0-9]+[.]dkr[.]ecr[.][a-z0-9-]+[.]amazonaws[.]com$ ]] || exit 1
+            echo "::add-mask::$registry"
+            image="$registry/duckgres-prs:$tag"
+          fi
+          echo "TRINO_IMAGE=$image" >> "$GITHUB_ENV"
 
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy
