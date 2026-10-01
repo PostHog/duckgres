@@ -227,6 +227,7 @@ func TestClientTrinoStatusUsesOrgDetailEndpoint(t *testing.T) {
 				"tier":               "free",
 				"cell":               "cell-001",
 				"state":              "ready",
+				"connection":         map[string]any{"host": "duckgres-trino-gateway.ns.svc", "port": 8443, "username": "scenario-db"},
 			},
 		})
 	}))
@@ -249,6 +250,9 @@ func TestClientTrinoStatusUsesOrgDetailEndpoint(t *testing.T) {
 	}
 	if status.Status.Principal != "scenario-db" || status.Status.Catalog != "org_scenario_db" {
 		t.Fatalf("Trino identity = %+v, want scenario-db/org_scenario_db", status.Status)
+	}
+	if got := status.Status.Connection; got == nil || got.Host != "duckgres-trino-gateway.ns.svc" || got.Port != 8443 {
+		t.Fatalf("Trino connection = %+v, want advertised gateway endpoint", got)
 	}
 }
 

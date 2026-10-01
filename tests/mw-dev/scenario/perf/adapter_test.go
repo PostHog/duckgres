@@ -236,18 +236,16 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 				Password: "root-password",
 			})
 			provisionState.StoreTrinoStatus("scenario-org", provision.TrinoStatus{
-				Cell: provision.TrinoCell{
-					ID:             "legacy",
-					CoordinatorURL: "https://trino.example.test:8443",
-				},
+				Cell:      provision.TrinoCell{ID: "legacy"},
 				Enabled:   true,
 				Available: true,
 				Status: &provision.TrinoOrgStatus{
-					Org:       "scenario-org",
-					Principal: "org_database",
-					Catalog:   "org_catalog",
-					Cell:      "legacy",
-					State:     provision.WarehouseStateReady,
+					Org:        "scenario-org",
+					Principal:  "org_database",
+					Catalog:    "org_catalog",
+					Cell:       "legacy",
+					State:      provision.WarehouseStateReady,
+					Connection: &provision.TrinoConnection{Host: "trino.example.test", Port: 8443},
 				},
 			})
 			factory := &fakeDriverFactory{}
