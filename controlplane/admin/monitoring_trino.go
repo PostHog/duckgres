@@ -3,6 +3,7 @@
 package admin
 
 import (
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -115,7 +116,8 @@ type trinoMonitoringTotals struct {
 	Running int `json:"running"`
 	Queued  int `json:"queued"`
 	// Blocked is the subset of Running whose drivers are all blocked.
-	Blocked            int   `json:"blocked"`
+	Blocked int `json:"blocked"`
+	// LongestRunningMS is the longest time since submission among all in-flight queries, queued ones included.
 	LongestRunningMS   int64 `json:"longest_running_ms"`
 	PhysicalInputBytes int64 `json:"physical_input_bytes"`
 }
@@ -142,8 +144,8 @@ type trinoMonitoringSnapshotResponse struct {
 	OrgID         string               `json:"org_id"`
 	AsOf          time.Time            `json:"as_of"`
 	Trino         trinoMonitoringState `json:"trino"`
-	// Available is false when the coordinator could not be read. Totals are
-	// then zero, and a consumer must not present them as an idle warehouse.
+	// Available is false when the coordinator or the org index could not be
+	// read, or no configured cell owns the org. Totals are then zero, and a consumer must not present them as an idle warehouse.
 	Available        bool                   `json:"available"`
 	Limits           trinoMonitoringLimits  `json:"limits"`
 	Totals           trinoMonitoringTotals  `json:"totals"`
@@ -179,6 +181,7 @@ func (a *TrinoAPI) orgCell(orgID string) (*TrinoAPI, *configstore.ManagedWarehou
 		return nil, row, nil
 	}
 	if a.fleet == nil {
+		// Production always builds the fleet API, so this branch serves a single-cell API built directly with NewTrinoAPI.
 		return a, row, nil
 	}
 	for _, candidate := range a.fleet {
@@ -248,11 +251,13 @@ func (h *trinoMonitoringHandler) snapshot(c *gin.Context) {
 	// an empty list would read as an idle warehouse. Report it as unavailable.
 	idx, err := cell.index()
 	if err != nil {
+		slog.Warn("admin: trino monitoring snapshot unavailable: org index unreadable", "org", orgID, "error", err)
 		c.JSON(http.StatusOK, response)
 		return
 	}
 	queries, _, err := cell.liveQueries(c.Request.Context(), idx)
 	if err != nil {
+		slog.Warn("admin: trino monitoring snapshot unavailable: coordinator unreadable", "org", orgID, "error", err)
 		c.JSON(http.StatusOK, response)
 		return
 	}

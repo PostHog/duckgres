@@ -5,7 +5,9 @@ package controlplane
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -161,4 +163,38 @@ func TestTrinoOrgMetricsClearGaugesWhenThePollCannotBeTrusted(t *testing.T) {
 			t.Fatalf("in-flight series = %d, want 4 (only org-a remains)", got)
 		}
 	})
+}
+
+// lockedTrinoUsageTracker lets two collector loops capture events without the
+// shared fake tracker's unguarded slice masking a race inside the collector.
+type lockedTrinoUsageTracker struct{ mu sync.Mutex }
+
+func (f *lockedTrinoUsageTracker) Capture(string, string, map[string]any) { f.mu.Lock(); f.mu.Unlock() }
+
+func (f *lockedTrinoUsageTracker) Close() {}
+
+func TestTrinoUsageCollectorToleratesOverlappingRuns(t *testing.T) {
+	collector, metrics, _ := newTrinoOrgMetricsTestCollector(t, &trinoUsageFakeCoordinator{queries: []admin.TrinoQuery{
+		{QueryID: "r1", State: "RUNNING", Principal: "tenant-a"},
+		{QueryID: "q1", State: "QUEUED", Principal: "tenant-a"},
+		{QueryID: "ok", State: "FINISHED", Principal: "tenant-a", ElapsedMS: 10},
+	}})
+	analytics.SetDefault(&lockedTrinoUsageTracker{})
+	collector.interval = time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			collector.Run(ctx)
+		}()
+	}
+	wg.Wait()
+
+	if got := testutil.CollectAndCount(metrics.inFlight); got != 0 {
+		t.Fatalf("in-flight series after both loops exited = %d, want 0", got)
+	}
 }

@@ -489,7 +489,9 @@ One collector runs per Trino cell and writes the gauge only for the orgs
 assigned to its cell. The gauge is removed when a poll fails and when the
 collector stops, so a coordinator outage appears as a gap rather than a frozen
 value. During a leader handover two pods can export the gauge briefly; queries
-must take the maximum across pods, not the sum.
+must take the maximum across pods, not the sum. The counters and histograms
+are not removed when an org leaves a cell; their series stay until the process
+restarts.
 
 The counters and histograms are best-effort. The coordinator keeps finished
 queries only briefly, so a very busy cell can drop some between polls, and a

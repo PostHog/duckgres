@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/admin"
@@ -23,6 +24,9 @@ const (
 type trinoUsageTeamResolver func(orgID, username string) int64
 
 type trinoUsageCollector struct {
+	// mu guards seen and gauged: a new leader term can start before the
+	// previous term's loop has returned, so two loops may overlap.
+	mu          sync.Mutex
 	coordinator admin.TrinoCoordinatorClient
 	orgs        admin.TrinoOrgStore
 	teamID      trinoUsageTeamResolver
@@ -89,17 +93,19 @@ func (c *trinoUsageCollector) collect(ctx context.Context) {
 	if c == nil || c.coordinator == nil || c.orgs == nil {
 		return
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	orgs, err := c.orgs.ListTrinoEnabledOrgs()
 	if err != nil {
 		slog.Warn("Trino usage collection skipped: list enabled orgs failed", "error", err)
-		c.clearInFlight()
+		c.clearInFlightLocked()
 		return
 	}
 	owners := configstore.NewTrinoPrincipalOwners(orgs)
 	queries, err := c.coordinator.Queries(ctx)
 	if err != nil {
 		slog.Warn("Trino usage collection skipped: list queries failed", "error", err)
-		c.clearInFlight()
+		c.clearInFlightLocked()
 		return
 	}
 	now := c.now()
@@ -169,6 +175,16 @@ func (c *trinoUsageCollector) recordInFlight(orgs []configstore.TrinoEnabledOrg,
 }
 
 func (c *trinoUsageCollector) clearInFlight() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clearInFlightLocked()
+}
+
+// clearInFlightLocked requires c.mu to be held.
+func (c *trinoUsageCollector) clearInFlightLocked() {
 	if c == nil || c.metrics == nil {
 		return
 	}
