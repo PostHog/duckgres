@@ -25,12 +25,16 @@ var trinoPoolMetrics = newTrinoPoolMetrics(prometheus.DefaultRegisterer)
 type trinoPoolObservationKey struct{}
 
 type trinoPoolMetricSet struct {
-	mu          sync.Mutex
-	owners      map[string]*trinoPoolTelemetry
-	members     *prometheus.GaugeVec
-	oldestDrain *prometheus.GaugeVec
-	snapshotAt  *prometheus.GaugeVec
-	failures    *prometheus.CounterVec
+	mu               sync.Mutex
+	owners           map[string]*trinoPoolTelemetry
+	members          *prometheus.GaugeVec
+	oldestDrain      *prometheus.GaugeVec
+	snapshotAt       *prometheus.GaugeVec
+	failures         *prometheus.CounterVec
+	servingInstances *prometheus.GaugeVec
+	minServing       *prometheus.GaugeVec
+	configured       *prometheus.GaugeVec
+	configurationID  uint64
 }
 
 func newTrinoPoolMetrics(reg prometheus.Registerer) *trinoPoolMetricSet {
@@ -39,6 +43,15 @@ func newTrinoPoolMetrics(reg prometheus.Registerer) *trinoPoolMetricSet {
 		members: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "duckgres_trino_pool_members", Help: "Durable pool instance rows by phase at the last successful snapshot.",
 		}, []string{"pool", "phase"}),
+		servingInstances: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "duckgres_trino_pool_serving_instance_info", Help: "Deployment identities of durable SERVING rows at the last successful snapshot; not a health observation.",
+		}, []string{"pool", "pool_instance", "workload_namespace", "coordinator_deployment", "worker_deployment"}),
+		minServing: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "duckgres_trino_pool_min_serving", Help: "Configured minimum serving instances at the last successful durable snapshot.",
+		}, []string{"pool", "workload_namespace"}),
+		configured: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "duckgres_trino_pool_configured", Help: "Enabled shared pools configured in this process, independent of operator authority.",
+		}, []string{"pool", "workload_namespace"}),
 		oldestDrain: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "duckgres_trino_pool_oldest_drain_seconds", Help: "Oldest durable DRAINING phase age at the last successful snapshot.",
 		}, []string{"pool"}),
@@ -49,8 +62,30 @@ func newTrinoPoolMetrics(reg prometheus.Registerer) *trinoPoolMetricSet {
 			Name: "duckgres_trino_pool_reconcile_failures_total", Help: "Failed pool reconciliations by bounded reason; excludes pure backoff waits.",
 		}, []string{"pool", "reason"}),
 	}
-	reg.MustRegister(m.members, m.oldestDrain, m.snapshotAt, m.failures)
+	reg.MustRegister(m.members, m.oldestDrain, m.snapshotAt, m.failures, m.servingInstances, m.minServing, m.configured)
 	return m
+}
+
+// Configured pools remain visible without an owner, until this API process stops.
+// Call this during startup, before the operator loops can change their configuration.
+func (m *trinoPoolMetricSet) configurePools(operators []*trinoPoolOperator) func() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.configurationID++
+	id := m.configurationID
+	m.configured.Reset()
+	for _, operator := range operators {
+		if operator.operatorEnabled {
+			m.configured.WithLabelValues(operator.config.PublicID, operator.config.Namespace).Set(1)
+		}
+	}
+	return func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.configurationID == id {
+			m.configured.Reset()
+		}
+	}
 }
 
 type trinoPoolWaitState struct {
@@ -65,9 +100,15 @@ type trinoPoolWaitLog struct {
 }
 
 type trinoPoolTelemetry struct {
-	metrics *trinoPoolMetricSet
-	pool    string
-	waits   map[string]trinoPoolWaitLog
+	metrics      *trinoPoolMetricSet
+	pool         string
+	waits        map[string]trinoPoolWaitLog
+	serving      map[trinoPoolServingMetricKey]bool
+	minNamespace string
+}
+
+type trinoPoolServingMetricKey struct {
+	instance, namespace, coordinator, worker string
 }
 
 func (m *trinoPoolMetricSet) beginTerm(ctx context.Context, pool string) (context.Context, func()) {
@@ -93,6 +134,8 @@ func (m *trinoPoolMetricSet) clear(pool string) {
 	m.members.DeletePartialMatch(prometheus.Labels{"pool": pool})
 	m.oldestDrain.DeleteLabelValues(pool)
 	m.snapshotAt.DeleteLabelValues(pool)
+	m.servingInstances.DeletePartialMatch(prometheus.Labels{"pool": pool})
+	m.minServing.DeletePartialMatch(prometheus.Labels{"pool": pool})
 }
 
 func (o *trinoPoolTelemetry) end() {
@@ -111,7 +154,7 @@ func poolObservation(ctx context.Context) *trinoPoolTelemetry {
 }
 
 // Snapshot data precedes this tick's effects. It is not Gateway obligation data.
-func (o *trinoPoolTelemetry) snapshot(instances []configstore.TrinoPoolInstance, now time.Time) {
+func (o *trinoPoolTelemetry) snapshot(instances []configstore.TrinoPoolInstance, namespace string, minServing int, now time.Time) {
 	if o == nil {
 		return
 	}
@@ -120,6 +163,12 @@ func (o *trinoPoolTelemetry) snapshot(instances []configstore.TrinoPoolInstance,
 	if o.metrics.owners[o.pool] != o {
 		return
 	}
+	o.metrics.minServing.WithLabelValues(o.pool, namespace).Set(float64(minServing))
+	if o.minNamespace != "" && o.minNamespace != namespace {
+		o.metrics.minServing.DeleteLabelValues(o.pool, o.minNamespace)
+	}
+	o.minNamespace = namespace
+	serving := make(map[trinoPoolServingMetricKey]bool)
 	counts := map[string]int{
 		"PENDING": 0, "CREATING": 0, "PREPARING": 0, "VALIDATING": 0,
 		"ADMITTED": 0, "SERVING": 0, "DRAINING": 0, "SEALED": 0,
@@ -134,6 +183,12 @@ func (o *trinoPoolTelemetry) snapshot(instances []configstore.TrinoPoolInstance,
 			phase = "UNKNOWN"
 		}
 		counts[phase]++
+		if phase == "SERVING" {
+			pinnedNamespace := instanceNamespace(instance)
+			serving[trinoPoolServingMetricKey{instance.InstanceID, pinnedNamespace, instance.CoordinatorDeploymentName, instance.WorkerDeploymentName}] = true
+			o.metrics.servingInstances.WithLabelValues(o.pool, instance.InstanceID, pinnedNamespace,
+				instance.CoordinatorDeploymentName, instance.WorkerDeploymentName).Set(1)
+		}
 		if !trinopool.Phase(instance.Phase).Terminal() {
 			live[instance.InstanceID] = true
 		}
@@ -144,6 +199,13 @@ func (o *trinoPoolTelemetry) snapshot(instances []configstore.TrinoPoolInstance,
 	for phase, count := range counts {
 		o.metrics.members.WithLabelValues(o.pool, phase).Set(float64(count))
 	}
+	// Keep unchanged samples present during scrapes, and remove only departed identities.
+	for previous := range o.serving {
+		if !serving[previous] {
+			o.metrics.servingInstances.DeleteLabelValues(o.pool, previous.instance, previous.namespace, previous.coordinator, previous.worker)
+		}
+	}
+	o.serving = serving
 	for id := range o.waits {
 		if !live[id] {
 			delete(o.waits, id)

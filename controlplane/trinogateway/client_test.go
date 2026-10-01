@@ -294,3 +294,29 @@ func TestClientRejectsUnsafeConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestDrainReconciliationProtocol(t *testing.T) {
+	client, captured := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			if r.URL.Query().Get("after") != "query+1" {
+				t.Error("cursor not escaped")
+			}
+			writeJSON(t, w, http.StatusOK, []map[string]any{{"queryId": "query-2", "admissionCount": 7}})
+		} else {
+			writeJSON(t, w, http.StatusOK, map[string]any{"reconciled": 1})
+		}
+	})
+	candidates, err := client.GetDrainCandidates(context.Background(), "pool-1", "member-1", "query+1")
+	if err != nil || len(candidates) != 1 || candidates[0].AdmissionCount != 7 {
+		t.Fatalf("candidates=%+v err=%v", candidates, err)
+	}
+	result, err := client.ReconcileQueries(context.Background(), "pool-1", "member-1", ReconcileQueriesRequest{
+		Step: Step{OperationID: "op", StepID: "proof", ControllerEpoch: 3, OwnerIdentity: "controller"}, ExpectedGeneration: 9, NodeID: "node", CoordinatorID: "process", Queries: candidates})
+	if err != nil || result.Reconciled != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	r := (*captured)[1]
+	if r.path != "/gateway/v1/pools/pool-1/members/member-1/reconcile-queries" || r.body["expectedGeneration"] != float64(9) || r.body["nodeId"] != "node" || r.body["coordinatorId"] != "process" || r.body["controllerEpoch"] != float64(3) || r.body["ownerIdentity"] != "controller" {
+		t.Fatalf("wrong wire contract: %+v", r)
+	}
+}

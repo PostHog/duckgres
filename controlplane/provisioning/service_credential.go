@@ -49,13 +49,12 @@ type serviceCredentialRequest struct {
 }
 
 // serviceCredentialRefreshRequest is the refresh body
-// (POST /api/v1/orgs/:id/service-credentials/refresh). Refresh ALWAYS rotates
-// the named grant's secret — it is how a caller that already holds a
-// credential_id extends its window (or recovers after an expiry) without
-// minting a second identity for the same principal.
+// (POST /api/v1/orgs/:id/service-credentials/refresh). Refresh rotates by default;
+// rotate_secret=false renews a live grant without changing its secret.
 type serviceCredentialRefreshRequest struct {
 	CredentialID string `json:"credential_id"`
 	TTLSeconds   int    `json:"ttl_seconds"`
+	RotateSecret *bool  `json:"rotate_secret,omitempty"`
 }
 
 // connectDetails is the always-present `connect` block of the mint/refresh
@@ -83,16 +82,30 @@ type connectDetails struct {
 	SslMode  string `json:"sslmode"`
 }
 
-// serviceCredentialResponse is the mint/refresh response. Both operations
-// always bind and return a fresh secret; the store persists only its hash.
+// serviceCredentialResponse returns a secret only on mint or rotation.
+// Non-rotating renewal explicitly marks that the caller must retain its secret.
 type serviceCredentialResponse struct {
 	CredentialID     string    `json:"credential_id"`
-	CredentialSecret string    `json:"credential_secret"`
+	CredentialSecret string    `json:"credential_secret,omitempty"`
+	SecretRotated    bool      `json:"secret_rotated"`
 	ExpiresAt        time.Time `json:"expires_at"`
 	// Connect is unconditional: identical shape on mint and refresh, so the
 	// client can always take its connection target
 	// from this same response instead of holding its own out-of-band copy.
-	Connect connectDetails `json:"connect"`
+	Connect      connectDetails                 `json:"connect"`
+	TrinoConnect *TrinoServiceCredentialConnect `json:"trino_connect,omitempty"`
+}
+
+type TrinoServiceCredentialConnect struct {
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	Catalog    string `json:"catalog"`
+	Username   string `json:"username"`
+	HTTPScheme string `json:"http_scheme"`
+}
+
+func WithTrinoServiceCredentialConnect(resolve func(string, string) *TrinoServiceCredentialConnect) Option {
+	return func(h *handler) { h.trinoServiceCredentialConnect = resolve }
 }
 
 // TenantStore is the subset of the config store the service-credential
@@ -102,6 +115,7 @@ type TenantStore interface {
 	OrgExists(orgID string) (bool, error)
 	MintServiceCredential(orgID, principal string, ttl time.Duration) (*configstore.ServiceCredentialIssue, error)
 	RefreshServiceCredential(orgID, credentialID string, ttl time.Duration) (*configstore.ServiceCredentialIssue, error)
+	RenewServiceCredential(orgID, credentialID string, ttl time.Duration) (*configstore.ServiceCredentialIssue, error)
 	ReloadSnapshot() error
 }
 
@@ -137,9 +151,10 @@ func (h *handler) afterCredentialWrite(c *gin.Context, tenantStore TenantStore) 
 }
 
 func (h *handler) credentialResponse(orgID string, issued *configstore.ServiceCredentialIssue) serviceCredentialResponse {
-	return serviceCredentialResponse{
+	response := serviceCredentialResponse{
 		CredentialID:     issued.CredentialID,
 		CredentialSecret: issued.Plaintext,
+		SecretRotated:    issued.Plaintext != "",
 		ExpiresAt:        issued.ExpiresAt,
 		Connect: connectDetails{
 			// The org's canonical ingress hostname — orgID + the CP's
@@ -152,6 +167,10 @@ func (h *handler) credentialResponse(orgID string, issued *configstore.ServiceCr
 			SslMode:  "require",
 		},
 	}
+	if h.trinoServiceCredentialConnect != nil {
+		response.TrinoConnect = h.trinoServiceCredentialConnect(orgID, issued.CredentialID)
+	}
+	return response
 }
 
 // issueServiceCredential handles POST /api/v1/orgs/:id/service-credentials.
@@ -219,10 +238,9 @@ func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore
 }
 
 // refreshServiceCredential handles
-// POST /api/v1/orgs/:id/service-credentials/refresh. Refresh ALWAYS rotates
-// the named grant's secret and returns the new plaintext — unlike mint, there
-// is no reuse branch: the caller named a specific credential, so "change
-// nothing" would be a lie either way.
+// POST /api/v1/orgs/:id/service-credentials/refresh. Refresh rotates by default;
+// an explicit rotate_secret=false extends a live grant without returning or
+// rotating its secret, so active HTTP query-owner fingerprints remain stable.
 func (h *handler) refreshServiceCredential(c *gin.Context, tenantStore TenantStore) {
 	orgID := c.Param("id")
 
@@ -247,12 +265,17 @@ func (h *handler) refreshServiceCredential(c *gin.Context, tenantStore TenantSto
 		return
 	}
 
-	issued, err := tenantStore.RefreshServiceCredential(orgID, req.CredentialID, ttl)
+	var issued *configstore.ServiceCredentialIssue
+	if req.RotateSecret != nil && !*req.RotateSecret {
+		issued, err = tenantStore.RenewServiceCredential(orgID, req.CredentialID, ttl)
+	} else {
+		issued, err = tenantStore.RefreshServiceCredential(orgID, req.CredentialID, ttl)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, configstore.ErrServiceCredentialNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-		case errors.Is(err, configstore.ErrServiceCredentialRevoked):
+		case errors.Is(err, configstore.ErrServiceCredentialRevoked), errors.Is(err, configstore.ErrServiceCredentialExpired):
 			// 410 Gone: the credential existed and is terminally dead —
 			// distinguishable from a 404 (never existed) and from a rotation
 			// race.

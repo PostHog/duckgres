@@ -63,8 +63,8 @@ func TestEnableTrinoIsIdempotentAndPreservesReconcileState(t *testing.T) {
 	}
 
 	// The reconcile loop advances the row...
-	if err := store.AssignTrinoCell("acme", "cell-001"); err != nil {
-		t.Fatalf("AssignTrinoCell: %v", err)
+	if err := store.DB().Model(&configstore.ManagedWarehouseTrino{}).Where("org_id = ?", "acme").Update("trino_cell_id", "cell-001").Error; err != nil {
+		t.Fatalf("seed assigned cell: %v", err)
 	}
 	now := time.Now().UTC()
 	if err := store.UpdateTrinoState("acme", configstore.TrinoStateUpdate{
@@ -90,27 +90,6 @@ func TestEnableTrinoIsIdempotentAndPreservesReconcileState(t *testing.T) {
 	}
 	if row.TrinoCellID != "cell-001" {
 		t.Errorf("trino_cell_id = %q, want the claim to survive a re-enable", row.TrinoCellID)
-	}
-}
-
-func TestAssignTrinoCellNeverStealsAnOwnedOrg(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-	seedTrinoOrg(t, store, "acme")
-	if err := store.EnableTrino("acme", configstore.TrinoSettings{}); err != nil {
-		t.Fatalf("EnableTrino: %v", err)
-	}
-
-	if err := store.AssignTrinoCell("acme", "cell-001"); err != nil {
-		t.Fatalf("AssignTrinoCell (first): %v", err)
-	}
-	// A second cell tries to claim the same org. The conditional WHERE is
-	// the only thing stopping two coordinators from both projecting this
-	// tenant's credentials and catalog.
-	if err := store.AssignTrinoCell("acme", "cell-002"); err != nil {
-		t.Fatalf("AssignTrinoCell (second) must be a silent no-op, got %v", err)
-	}
-	if got := trinoRow(t, store, "acme").TrinoCellID; got != "cell-001" {
-		t.Fatalf("trino_cell_id = %q, want cell-001 (the second claim must not steal it)", got)
 	}
 }
 
@@ -221,9 +200,13 @@ func TestListTrinoEnabledOrgsJoinsRootUserAndCarriesCell(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	seedTrinoOrg(t, store, "acme")
 	seedTrinoOrg(t, store, "beta")
-	// An org WITHOUT a root user: the INNER JOIN drops it, because
-	// projecting a half-built password file is worse than skipping.
+	// An org WITHOUT a root user is still listed: its other logins are
+	// principals in their own right. Only the bare principal (root's hash)
+	// is absent.
 	seedOrg(t, store, "rootless")
+	if err := store.CreateOrgUser("rootless", "analyst", "$2a$10$hash-analyst"); err != nil {
+		t.Fatalf("create analyst for rootless: %v", err)
+	}
 
 	for _, org := range []string{"acme", "beta", "rootless"} {
 		settings := configstore.TrinoSettings{Tier: "free"}
@@ -234,9 +217,6 @@ func TestListTrinoEnabledOrgsJoinsRootUserAndCarriesCell(t *testing.T) {
 			t.Fatalf("EnableTrino(%s): %v", org, err)
 		}
 	}
-	if claimed, err := store.ClaimTrinoCell("acme", "legacy-cell"); err != nil || claimed {
-		t.Fatalf("legacy claimed default-placed tenant: claimed=%v err=%v", claimed, err)
-	}
 	// beta stays unassigned — the listing must still return it so a cell
 	// can claim it. Filtering by cell in SQL would make a freshly enabled
 	// org invisible to every cell forever.
@@ -245,12 +225,18 @@ func TestListTrinoEnabledOrgsJoinsRootUserAndCarriesCell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTrinoEnabledOrgs: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("expected 2 orgs (rootless dropped by the root-user join), got %d: %+v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 orgs (rootless included), got %d: %+v", len(got), got)
 	}
 	// Ordered by org_id so projections are byte-stable across ticks.
-	if got[0].OrgID != "acme" || got[1].OrgID != "beta" {
-		t.Fatalf("expected [acme beta] in order, got %+v", got)
+	if got[0].OrgID != "acme" || got[1].OrgID != "beta" || got[2].OrgID != "rootless" {
+		t.Fatalf("expected [acme beta rootless] in order, got %+v", got)
+	}
+	if got[2].RootPasswordHash != "" {
+		t.Errorf("rootless RootPasswordHash = %q, want empty (no bare principal)", got[2].RootPasswordHash)
+	}
+	if len(got[2].Users) != 1 || got[2].Users[0].Username != "analyst" {
+		t.Errorf("rootless Users = %+v, want exactly analyst", got[2].Users)
 	}
 	if got[0].CellID != "registered:pool-a" {
 		t.Errorf("acme CellID = %q, want registered:pool-a", got[0].CellID)
@@ -276,8 +262,51 @@ func TestListTrinoEnabledOrgsJoinsRootUserAndCarriesCell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTrinoEnabledOrgs (after disable): %v", err)
 	}
+	if len(got) != 2 || got[0].OrgID != "acme" || got[1].OrgID != "rootless" {
+		t.Fatalf("expected [acme rootless] after disabling beta, got %+v", got)
+	}
+}
+
+// Disabling root is the per-user kill switch for the bare principal too: the
+// bare `<database_name>` line authenticates with root's hash, so leaving it
+// projected would keep a disabled root's password working on Trino. The org
+// itself stays listed so its other logins keep working.
+func TestListTrinoEnabledOrgsDropsDisabledRootHash(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedTrinoOrg(t, store, "acme")
+	if err := store.CreateOrgUser("acme", "analyst", "$2a$10$hash-analyst"); err != nil {
+		t.Fatalf("create analyst: %v", err)
+	}
+	if err := store.EnableTrino("acme", configstore.TrinoSettings{Tier: "free"}); err != nil {
+		t.Fatalf("EnableTrino: %v", err)
+	}
+	if err := store.SetOrgUserDisabled("acme", "root", true); err != nil {
+		t.Fatalf("disable root: %v", err)
+	}
+
+	got, err := store.ListTrinoEnabledOrgs()
+	if err != nil {
+		t.Fatalf("ListTrinoEnabledOrgs: %v", err)
+	}
 	if len(got) != 1 || got[0].OrgID != "acme" {
-		t.Fatalf("expected only acme after disabling beta, got %+v", got)
+		t.Fatalf("expected acme still listed, got %+v", got)
+	}
+	if got[0].RootPasswordHash != "" {
+		t.Errorf("RootPasswordHash = %q, want empty while root is disabled", got[0].RootPasswordHash)
+	}
+	if len(got[0].Users) != 1 || got[0].Users[0].Username != "analyst" {
+		t.Errorf("Users = %+v, want exactly analyst", got[0].Users)
+	}
+
+	if err := store.SetOrgUserDisabled("acme", "root", false); err != nil {
+		t.Fatalf("re-enable root: %v", err)
+	}
+	got, err = store.ListTrinoEnabledOrgs()
+	if err != nil {
+		t.Fatalf("ListTrinoEnabledOrgs (re-enabled): %v", err)
+	}
+	if got[0].RootPasswordHash != "$2a$10$hash-acme" {
+		t.Errorf("RootPasswordHash = %q, want root's hash back after re-enable", got[0].RootPasswordHash)
 	}
 }
 
@@ -285,9 +314,9 @@ func TestListTrinoEnabledOrgsJoinsRootUserAndCarriesCell(t *testing.T) {
 // re-created org would inherit a stranded row.
 // database_name is the org's Trino principal — the username it authenticates
 // as and the stem of its catalog name — so an org without one has no
-// derivable Trino identity and must be dropped by the listing, exactly as a
-// root-less org is. Returning it would project a catalog literally named
-// `org_`, which every such org would collide on.
+// derivable Trino identity and must be dropped by the listing. Returning it
+// would project a catalog literally named `org_`, which every such org would
+// collide on.
 func TestListTrinoEnabledOrgsRequiresADatabaseName(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	seedTrinoOrg(t, store, "acme")

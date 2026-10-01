@@ -201,11 +201,98 @@ func TestArtifactSinkWritesAthenaServiceMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read query_service_metrics.csv: %v", err)
 	}
-	wantMetricsHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "queue_ms", "planning_ms", "engine_ms", "service_ms", "bytes_scanned", "dpu_count", "result_reused", "engine_version", "representation", "run_label"}
-	if !reflect.DeepEqual(metricsRecords[0], wantMetricsHeader) {
-		t.Fatalf("service metrics header: got %v want %v", metricsRecords[0], wantMetricsHeader)
+	if !reflect.DeepEqual(metricsRecords[0], wantServiceMetricsHeader) {
+		t.Fatalf("service metrics header: got %v want %v", metricsRecords[0], wantServiceMetricsHeader)
 	}
-	if got, want := metricsRecords[1], []string{"q1__athena_external", "i1", "1", "athena", "100.000000", "200.000000", "2000.000000", "2500.000000", "4096", "4", "false", "Athena engine version 3", "", "athena"}; !reflect.DeepEqual(got, want) {
+	// Athena values are unchanged; the appended Trino-only columns stay blank.
+	if got, want := metricsRecords[1], []string{"q1__athena_external", "i1", "1", "athena", "100.000000", "200.000000", "2000.000000", "2500.000000", "4096", "4", "false", "Athena engine version 3", "", "athena", "", "", "", "", "", "", ""}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("service metrics row: got %v want %v", got, want)
+	}
+}
+
+// The original columns keep their positions so existing readers still work;
+// the Trino statistics columns are appended.
+var wantServiceMetricsHeader = []string{
+	"query_id", "intent_id", "measure_iteration", "protocol", "queue_ms", "planning_ms", "engine_ms", "service_ms",
+	"bytes_scanned", "dpu_count", "result_reused", "engine_version", "representation", "run_label",
+	"total_splits", "completed_splits", "physical_input_rows", "cpu_ms", "peak_memory_bytes", "engine_query_id", "stats_source",
+}
+
+func TestArtifactSinkWritesTrinoQueryStatistics(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := NewArtifactSink(dir)
+	if err != nil {
+		t.Fatalf("NewArtifactSink returned error: %v", err)
+	}
+	physicalRows := int64(0)
+	base := QueryResult{
+		QueryID:          "q_events_total_v5__hoglake_table",
+		IntentID:         "intent_events_total_v5",
+		MeasureIteration: 2,
+		Protocol:         ProtocolTrinoCached,
+		Status:           "ok",
+		Rows:             1,
+		Duration:         450 * time.Millisecond,
+		StartedAt:        time.Unix(1700000000, 0),
+	}
+	fromQueryInfo := base
+	fromQueryInfo.ServiceMetrics = &ServiceMetrics{
+		QueueDuration:    1210 * time.Microsecond,
+		PlanningDuration: 55500 * time.Microsecond,
+		EngineDuration:   398 * time.Millisecond,
+		ServiceDuration:  412350 * time.Microsecond,
+		BytesScanned:     2 << 20,
+		Trino: &TrinoQueryStats{
+			QueryID: "20260924_101500_00042_abcde", Source: TrinoStatsSourceQueryInfo,
+			TotalSplits: 97, CompletedSplits: 97, PhysicalInputRows: &physicalRows,
+			CPUDuration: 1520 * time.Millisecond, PeakMemoryBytes: 1310720,
+		},
+	}
+	fromStatement := base
+	fromStatement.MeasureIteration = 3
+	fromStatement.ServiceMetrics = &ServiceMetrics{
+		QueueDuration:    time.Millisecond,
+		PlanningDuration: 55 * time.Millisecond,
+		ServiceDuration:  412 * time.Millisecond,
+		BytesScanned:     2 << 20,
+		Trino: &TrinoQueryStats{
+			QueryID: "20260924_101500_00043_abcde", Source: TrinoStatsSourceStatement,
+			TotalSplits: 92, CompletedSplits: 92, CPUDuration: 1520 * time.Millisecond, PeakMemoryBytes: 1310720,
+		},
+	}
+	withoutStats := base
+	withoutStats.MeasureIteration = 4
+	for _, result := range []QueryResult{fromQueryInfo, fromStatement, withoutStats} {
+		if err := sink.Record(result); err != nil {
+			t.Fatalf("Record returned error: %v", err)
+		}
+	}
+	if err := sink.Close(RunSummary{}, ""); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	metricsFile, err := os.Open(filepath.Join(dir, "query_service_metrics.csv"))
+	if err != nil {
+		t.Fatalf("open query_service_metrics.csv: %v", err)
+	}
+	records, err := csv.NewReader(metricsFile).ReadAll()
+	_ = metricsFile.Close()
+	if err != nil {
+		t.Fatalf("read query_service_metrics.csv: %v", err)
+	}
+	if !reflect.DeepEqual(records[0], wantServiceMetricsHeader) {
+		t.Fatalf("service metrics header: got %v want %v", records[0], wantServiceMetricsHeader)
+	}
+	// One row per Trino iteration with statistics. Athena-only fields are blank
+	// rather than a misleading zero DPU count or result-reuse flag.
+	want := [][]string{
+		{"q_events_total_v5__hoglake_table", "intent_events_total_v5", "2", "trino_cached", "1.210000", "55.500000", "398.000000", "412.350000", "2097152", "", "", "", "", "trino_cached",
+			"97", "97", "0", "1520.000000", "1310720", "20260924_101500_00042_abcde", "query_info"},
+		// The statement fallback has no execution time or physical input rows.
+		{"q_events_total_v5__hoglake_table", "intent_events_total_v5", "3", "trino_cached", "1.000000", "55.000000", "", "412.000000", "2097152", "", "", "", "", "trino_cached",
+			"92", "92", "", "1520.000000", "1310720", "20260924_101500_00043_abcde", "statement_stats"},
+	}
+	if got := records[1:]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("service metrics rows:\ngot  %v\nwant %v", got, want)
 	}
 }

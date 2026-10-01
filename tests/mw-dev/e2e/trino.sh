@@ -39,6 +39,10 @@ chmod +x "$KUBECTL"
 
 api() { curl --connect-timeout 5 --max-time 60 -fsS -H "$H" "$@"; }
 
+serving_instance() {
+  api "$API/api/v1/trino/instances?cell=pool-test" \
+    | jq -er '[.instances[] | select(.phase == "SERVING") | .instance_id] | select(length > 0) | .[0]'
+}
 
 provision() { # org db team
   api -X POST -H 'Content-Type: application/json' \
@@ -63,12 +67,12 @@ wait_trino() { # org expected-principal expected-catalog
     body="$(api "$API/api/v1/orgs/$1/trino" 2>/dev/null || true)"
     state="$(printf %s "$body" | jq -r '.status.state // empty' 2>/dev/null || true)"
     if [ "$state" = ready ]; then
-      printf %s "$body" | jq -e --arg p "$2" --arg c "$3" --arg cell legacy --arg host "duckgres-trino.$NS.svc" \
+      printf %s "$body" | jq -e --arg p "$2" --arg c "$3" --arg cell pool-test --arg host "duckgres-trino-gateway.$NS.svc" \
         '.enabled == true and .available == true and .status.principal == $p and .status.catalog == $c and .status.cell == $cell and .status.tier == "free" and .status.connection.host == $host and .status.connection.port == 8443 and .status.connection.username == $p and (.status.connection | has("password") | not)' >/dev/null \
         || fail "$1 Trino status identity mismatch: $body"
-      api "$API/api/v1/orgs/$1" | jq -e --arg stored_cell "ci-pr-$PR" \
+      api "$API/api/v1/orgs/$1" | jq -e --arg stored_cell "registered:pool-test" \
         '.trino.trino_cell_id == $stored_cell and .trino.backend == "hoglake"' >/dev/null \
-        || fail "$1 legacy API identity changed persisted Trino ownership"
+        || fail "$1 pool API identity changed persisted Trino ownership"
       TRINO="https://$(printf %s "$body" | jq -r '.status.connection.host'):$(printf %s "$body" | jq -r '.status.connection.port')"
       return 0
     fi
@@ -85,9 +89,18 @@ wait_trino() { # org expected-principal expected-catalog
 trino_query() { # principal password sql
   principal="$1" password="$2" sql="$3"
   set -- -H "X-Trino-User: $principal" -H 'X-Trino-Time-Zone: UTC'
+  endpoint="$TRINO"
+  case "$principal" in
+    __admin_provisioner|__duckgres_observer)
+      service="$(serving_instance)" || return 1
+      endpoint="http://$service.$NS.svc:8080"
+      set -- "$@" -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-Port: 443'
+      ;;
+    *) set -- "$@" -H 'X-Trino-Routing-Group: pool-test' ;;
+  esac
   [ -z "${TRINO_HOST:-}" ] || set -- "$@" -H "Host: $TRINO_HOST"
   response="$(curl --connect-timeout 5 --max-time 60 --cacert "$CA" -fsS --user "$principal:$password" \
-    "$@" --data-binary "$sql" "$TRINO/v1/statement")" || return 1
+    "$@" --data-binary "$sql" "$endpoint/v1/statement")" || return 1
   rows='[]'
   while :; do
     err="$(printf %s "$response" | jq -r '.error.message // empty')"
@@ -109,6 +122,16 @@ trino_query() { # principal password sql
     rows="$(printf %s "$response" | jq -c --argjson rows "$rows" '$rows + (.data // [])')"
     next="$(printf %s "$response" | jq -r '.nextUri // empty')"
     [ -n "$next" ] || break
+    case "$principal" in
+      __admin_provisioner|__duckgres_observer)
+        case "$next" in
+          "https://$service.$NS.svc/v1/statement/"*) next="$endpoint/${next#https://$service.$NS.svc/}" ;;
+          "https://$service.$NS.svc:443/v1/statement/"*) next="$endpoint/${next#https://$service.$NS.svc:443/}" ;;
+          *) echo 'unexpected coordinator continuation origin' >&2; return 1 ;;
+        esac
+        ;;
+      *) case "$next" in "$TRINO/"*) ;; *) echo 'unexpected Gateway continuation origin' >&2; return 1 ;; esac ;;
+    esac
     response="$(curl --connect-timeout 5 --max-time 60 --cacert "$CA" -fsS --user "$principal:$password" \
       "$@" "$next")" || return 1
   done
@@ -209,7 +232,7 @@ bootstrap_auth="$("$KUBECTL" -n "$NS" get secret trino-auth -o json)"
 bootstrap_admin="$(printf %s "$bootstrap_auth" | jq -r '.data["admin-password"] | @base64d')"
 bootstrap_observer="$(printf %s "$bootstrap_auth" | jq -r '.data["observer-password"] | @base64d')"
 unset bootstrap_auth
-TRINO="https://duckgres-trino.$NS.svc:8443"
+TRINO="https://duckgres-trino-gateway.$NS.svc:8443"
 bootstrap_auth_attempt=0
 bootstrap_authenticated=false
 while [ "$bootstrap_auth_attempt" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do
@@ -240,7 +263,7 @@ log "TLS/password auth, discovery, and DDL/DML"
 [ "$(scalar "$DB_A" "$pw_a" 'SELECT 1')" = 1 ] || fail "Trino SELECT 1 failed"
 [ "$(bootstrap_pair_fingerprint)" = "$bootstrap_initial_fingerprint" ] || fail "tenant provisioning replaced bootstrap credential pairs"
 must_fail "$DB_A" definitely-wrong-password 'SELECT 1' '401|Unauthorized|Authentication|credentials'
-must_fail "$ORG_A" "$pw_a" 'SELECT 1' '401|Unauthorized|Authentication|credentials'
+must_fail "$ORG_A" "$pw_a" 'SELECT 1' '403'
 catalogs="$(trino_query "$DB_A" "$pw_a" 'SHOW CATALOGS')"
 printf %s "$catalogs" | jq -e --arg c "$CAT_A" 'any(.[]; .[0] == $c)' >/dev/null || fail "own catalog absent: $catalogs"
 printf %s "$catalogs" | jq -e --arg c "$CAT_B" 'all(.[]; .[0] != $c)' >/dev/null || fail "foreign catalog visible before tenant B exists"
@@ -273,12 +296,15 @@ file_count_after="$(curl -fsS "$files_uri" | jq length)"
 [ "$(trino_query "$DB_A" "$pw_a" "SELECT id, CAST(amount AS VARCHAR) FROM $CAT_A.$schema.$writes ORDER BY id")" = "$before_rows" ] || fail "compaction changed wide decimal rows"
 
 log "hot-add second tenant without restarting coordinator"
-coord_uid_before="$("$KUBECTL" -n "$NS" get pod -l 'app=duckgres-trino,component=coordinator' -o jsonpath='{.items[0].metadata.uid}')"
+coord_uid_before="$("$KUBECTL" -n "$NS" get pod -l 'posthog.com/trino-pool=pool-test,app.kubernetes.io/component=coordinator' -o jsonpath='{.items[0].metadata.uid}')"
 pw_b="$(provision "$ORG_B" "$DB_B" "$TEAM_B" | jq -r .password)"
 [ -n "$pw_b" ] && [ "$pw_b" != null ] || fail "tenant B provision returned no password"
 wait_warehouse "$ORG_B"
 wait_trino "$ORG_B" "$DB_B" "$CAT_B"
-[ "$("$KUBECTL" -n "$NS" get pod -l 'app=duckgres-trino,component=coordinator' -o jsonpath='{.items[0].metadata.uid}')" = "$coord_uid_before" ] \
+if [ "${TRINO_SERVICE_CREDENTIALS_ENABLED:-false}" = true ]; then
+  . /harness/trino-service-credentials.sh
+fi
+[ "$("$KUBECTL" -n "$NS" get pod -l 'posthog.com/trino-pool=pool-test,app.kubernetes.io/component=coordinator' -o jsonpath='{.items[0].metadata.uid}')" = "$coord_uid_before" ] \
   || fail "adding tenant B restarted the Trino coordinator"
 [ "$(scalar "$DB_B" "$pw_b" 'SELECT 1')" = 1 ] || fail "hot-added tenant cannot authenticate"
 admin_pw="$("$KUBECTL" -n "$NS" get secret trino-auth -o go-template='{{index .data "admin-password"}}' | base64 -d)"
@@ -307,11 +333,11 @@ must_fail "$DB_B" "$pw_b" "DROP TABLE $CAT_A.$schema.$table" 'denied|access|cata
 [ "$(scalar "$DB_A" "$pw_a" "SELECT count(*) FROM $CAT_A.$schema.$table")" = 1 ] || fail "cross-tenant attempts changed tenant A data"
 
 log "admin Trino fleet/org/query surfaces"
-api "$API/api/v1/trino/status" | jq -e --arg cell legacy '.available == true and .cell.id == $cell' >/dev/null
-api "$API/api/v1/trino/nodes" | jq -e '.available == true and (.nodes | length) >= 2' >/dev/null
-api "$API/api/v1/trino/orgs" | jq -e --arg a "$ORG_A" --arg b "$ORG_B" \
-  'any(.orgs[]; .org == $a and .state == "ready" and .cell == "legacy") and any(.orgs[]; .org == $b and .state == "ready" and .cell == "legacy")' >/dev/null
-queries="$(api "$API/api/v1/trino/queries?org=$ORG_A")"
+api "$API/api/v1/trino/status?cell=pool-test" | jq -e --arg cell pool-test '.available == true and .cell.id == $cell' >/dev/null
+api "$API/api/v1/trino/nodes?cell=pool-test" | jq -e '.available == true and (.nodes | length) >= 2' >/dev/null
+api "$API/api/v1/trino/orgs?cell=pool-test" | jq -e --arg a "$ORG_A" --arg b "$ORG_B" \
+  'any(.orgs[]; .org == $a and .state == "ready" and .cell == "pool-test") and any(.orgs[]; .org == $b and .state == "ready" and .cell == "pool-test")' >/dev/null
+queries="$(api "$API/api/v1/trino/queries?cell=pool-test&org=$ORG_A")"
 printf %s "$queries" | jq -e --arg a "$ORG_A" --arg table "$table" \
   'all(.queries[]; .org == $a) and any(.queries[]; .query | contains($table))' >/dev/null \
   || fail "admin query list is unscoped or missing tenant A SQL: $queries"
@@ -323,21 +349,21 @@ kill_out=/tmp/trino-kill-query.out
     >"$kill_out" 2>&1 ) & kill_pid=$!
 query_id=""; i=0
 while [ "$i" -lt 30 ]; do
-  query_id="$(api "$API/api/v1/trino/queries?org=$ORG_A&active=1" \
+  query_id="$(api "$API/api/v1/trino/queries?cell=pool-test&org=$ORG_A&active=1" \
     | jq -r '.queries[0].query_id // empty')"
   [ -n "$query_id" ] && break
   kill -0 "$kill_pid" 2>/dev/null || break
   sleep 1; i=$((i + 1))
 done
 [ -n "$query_id" ] || { wait "$kill_pid" 2>/dev/null || true; fail "long Trino query never appeared in admin live queries: $(cat "$kill_out")"; }
-api "$API/api/v1/trino/queries/$query_id" | jq -e --arg q "$query_id" --arg org "$ORG_A" \
+api "$API/api/v1/trino/queries/$query_id?cell=pool-test" | jq -e --arg q "$query_id" --arg org "$ORG_A" \
   '.query_id == $q and .org == $org' >/dev/null \
   || fail "admin Trino query detail did not identify tenant A query $query_id"
 code="$(curl --cacert "$CA" -sS -o /tmp/trino-cross-query -w '%{http_code}' \
   --user "$DB_B:$pw_b" -H "X-Trino-User: $DB_B" "$TRINO/v1/query/$query_id")"
 [ "$code" = 403 ] || fail "tenant B query detail for tenant A returned HTTP $code, want 403: $(cat /tmp/trino-cross-query)"
 api -X POST -H 'Content-Type: application/json' -d '{"reason":"e2e operator cancellation"}' \
-  "$API/api/v1/trino/queries/$query_id/kill" \
+  "$API/api/v1/trino/queries/$query_id/kill?cell=pool-test" \
   | jq -e --arg org "$ORG_A" '.killed == true and .org == $org' >/dev/null
 wait "$kill_pid" 2>/dev/null && fail "admin kill did not fail the tenant query"
 api "$API/api/v1/audit?org=$ORG_A" | jq -e --arg q "$query_id" \
@@ -370,7 +396,7 @@ trino_query "$analyst_principal" "$pw_a" 'SELECT 1' >/dev/null 2>&1 \
 must_fail "$analyst_principal" "$analyst_pw" "SELECT * FROM $CAT_B.main.$foreign_table" 'denied|access|catalog|not found|does not exist'
 marker="per_user_attribution_$PR"
 trino_query "$analyst_principal" "$analyst_pw" "SELECT '$marker'" >/dev/null
-api "$API/api/v1/trino/queries?org=$ORG_A" | jq -e --arg m "$marker" --arg p "$analyst_principal" --arg org "$ORG_A" \
+api "$API/api/v1/trino/queries?cell=pool-test&org=$ORG_A" | jq -e --arg m "$marker" --arg p "$analyst_principal" --arg org "$ORG_A" \
   'any(.queries[]; .principal == $p and .org == $org and (.query | contains($m)))' >/dev/null \
   || fail "admin query list did not attribute the per-user login's query to its org"
 
@@ -409,14 +435,45 @@ done
 trino_query "$DB_A" "$pw_a" 'SELECT 1' >/dev/null 2>&1 && fail "old Trino password still authenticates"
 pw_a="$new_pw"
 
+# The bare <database_name> principal authenticates with root's hash, so the
+# per-user kill switch on root must revoke it too (it used to survive a root
+# disable). The org stays enabled; re-enabling root restores the login.
+log "disabling root revokes the bare org principal"
+api -X POST "$API/api/v1/orgs/$ORG_A/users/root/disable" >/dev/null
+i=0
+while [ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do
+  trino_query "$DB_A" "$pw_a" 'SELECT 1' >/dev/null 2>&1 || break
+  sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"; i=$((i + 1))
+done
+[ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ] || fail "bare org principal still authenticates after root was disabled"
+api -X POST "$API/api/v1/orgs/$ORG_A/users/root/enable" >/dev/null
+i=0
+while [ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do
+  trino_query "$DB_A" "$pw_a" 'SELECT 1' >/dev/null 2>&1 && break
+  sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"; i=$((i + 1))
+done
+[ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ] || fail "bare org principal did not come back after root was re-enabled"
+
 log "worker restart preserves Hoglake data"
-"$KUBECTL" -n "$NS" delete pod -l 'app=duckgres-trino,component=worker' --wait=true >/dev/null
-"$KUBECTL" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=240s >/dev/null
+old_instance="$(serving_instance)"
+"$KUBECTL" -n "$NS" delete pod -l 'posthog.com/trino-pool=pool-test,app.kubernetes.io/component=worker' --wait=true >/dev/null
+"$KUBECTL" -n "$NS" rollout status "deployment/$old_instance-worker" --timeout=240s >/dev/null
 [ "$(scalar "$DB_A" "$pw_a" "SELECT label FROM $CAT_A.$schema.$table")" = two ] || fail "data missing after Trino worker restart"
 
-log "coordinator restart restores catalog store, auth, and OPA bundle"
-"$KUBECTL" -n "$NS" delete pod -l 'app=duckgres-trino,component=coordinator' --wait=true >/dev/null
-"$KUBECTL" -n "$NS" rollout status deploy/duckgres-trino-coordinator --timeout=240s >/dev/null
+log "immutable pool replacement restores catalogs, auth, and OPA"
+old_instance="$(serving_instance)"
+pool_config="$("$KUBECTL" -n "$NS" get configmap trino-pool-config -o json)"
+pool_patch="$(printf %s "$pool_config" | jq -ce '[{op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion},{op:"replace",path:"/data/blueprint.json",value:(.data["blueprint.json"] | fromjson | .generation += 1 | .release_id="fixture-v2" | tojson)}]')"
+"$KUBECTL" -n "$NS" patch configmap trino-pool-config --type=json -p "$pool_patch" >/dev/null
+i=0
+while [ "$i" -lt 180 ]; do
+  if api "$API/api/v1/trino/instances?cell=pool-test" | jq -e --arg old "$old_instance" \
+      'any(.instances[]; .phase == "SERVING" and .instance_id != $old) and all(.instances[]; .instance_id != $old or .phase == "RETIRED")' >/dev/null; then
+    break
+  fi
+  sleep 5; i=$((i + 1))
+done
+[ "$i" -lt 180 ] || fail "pool did not replace and retire its original instance"
 i=0
 while [ "$i" -lt 30 ]; do
   value="$(scalar "$DB_A" "$pw_a" "SELECT label FROM $CAT_A.$schema.$table" 2>/dev/null || true)"
@@ -460,10 +517,4 @@ api -X POST -H 'Content-Type: application/json' -d '{"enabled":true,"tier":"free
 wait_trino "$ORG_B" "$DB_B" "$CAT_B"
 [ "$(scalar "$DB_B" "$pw_b" "SELECT count(*) FROM $CAT_B.main.$foreign_table")" = 1 ] || fail "reenabled tenant lost data"
 # Namespace teardown removes fixture metadata; the runner removes only its S3 prefixes.
-if [ "${TRINO_MULTICELL_ENABLED:-false}" = true ]; then
-  . /harness/trino-multicell.sh
-  if [ "${TRINO_SHARED_CATALOGS_ENABLED:-false}" = true ]; then
-    . /harness/trino-shared-catalogs.sh
-  fi
-fi
 log "PASS: isolated Trino provisioning + verified auth + per-user logins + DDL/DML + OPA isolation/batching + hot-add + admin + rotation + restart + disable"

@@ -400,17 +400,6 @@ type ManagedWarehouse struct {
 
 func (ManagedWarehouse) TableName() string { return "duckgres_managed_warehouses" }
 
-// DefaultTrinoCellID is the cell every Trino-enabled org lands on until a
-// second cell exists. Cells are the unit a shared Trino cluster is scaled
-// in: one coordinator + worker fleet + one OPA sidecar per cell, with the
-// orgs assigned to it. Today there is exactly ONE, named by
-// DUCKGRES_TRINO_CELL_ID; the column exists so adding a second cell is a
-// data change plus a per-cell coordinator lookup, not a schema migration
-// mid-incident. There is deliberately NO assignment policy, rebalancer, or
-// fleet manager — an org lands on the cell whose provisioner claims it
-// first, and today only one provisioner runs.
-const DefaultTrinoCellID = "cell-001"
-
 // ManagedWarehouseTrino captures per-org opt-in for the shared, multi-tenant
 // Trino cell. Trino access is granted at the org level: when Enabled is true,
 // the provisioner extension (controlplane/provisioner/trino_provisioner.go)
@@ -450,8 +439,7 @@ type ManagedWarehouseTrino struct {
 	Tier string `gorm:"size:64" json:"tier"`
 
 	// TrinoCellID names the Trino cell that owns this org. Empty means
-	// UNASSIGNED: the first reconciling provisioner claims the org into its
-	// own cell (AssignTrinoCell) and every later tick sees the stamp. A
+	// UNASSIGNED: explicit selection or the configured default selects a pool. A
 	// provisioner NEVER touches an org stamped with a different cell — that
 	// is what keeps two cells from both projecting the same tenant.
 	TrinoCellID string `gorm:"column:trino_cell_id;size:64" json:"trino_cell_id"`
@@ -530,7 +518,7 @@ type TrinoEnabledOrg struct {
 	DatabaseName       string
 	Tier               string
 	CellID             string
-	RootPasswordHash   string                            // bcrypt hash from OrgUser row where Username = "root"
+	RootPasswordHash   string                            // bcrypt hash of an enabled `root` OrgUser; "" = no bare principal
 	State              ManagedWarehouseProvisioningState // current state at read time
 	// Users are the org's own duckgres logins, each of which authenticates
 	// to Trino under TrinoUserPrincipal(Username) with the very same bcrypt
@@ -609,19 +597,24 @@ type TrinoPrincipalOwner struct {
 // consumer that attributes a query to a tenant (usage metering, the admin
 // console) must see a per-user login as its org's, not as an unknown user.
 //
-// It is built from the SAME principals BuildTrinoAuthFiles projects, by exact
-// match, rather than by splitting on the separator, so a principal that is not
-// in the password file never resolves to an org.
+// Persistent users resolve by exact projection membership. Authenticated
+// service grants resolve through their reserved namespace and known tenant.
 type TrinoPrincipalOwners map[string]TrinoPrincipalOwner
 
 // NewTrinoPrincipalOwners indexes the projected principals of orgs. The bare
 // org principal authenticates with the root login's hash, so it resolves to
-// root.
+// root -- and, like the password file, exists only while root has a hash.
 func NewTrinoPrincipalOwners(orgs []TrinoEnabledOrg) TrinoPrincipalOwners {
 	owners := make(TrinoPrincipalOwners, len(orgs))
 	for _, o := range orgs {
 		if p := o.TrinoPrincipal(); p != "" {
-			owners[p] = TrinoPrincipalOwner{OrgID: o.OrgID, Username: "root"}
+			// The database index attributes minted service credentials
+			// (`<db>.svc_…`), which are not projected logins and exist whether
+			// or not root does.
+			owners[trinoDatabaseOwnerKey(p)] = TrinoPrincipalOwner{OrgID: o.OrgID}
+			if o.RootPasswordHash != "" {
+				owners[p] = TrinoPrincipalOwner{OrgID: o.OrgID, Username: "root"}
+			}
 		}
 		for _, u := range o.Users {
 			if p := o.TrinoUserPrincipal(u.Username); p != "" {
@@ -632,10 +625,30 @@ func NewTrinoPrincipalOwners(orgs []TrinoEnabledOrg) TrinoPrincipalOwners {
 	return owners
 }
 
+// trinoDatabaseOwnerKey keys the database -> org index inside the owners map.
+// The NUL prefix cannot occur in a principal (password.db is line-oriented and
+// usernames are allowlisted), so an index entry never resolves as a login.
+func trinoDatabaseOwnerKey(databaseName string) string {
+	return "\x00db:" + databaseName
+}
+
 // OrgID returns the org that owns principal, or "" for an operational or
 // unknown principal.
 func (owners TrinoPrincipalOwners) OrgID(principal string) string {
-	return owners[principal].OrgID
+	owner, _ := owners.Resolve(principal)
+	return owner.OrgID
+}
+
+// Resolve attributes a coordinator-authenticated identity; it does not grant
+// authentication or authorization to a caller-supplied username.
+func (owners TrinoPrincipalOwners) Resolve(principal string) (TrinoPrincipalOwner, bool) {
+	if parts := trinoServiceCredentialUsername.FindStringSubmatch(principal); parts != nil {
+		owner, found := owners[trinoDatabaseOwnerKey(parts[1])]
+		owner.Username = parts[2]
+		return owner, found
+	}
+	owner, found := owners[principal]
+	return owner, found
 }
 
 // TrinoPrincipal is the tenant's customer-facing identity in Trino: the

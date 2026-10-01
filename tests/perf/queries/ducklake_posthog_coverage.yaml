@@ -1,0 +1,175 @@
+name: posthog-frozen-coverage-v1
+description: Bounded analytical workload coverage on the frozen events/persons snapshot; background shapes measure SELECT computation, not materialization writes.
+seed: 42
+dataset_scale: 1
+targets: [pgwire_uncached, pgwire_cached, trino, trino_cached, athena]
+warmup_iterations: 1
+measure_iterations: 4
+relation_variants:
+  ducklake_table: {events: posthog.events, persons: posthog.persons}
+  hoglake_table: {events: posthog.events, persons: posthog.persons}
+  athena_external: {events: events, persons: persons}
+
+# Fixed UTC windows make comparisons reproducible. Persons are deduplicated by
+# tenant and ID before joins because the frozen export contains snapshot rows.
+# Identification means observed identified in the snapshot, not as-of event time.
+# Funnel: first pageview followed by autocapture within seven days.
+# Retention: activity in week one and again in week two (not new-user retention).
+# Session model: new session after an inactivity gap strictly greater than 30m.
+# Verify date/event/join population before treating a run as representative.
+paired_queries:
+  - query_id_base: q_coverage_daily_uniques_v1
+    intent_id: intent_coverage_daily_uniques_v1
+    tags: [nightly, frozen, posthog, coverage, paired, foreground, distinct, trends]
+    params: {}
+    sql_template: |
+      SELECT CAST(day AS VARCHAR) AS day, COUNT(*) AS persons FROM (
+        SELECT CAST("timestamp" AT TIME ZONE 'UTC' AS DATE) AS day, team_id, person_id
+        FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-27 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND person_id IS NOT NULL AND event = '$pageview'
+        GROUP BY 1, 2, 3
+      ) active GROUP BY day ORDER BY day
+
+  - query_id_base: q_coverage_event_trends_v1
+    intent_id: intent_coverage_event_trends_v1
+    tags: [nightly, frozen, posthog, coverage, paired, foreground, aggregate, trends]
+    params: {}
+    sql_template: |
+      SELECT CAST(CAST("timestamp" AT TIME ZONE 'UTC' AS DATE) AS VARCHAR) AS day, event, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-27 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND event IN ('$pageview', '$autocapture') GROUP BY 1, 2 ORDER BY 1, 2
+
+  - query_id_base: q_coverage_person_enrichment_v1
+    intent_id: intent_coverage_person_enrichment_v1
+    tags: [nightly, frozen, posthog, coverage, paired, foreground, join]
+    params: {}
+    sql_template: |
+      SELECT * FROM (
+      WITH deduplicated_persons AS (
+        SELECT team_id, id, MAX(CASE WHEN is_identified THEN 1 ELSE 0 END) AS identified
+        FROM {{ relation "persons" }} GROUP BY team_id, id
+      )
+      SELECT p.identified = 1 AS is_identified, COUNT(*) AS events
+      FROM (SELECT * FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)) e JOIN deduplicated_persons p ON e.team_id = p.team_id AND e.person_id = p.id
+      GROUP BY p.identified ORDER BY p.identified
+      ) coverage_query ORDER BY 1
+
+  - query_id_base: q_coverage_person_activity_join_v1
+    intent_id: intent_coverage_person_activity_join_v1
+    tags: [nightly, frozen, posthog, coverage, paired, foreground, join]
+    params: {}
+    sql_template: |
+      SELECT * FROM (
+      WITH activity AS (SELECT team_id, person_id, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND person_id IS NOT NULL GROUP BY team_id, person_id), deduplicated_persons AS (SELECT DISTINCT team_id, id FROM {{ relation "persons" }})
+      SELECT COUNT(*) AS matched_persons, COALESCE(SUM(a.events), 0) AS events
+      FROM activity a JOIN deduplicated_persons p ON a.team_id = p.team_id AND a.person_id = p.id
+      ) coverage_query
+
+  - query_id_base: q_coverage_recent_events_v1
+    intent_id: intent_coverage_recent_events_v1
+    tags: [nightly, frozen, posthog, coverage, paired, foreground, retrieval]
+    params: {}
+    sql_template: |
+      SELECT uuid, event, person_id FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+      ORDER BY "timestamp" DESC, uuid DESC LIMIT 100
+
+  - query_id_base: q_coverage_active_actors_v1
+    intent_id: intent_coverage_active_actors_v1
+    tags: [nightly, frozen, posthog, coverage, paired, foreground, retrieval]
+    params: {}
+    sql_template: |
+      SELECT team_id, person_id, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND person_id IS NOT NULL GROUP BY team_id, person_id ORDER BY events DESC, team_id, person_id LIMIT 100
+
+  - query_id_base: q_coverage_ordered_funnel_v1
+    intent_id: intent_coverage_ordered_funnel_v1
+    tags: [nightly, frozen, posthog, coverage, paired, foreground, funnel]
+    params: {}
+    sql_template: |
+      SELECT * FROM (
+      WITH starts AS (
+       SELECT team_id, person_id, MIN("timestamp") AS started_at FROM {{ relation "events" }}
+       WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND event = '$pageview' AND person_id IS NOT NULL GROUP BY team_id, person_id
+      ), completions AS (
+       SELECT s.team_id, s.person_id, MIN(e."timestamp") AS completed_at
+       FROM starts s JOIN {{ relation "events" }} e ON s.team_id = e.team_id AND s.person_id = e.person_id
+       WHERE e.event = '$autocapture' AND e."timestamp" > s.started_at
+         AND e."timestamp" <= s.started_at + INTERVAL '7' DAY
+         AND e."timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+         AND e."timestamp" < CAST('2026-03-31 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+       GROUP BY s.team_id, s.person_id
+      )
+      SELECT COUNT(*) AS started_persons, COUNT(c.person_id) AS completed_persons
+      FROM starts s LEFT JOIN completions c ON s.team_id = c.team_id AND s.person_id = c.person_id
+      ) coverage_query
+
+  - query_id_base: q_coverage_weekly_retention_v1
+    intent_id: intent_coverage_weekly_retention_v1
+    tags: [nightly, frozen, posthog, coverage, paired, foreground, retention]
+    params: {}
+    sql_template: |
+      SELECT * FROM (
+      WITH activity AS (
+       SELECT team_id, person_id,
+       MAX(CASE WHEN "timestamp" < CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) THEN 1 ELSE 0 END) AS first_week,
+       MAX(CASE WHEN "timestamp" >= CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) THEN 1 ELSE 0 END) AS second_week
+       FROM {{ relation "events" }}
+       WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+       AND "timestamp" < CAST('2026-03-31 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+       AND person_id IS NOT NULL GROUP BY team_id, person_id
+      )
+      SELECT COALESCE(SUM(first_week), 0) AS cohort_persons,
+       COALESCE(SUM(CASE WHEN first_week = 1 AND second_week = 1 THEN 1 ELSE 0 END), 0) AS retained_persons FROM activity
+      ) coverage_query
+
+  - query_id_base: q_coverage_repeat_activity_cohort_v1
+    intent_id: intent_coverage_repeat_activity_cohort_v1
+    tags: [nightly, frozen, posthog, coverage, paired, background, cohort]
+    params: {}
+    sql_template: |
+      SELECT COUNT(*) AS cohort_persons FROM (SELECT team_id, person_id, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND person_id IS NOT NULL GROUP BY team_id, person_id HAVING COUNT(*) >= 3) members
+
+  - query_id_base: q_coverage_exclusion_cohort_v1
+    intent_id: intent_coverage_exclusion_cohort_v1
+    tags: [nightly, frozen, posthog, coverage, paired, background, cohort]
+    params: {}
+    sql_template: |
+      SELECT COUNT(*) AS cohort_persons FROM (
+       SELECT team_id, person_id FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND person_id IS NOT NULL
+       GROUP BY team_id, person_id
+       HAVING SUM(CASE WHEN event = '$pageview' THEN 1 ELSE 0 END) > 0
+       AND SUM(CASE WHEN event = '$autocapture' THEN 1 ELSE 0 END) = 0
+      ) members
+
+  - query_id_base: q_coverage_daily_person_model_v1
+    intent_id: intent_coverage_daily_person_model_v1
+    tags: [nightly, frozen, posthog, coverage, paired, background, modeling]
+    params: {}
+    sql_template: |
+      SELECT COUNT(*) AS person_days, COALESCE(SUM(events), 0) AS events FROM (
+       SELECT team_id, person_id, CAST("timestamp" AT TIME ZONE 'UTC' AS DATE) AS day, COUNT(*) AS events
+       FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND person_id IS NOT NULL GROUP BY 1, 2, 3
+      ) daily_activity
+
+  - query_id_base: q_coverage_session_model_v1
+    intent_id: intent_coverage_session_model_v1
+    tags: [nightly, frozen, posthog, coverage, paired, background, modeling, window]
+    params: {}
+    sql_template: |
+      SELECT * FROM (
+      WITH ordered_events AS (
+       SELECT team_id, person_id, "timestamp",
+       LAG("timestamp") OVER (PARTITION BY team_id, person_id ORDER BY "timestamp", uuid) AS previous_at
+       FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-17 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-24 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND person_id IS NOT NULL
+      )
+      SELECT COALESCE(SUM(CASE WHEN previous_at IS NULL OR "timestamp" > previous_at + INTERVAL '30' MINUTE THEN 1 ELSE 0 END), 0) AS sessions,
+       COUNT(*) AS events FROM ordered_events
+      ) coverage_query
+

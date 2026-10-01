@@ -2,12 +2,20 @@
 
 ## Client backend policy
 
-Existing Trino clients retain DuckLake. All new Trino clients use Hoglake; the
-admin UI reports the backend without offering a choice. API callers can omit
-`backend`: the server preserves an existing selection or assigns Hoglake to a
-new client. A request to create a new DuckLake client is rejected. Disable and
-re-enable retain the selected backend. Manual migration of existing clients is
-outside this rollout.
+Existing Trino clients retain DuckLake. New Trino clients use the deployment's
+new-client backend: Hoglake where managed Hoglake is configured, DuckLake where
+it is not. The admin UI reports the backend without offering a choice. API
+callers can omit `backend`: the server preserves an existing selection or
+assigns the new-client backend. A request for any other backend on a new client
+is rejected (an explicit `hoglake` on a deployment without it is 503, not
+configured). Disable and re-enable retain the selected backend. Manual
+migration of existing clients is outside this rollout.
+
+The DuckLake fallback exists because onboarding enables Trino in the provision
+call. Without it, a deployment with no managed Hoglake (prod-us today) rejected
+every new org's provision with 503. A DuckLake client's Trino catalog is the
+org's existing warehouse; configuring managed Hoglake later changes only what
+NEW clients receive, never a pinned selection.
 
 Existing Trino configuration rows migrate to locked DuckLake selections,
 including disabled rows whose previous enablement history is unknown. This
@@ -102,16 +110,15 @@ or ownership mismatches explicitly; do not drop catalogs to force a switch.
    role. Custom roles outside the managed composition require equivalent grants.
 4. Allow the control plane and Trino cells to reach the Hoglake REST service, and
    allow Trino and Hoglake to reach the required storage services.
-5. Supply registered-cell rollout canary credentials and verify healthy control
-   plane and cell readiness. Creating an empty secret resource is insufficient.
+5. Verify healthy control plane and shared-pool admission. The pool controller
+   creates its own validation tenant; no static canary credentials are required.
 6. Enable the managed configuration, create a dedicated pilot tenant, select its
    cell, then enable Trino. Hoglake is assigned automatically. Wait for
    reconciled readiness.
 7. Run the tenant smoke test. Keep pilot enablement limited until it succeeds.
 
-The historical global `DUCKGRES_TRINO_HOGLAKE_URI` switch is deprecated and
-ignored, with a startup warning. It cannot override a client's stored backend.
-Existing catalogs are retained, while new clients use the managed Hoglake path.
+The stored warehouse backend controls catalog provisioning. Enabling managed
+Hoglake does not change an existing warehouse's backend.
 The frozen performance runner still sets the historical switch: its old setup
 is insufficient for new-client onboarding. Updating that runner's storage and
 fixture setup is separate work; do not repurpose immutable fixture prefixes

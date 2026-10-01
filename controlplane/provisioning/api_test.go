@@ -312,7 +312,7 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 
 func (s *fakeStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
 	s.lastTrinoSettings = settings
-	backend, err := configstore.ResolveTrinoBackend(s.trino[orgID], settings.Backend)
+	backend, err := configstore.ResolveTrinoBackend(s.trino[orgID], settings.Backend, settings.NewClientBackend)
 	if err != nil {
 		return err
 	}
@@ -484,6 +484,16 @@ func (s *fakeStore) RefreshServiceCredential(
 func (s *fakeStore) ReloadSnapshot() error {
 	s.reloadSnapshotN++
 	return s.reloadSnapshotEr
+}
+
+func (s *fakeStore) RenewServiceCredential(orgID, credentialID string, ttl time.Duration) (*configstore.ServiceCredentialIssue, error) {
+	issued, err := s.RefreshServiceCredential(orgID, credentialID, ttl)
+	if err != nil {
+		return nil, err
+	}
+	copy := *issued
+	copy.Plaintext = ""
+	return &copy, nil
 }
 
 func newTestRouter(store Store) *gin.Engine {
@@ -1083,8 +1093,6 @@ func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
 	// numeric team_id — opts into Trino via the standalone endpoint.
 	store := newFakeStore()
 	store.orgs["ben-ducklake-cnpg"] = &configstore.Org{Name: "ben-ducklake-cnpg"}
-	// The org's root login is its Trino principal; the endpoint preflights it.
-	store.users[configstore.OrgUserKey{OrgID: "ben-ducklake-cnpg", Username: "root"}] = "hash"
 	router := newTestRouter(store)
 
 	body := []byte(`{"enabled": true, "tier": "growth"}`)
@@ -1102,12 +1110,11 @@ func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
 	}
 }
 
-// An org with no `root` login cannot be projected into a cell:
-// ListTrinoEnabledOrgs inner-joins on it, so the reconcile loop drops the org
-// and never says why. Orgs provisioned before the root-user convention are
-// exactly this shape. Reject at the API instead of queueing a row that can
-// never provision.
-func TestEnableTrinoRejectsOrgWithoutRootUser(t *testing.T) {
+// An org with no `root` login is still enabled: every duckgres login is its
+// own Trino principal, so a root-less org is served through its other logins
+// and only the bare `<database_name>` principal is absent. Orgs provisioned
+// before the root-user convention are exactly this shape.
+func TestEnableTrinoAcceptsOrgWithoutRootUser(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["legacy-org"] = &configstore.Org{Name: "legacy-org", DatabaseName: "legacy"}
 	// Its primary login predates the convention.
@@ -1119,14 +1126,11 @@ func TestEnableTrinoRejectsOrgWithoutRootUser(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "reset-password") {
-		t.Errorf("the error should point at the remedy, got %s", rec.Body.String())
-	}
-	if store.trino["legacy-org"] != nil {
-		t.Error("no trino row may be written for an org that cannot be provisioned")
+	if row := store.trino["legacy-org"]; row == nil || !row.Enabled {
+		t.Fatalf("expected an enabled trino row; got %+v", row)
 	}
 }
 
@@ -2139,7 +2143,11 @@ func TestProvisionTrinoHoglakeForwardsBackend(t *testing.T) {
 	}
 }
 
-func TestTrinoOmittedBackendUsesHoglakeAndChecksAvailability(t *testing.T) {
+// A new client's omitted backend is the deployment's: Hoglake where managed
+// Hoglake is configured, DuckLake where it is not. The DuckLake fallback is
+// what lets onboarding (which enables Trino in the provision call) succeed on
+// a deployment without Hoglake, serving the org's existing warehouse.
+func TestTrinoOmittedBackendFollowsDeploymentAvailability(t *testing.T) {
 	for _, endpoint := range []string{"trino", "provision"} {
 		for _, configured := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/configured=%v", endpoint, configured), func(t *testing.T) {
@@ -2158,14 +2166,12 @@ func TestTrinoOmittedBackendUsesHoglakeAndChecksAvailability(t *testing.T) {
 				req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/"+endpoint, strings.NewReader(body))
 				req.Header.Set("Content-Type", "application/json")
 				router.ServeHTTP(rec, req)
+				want := configstore.TrinoBackendHoglake
 				if !configured {
-					if rec.Code != http.StatusServiceUnavailable || len(store.trino) != 0 || len(store.warehouses) != 0 {
-						t.Fatalf("unconfigured new client mutated or accepted: %d %s", rec.Code, rec.Body.String())
-					}
-					return
+					want = configstore.TrinoBackendDuckLake
 				}
-				if rec.Code != http.StatusAccepted || store.trino["tenant"].Backend != configstore.TrinoBackendHoglake {
-					t.Fatalf("new client not Hoglake: %d %s %+v", rec.Code, rec.Body.String(), store.trino["tenant"])
+				if rec.Code != http.StatusAccepted || store.trino["tenant"] == nil || store.trino["tenant"].Backend != want || !store.trino["tenant"].BackendSelected {
+					t.Fatalf("new client want %s: %d %s %+v", want, rec.Code, rec.Body.String(), store.trino["tenant"])
 				}
 			})
 		}
@@ -2200,6 +2206,21 @@ func TestTrinoExistingDuckLakeReenableWithoutHoglake(t *testing.T) {
 				t.Fatalf("existing client changed or blocked: %d", rec.Code)
 			}
 		}
+	}
+}
+
+// Where DuckLake IS the new-client backend, asking for it explicitly is the
+// same selection as omitting it.
+func TestTrinoAcceptsExplicitDuckLakeWithoutHoglake(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["tenant"] = &configstore.Org{Name: "tenant"}
+	router := newUnconfiguredBackendTestRouter(store)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/trino", strings.NewReader(`{"enabled":true,"backend":"ducklake"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted || store.trino["tenant"].Backend != configstore.TrinoBackendDuckLake {
+		t.Fatalf("explicit DuckLake refused without Hoglake: %d %s", rec.Code, rec.Body.String())
 	}
 }
 

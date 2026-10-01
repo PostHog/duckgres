@@ -67,7 +67,8 @@ export DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI="s3://<results-bucket>/<prefix>/"
 
 The full and fast suites exercise PGWire only. The targeted frozen perf
 scenario compares PGWire on DuckLake, Trino on Hoglake, and on-demand Athena. It records per-query
-success and failure rows in `query_results.csv` and Athena service details in
+success and failure rows in `query_results.csv` and Athena and Trino service
+details (Trino splits and physical input included) in
 `query_service_metrics.csv`.
 Measured query errors fail the perf DAG step after its artifacts are written;
 independent sibling steps continue to run.
@@ -78,12 +79,12 @@ are sent as PGWire startup options. Both default to empty, which leaves worker
 selection to the server; set both for resource-controlled comparisons.
 
 For the frozen-perf scenario, `tests/mw-dev/run.sh` automatically supplies
-`DUCKGRES_TRINO_HOGLAKE_URI` to the control plane and
+`DUCKGRES_TRINO_MANAGED_HOGLAKE_URI` to the control plane and
 `DUCKGRES_SCENARIO_HOGLAKE_URI` to the runner. It also supplies the cached Trino endpoint/cell and a mounted admin password
 file for creating the second catalog. See [the deployment runbook](../../tests/mw-dev/README.md#running-the-combined-trino-perf-comparison)
 for direct-runner settings and failure recovery. No catalog configuration is supplied
-by the caller. Outside these deployments, the control-plane URI defaults to empty
-and catalog provisioning continues to use DuckLake. `HOGLAKE_IMAGE` can override
+by the caller. The bootstrap coordinator belongs to a disposable shared pool;
+the comparison clusters retain their isolated catalog partitions. `HOGLAKE_IMAGE` can override
 the pinned server image. The scenario image includes Python, boto3, and pyarrow
 for reading Parquet footers from S3 during setup.
 

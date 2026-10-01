@@ -34,15 +34,32 @@ import (
 // this process writes can land anyway. This is the isolation the tenant loop
 // already applies.
 func (o *trinoPoolOperator) progressInstances(ctx context.Context, instances []configstore.TrinoPoolInstance) (bool, error) {
+	recoveries, err := o.recoveryRequests(ctx)
+	if err != nil {
+		return true, err
+	}
+	o.recoveryEvidence.prepare(instances, recoveries)
 	var failures []error
 	for _, instance := range instances {
 		phase := trinopool.Phase(instance.Phase)
 		if phase.Terminal() {
 			continue
 		}
-		progressed, err := o.progressInstance(ctx, instance)
+		var progressed bool
+		if recovery, ok := recoveries[instance.InstanceID]; ok {
+			progressed, err = o.recoverInstance(ctx, instance, recovery)
+		} else {
+			progressed, err = o.progressInstance(ctx, instance)
+		}
 		if err != nil {
 			failures = append(failures, fmt.Errorf("instance %s: %w", instance.InstanceID, err))
+			if _, recovering := recoveries[instance.InstanceID]; recovering && !o.fenced {
+				checkpointErr := o.store.RecordTrinoPoolInstanceFields(ctx, o.lease, instance.InstanceID,
+					map[string]any{"last_error": configstore.TrinoPoolRecoveryBlockedMessage})
+				if checkpointErr != nil {
+					failures = append(failures, o.dropAuthority(checkpointErr))
+				}
+			}
 			if o.fenced {
 				return true, errors.Join(failures...)
 			}
@@ -65,17 +82,14 @@ func (o *trinoPoolOperator) progressInstance(ctx context.Context, instance confi
 	case trinopool.PhaseCreating:
 		return o.registerWhenReady(ctx, instance)
 	case trinopool.PhasePreparing:
-		if o.pool == nil || o.pool.DesiredReleaseID == "" || o.pool.DesiredBlueprintDigest == "" {
-			return false, errors.New("candidate supersession requires a complete desired pool specification")
-		}
-		blueprint, err := trinopool.ParseBlueprint([]byte(instance.BlueprintSnapshot))
+		superseded, err := o.candidateSuperseded(instance)
 		if err != nil {
-			return false, fmt.Errorf("read candidate blueprint for supersession: %w", err)
+			return false, err
 		}
 		// Configuration changes cannot repair an immutable candidate snapshot.
-		// Only PREPARING is safe here: VALIDATING can have an unknown admission outcome.
+		// VALIDATING can have an unknown admission outcome and must resolve it first.
 		// Cleanup still requires the Gateway's guarded retirement claim before deletion.
-		if instance.ReleaseID != o.pool.DesiredReleaseID || blueprint.Digest() != o.pool.DesiredBlueprintDigest {
+		if superseded {
 			return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing,
 				"candidate blueprint was superseded before admission")
 		}
@@ -102,6 +116,17 @@ func (o *trinoPoolOperator) progressInstance(ctx context.Context, instance confi
 	default:
 		return false, nil
 	}
+}
+
+func (o *trinoPoolOperator) candidateSuperseded(instance configstore.TrinoPoolInstance) (bool, error) {
+	if o.pool == nil || o.pool.DesiredReleaseID == "" || o.pool.DesiredBlueprintDigest == "" {
+		return false, errors.New("candidate supersession requires a complete desired pool specification")
+	}
+	blueprint, err := trinopool.ParseBlueprint([]byte(instance.BlueprintSnapshot))
+	if err != nil {
+		return false, fmt.Errorf("read candidate blueprint for supersession: %w", err)
+	}
+	return instance.ReleaseID != o.pool.DesiredReleaseID || blueprint.Digest() != o.pool.DesiredBlueprintDigest, nil
 }
 
 // createResources instantiates the instance's OWN blueprint snapshot, not the
@@ -145,6 +170,18 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 	if adopted, err := o.adoptRegisteredMember(ctx, instance, observed); adopted || err != nil {
 		return adopted, err
 	}
+	superseded, err := o.candidateSuperseded(instance)
+	if err != nil {
+		return false, err
+	}
+	if superseded {
+		// A same-term registration may still commit after this read-back returned 404.
+		if o.registrationAttempts[instance.InstanceID] {
+			return false, errors.New("superseded candidate registration remains unresolved in this authority term")
+		}
+		return true, o.failCandidate(ctx, instance, trinopool.PhaseCreating,
+			"candidate blueprint was superseded before registration")
+	}
 	if !observed.CoordinatorReady || observed.ReadyWorkers == 0 || observed.ReadyWorkers != observed.DesiredWorkers {
 		// Still converging. Not an error, and not something to time out into a
 		// failure: the plan's budgets already bound how many instances exist.
@@ -173,6 +210,10 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 		return true, fmt.Errorf("register gateway backend for %s: %w", instance.InstanceID, err)
 	}
 
+	if o.registrationAttempts == nil {
+		o.registrationAttempts = make(map[string]bool)
+	}
+	o.registrationAttempts[instance.InstanceID] = true
 	member, err := o.gateway.RegisterMember(ctx, o.config.RoutingGroup, trinogateway.RegisterMemberRequest{
 		Step:           o.step(instance.InstanceID, "register"),
 		InstanceID:     instance.InstanceID,
@@ -186,7 +227,7 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 	if err != nil {
 		return true, o.dropAuthority(fmt.Errorf("register member %s: %w", instance.InstanceID, err))
 	}
-	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+	err = o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseCreating, trinopool.PhasePreparing, map[string]any{
 			"coordinator_pod_uid": observed.CoordinatorPodUID,
 			"coordinator_boot_id": bootID,
@@ -207,6 +248,10 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 			"gateway_state":        member.Phase,
 			"gateway_generation":   member.Generation,
 		}))
+	if err == nil {
+		delete(o.registrationAttempts, instance.InstanceID)
+	}
+	return true, err
 }
 
 // adoptRegisteredMember resolves a registration whose response was lost.
@@ -239,7 +284,7 @@ func (o *trinoPoolOperator) adoptRegisteredMember(
 	}
 	slog.Info("Trino pool adopted a member whose registration response was lost.",
 		"pool", o.config.PublicID, "instance", instance.InstanceID, "phase", member.Phase)
-	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+	err = o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseCreating, trinopool.PhasePreparing, map[string]any{
 			"coordinator_pod_uid": member.PodUID,
 			"coordinator_boot_id": member.BootID,
@@ -254,6 +299,10 @@ func (o *trinoPoolOperator) adoptRegisteredMember(
 			"gateway_state":            member.Phase,
 			"gateway_generation":       member.Generation,
 		}))
+	if err == nil {
+		delete(o.registrationAttempts, instance.InstanceID)
+	}
+	return true, err
 }
 
 // runningCoordinatorContainer is the container instance currently running in the
@@ -272,6 +321,18 @@ func runningCoordinatorContainer(observed trinoPoolObservation, podUID string) s
 }
 
 func (o *trinoPoolOperator) validateCandidate(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {
+	if instance.NodeReplacementEvidence != nil {
+		return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing, "candidate node requires replacement before admission")
+	}
+	if err := o.candidateNodeCheck(ctx, instance); err != nil {
+		if definitiveTrinoNodePlacement(err) {
+			return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing, "candidate has an invalid node placement before admission")
+		}
+		if err == errTrinoPodProtectionIncomplete {
+			return false, nil
+		}
+		return false, err
+	}
 	observed, err := o.kube(o.lease.Epoch).Observe(ctx, inventoryOf(instance))
 	if err != nil {
 		return false, fmt.Errorf("observe %s: %w", instance.InstanceID, err)
@@ -360,7 +421,7 @@ func (o *trinoPoolOperator) admitCandidate(ctx context.Context, instance configs
 			BootID:          validation.ProcessID,
 		},
 		func(ctx context.Context) (string, error) {
-			admitted, err := o.gateway.AdmitMember(ctx, o.config.RoutingGroup, instance.InstanceID, request)
+			admitted, err := o.nodeSafeAdmission(ctx, instance, request)
 			if err != nil {
 				return "", err
 			}
@@ -368,6 +429,9 @@ func (o *trinoPoolOperator) admitCandidate(ctx context.Context, instance configs
 			return fmt.Sprintf(`{"phase":%q,"generation":%d}`, admitted.Phase, admitted.Generation), nil
 		},
 	); err != nil {
+		if errors.Is(err, errTrinoCandidateNodeRetired) {
+			return o.failCandidate(ctx, instance, trinopool.PhaseValidating, "candidate node required replacement before admission")
+		}
 		if errors.Is(err, trinogateway.ErrPublicationBarrier) {
 			// A member joining while a tenant publication is open must
 			// acknowledge that publication's target revision, which a member
@@ -427,8 +491,9 @@ func (o *trinoPoolOperator) sealWhenDrained(ctx context.Context, instance config
 	if (!obligations.ReadyToSeal && !obligations.Drained) || obligations.Outstanding() > 0 {
 		poolObservation(ctx).waiting(slog.Default(), instance, o.lease.Epoch,
 			"gateway_obligations", obligations, time.Now())
-		return false, nil
+		return o.reconcileDrainingQueries(ctx, instance, obligations)
 	}
+	delete(o.drainCursors, instance.InstanceID)
 	member, err := o.gateway.SealMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
 		Step: o.step(instance.InstanceID, "seal"),
 		// The generation comes from the RECORD, not from the obligations read

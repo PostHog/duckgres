@@ -15,50 +15,18 @@ import (
 	"strings"
 
 	"github.com/posthog/duckgres/controlplane/admin"
-	"github.com/posthog/duckgres/controlplane/provisioner"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 const envTrinoCellsFile = "DUCKGRES_TRINO_CELLS_FILE"
-const envTrinoRegistryOnly = "DUCKGRES_TRINO_REGISTRY_ONLY"
 
 const registeredTrinoCellPrefix = "registered:"
 
-// resolveTrinoCells preserves legacy unless registry-only mode explicitly excludes it.
-// The second result is the validated stored ID for initial default placement.
+// resolveTrinoCells loads the shared-pool registry and the initial placement default.
 func resolveTrinoCells() ([]trinoCell, string, error) {
-	registryOnly := false
-	if value := strings.TrimSpace(os.Getenv(envTrinoRegistryOnly)); value != "" {
-		var err error
-		registryOnly, err = strconv.ParseBool(value)
-		if err != nil {
-			return nil, "", fmt.Errorf("%s must be a boolean", envTrinoRegistryOnly)
-		}
-	}
 	path := strings.TrimSpace(os.Getenv(envTrinoCellsFile))
-	var legacy trinoCell
-	var cells []trinoCell
-	if registryOnly {
-		if path == "" {
-			return nil, "", fmt.Errorf("%s requires %s", envTrinoRegistryOnly, envTrinoCellsFile)
-		}
-		if strings.TrimSpace(os.Getenv(envTrinoCoordinatorURL)) != "" {
-			return nil, "", fmt.Errorf("%s cannot be combined with %s", envTrinoRegistryOnly, envTrinoCoordinatorURL)
-		}
-	} else {
-		var err error
-		legacy, err = resolveTrinoCell()
-		if err != nil {
-			return nil, "", err
-		}
-		if strings.HasPrefix(legacy.ID, registeredTrinoCellPrefix) {
-			return nil, "", errors.New("legacy Trino cell ID uses the reserved registered prefix")
-		}
-		cells = append(cells, legacy)
-	}
 	if path == "" {
-		defaultCell, err := resolveTrinoDefaultCell(nil)
-		return cells, defaultCell, err
+		return nil, "", fmt.Errorf("%s is required for Trino provisioning", envTrinoCellsFile)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -68,33 +36,11 @@ func resolveTrinoCells() ([]trinoCell, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	legacyNS := legacy.Namespace
-	if legacyNS == "" {
-		legacyNS = provisioner.TrinoCustomerNamespace
-	}
-	var legacyEndpoint string
-	if !registryOnly {
-		legacyEndpoint, err = trinoEndpointKey(legacy.CoordinatorURL)
-		if err != nil {
-			return nil, "", fmt.Errorf("legacy coordinator URL: %w", err)
-		}
-	}
+	cells := make([]trinoCell, 0, len(registered))
 	for _, entry := range registered {
-		if !registryOnly && entry.Namespace == legacyNS {
-			return nil, "", errors.New("registered cell must not share the legacy namespace")
-		}
-		cell := trinoCell{Mode: strings.TrimSpace(entry.Mode), ID: registeredTrinoCellPrefix + entry.ID, PublicID: entry.ID, RoutingGroup: entry.RoutingGroup, Namespace: entry.Namespace, ClientURL: entry.ClientURL, Backends: entry.Backends, CatalogManagement: entry.CatalogManagement}
+		cell := trinoCell{Mode: trinoPoolModeShared, ID: registeredTrinoCellPrefix + entry.ID, PublicID: entry.ID, RoutingGroup: entry.RoutingGroup, Namespace: entry.Namespace, ClientURL: entry.ClientURL}
 		if entry.Pool != nil {
 			cell.PoolCoordinatorPort = entry.Pool.CoordinatorServicePort
-		}
-		for _, backend := range entry.Backends {
-			endpoint, _ := trinoEndpointKey(backend.CoordinatorURL)
-			if !registryOnly && endpoint == legacyEndpoint {
-				return nil, "", errors.New("registered cell must not share a legacy coordinator")
-			}
-			if backend.RoutingActive {
-				cell.CoordinatorURL, cell.TLSServerName = backend.CoordinatorURL, backend.TLSServerName
-			}
 		}
 		cells = append(cells, cell)
 	}
@@ -103,27 +49,13 @@ func resolveTrinoCells() ([]trinoCell, string, error) {
 }
 
 type trinoRegisteredCell struct {
-	CatalogManagement string `json:"catalog_management,omitempty"`
-	// Mode selects the compute topology: empty or "fixed" is today's blue/green
-	// cell, "shared-pool" is the operator-managed pool. Unknown values are
-	// rejected rather than defaulted, so a newer config file cannot be
-	// half-understood by an older binary.
-	Mode         string                   `json:"mode,omitempty"`
-	Pool         *trinoRegisteredPool     `json:"pool,omitempty"`
-	ID           string                   `json:"id"`
-	Namespace    string                   `json:"namespace"`
-	ClientURL    string                   `json:"client_url"`
-	RoutingGroup string                   `json:"routing_group"`
-	Backends     []trinoRegisteredBackend `json:"backends"`
-}
-
-type trinoRegisteredBackend struct {
-	ID                 string `json:"id"`
-	CoordinatorURL     string `json:"coordinator_url"`
-	TLSServerName      string `json:"tls_server_name,omitempty"`
-	Running            bool   `json:"running"`
-	RoutingActive      bool   `json:"routing_active"`
-	InternalSecretName string `json:"internal_secret_name"`
+	// Mode must be shared-pool. Unknown topology fields are rejected.
+	Mode         string               `json:"mode,omitempty"`
+	Pool         *trinoRegisteredPool `json:"pool,omitempty"`
+	ID           string               `json:"id"`
+	Namespace    string               `json:"namespace"`
+	ClientURL    string               `json:"client_url"`
+	RoutingGroup string               `json:"routing_group"`
 }
 
 func parseTrinoCellRegistry(data []byte) ([]trinoRegisteredCell, error) {
@@ -142,20 +74,14 @@ func parseTrinoCellRegistry(data []byte) ([]trinoRegisteredCell, error) {
 		return nil, errors.New("Trino cell registry must contain at least one cell")
 	}
 	if len(registry.Cells) > 16 {
-		return nil, errors.New("Trino cell registry supports at most 16 additional cells")
+		return nil, errors.New("trino cell registry supports at most 16 cells")
 	}
-	identities, namespaces, groups, endpoints := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
+	identities, namespaces, groups := map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, cell := range registry.Cells {
-		if cell.CatalogManagement != "" && cell.CatalogManagement != "paused" && cell.CatalogManagement != "gateway-shared" {
-			return nil, errors.New("unsupported Trino catalog management mode")
+		if strings.TrimSpace(cell.Mode) != trinoPoolModeShared {
+			return nil, errors.New("trino supports shared-pool cells only")
 		}
-		if cell.CatalogManagement != "" && (len(cell.Backends) != 2 || cell.Backends[0].ID == cell.Backends[1].ID || (cell.Backends[0].ID != "blue" && cell.Backends[0].ID != "green") || (cell.Backends[1].ID != "blue" && cell.Backends[1].ID != "green")) {
-			return nil, errors.New("managed Trino cell requires exactly blue and green slots")
-		}
-		// A shared-pool cell has no static backends: its members are created
-		// by the operator and recorded durably. The per-backend checks below
-		// therefore do not apply to it.
-		pooled := strings.TrimSpace(cell.Mode) == trinoPoolModeShared
+
 		if cell.ID == "legacy" || len(validation.IsDNS1123Label(cell.ID)) != 0 {
 			return nil, errors.New("Trino cell identity must be a DNS label other than legacy")
 		}
@@ -176,41 +102,7 @@ func parseTrinoCellRegistry(data []byte) ([]trinoRegisteredCell, error) {
 		if _, err := trinoEndpointKey(clientURL); err != nil {
 			return nil, fmt.Errorf("Trino cell %s client URL: %w", cell.ID, err)
 		}
-		backendIDs, secrets := map[string]bool{}, map[string]bool{}
-		if len(cell.Backends) > 2 {
-			return nil, fmt.Errorf("Trino cell %s supports at most two backends", cell.ID)
-		}
-		active := 0
-		for _, backend := range cell.Backends {
-			if len(validation.IsDNS1123Label(backend.ID)) != 0 || backendIDs[backend.ID] {
-				return nil, fmt.Errorf("Trino cell %s has an invalid or duplicate backend identity", cell.ID)
-			}
-			backendIDs[backend.ID] = true
-			if len(validation.IsDNS1123Subdomain(backend.InternalSecretName)) != 0 || secrets[backend.InternalSecretName] {
-				return nil, fmt.Errorf("Trino cell %s has an invalid or shared internal secret reference", cell.ID)
-			}
-			secrets[backend.InternalSecretName] = true
-			endpoint, err := trinoEndpointKey(backend.CoordinatorURL)
-			if err != nil {
-				return nil, fmt.Errorf("Trino cell %s backend %s URL: %w", cell.ID, backend.ID, err)
-			}
-			if endpoints[endpoint] {
-				return nil, errors.New("Trino backends must have distinct coordinator endpoints")
-			}
-			endpoints[endpoint] = true
-			if backend.TLSServerName != "" && len(validation.IsDNS1123Subdomain(backend.TLSServerName)) != 0 {
-				return nil, fmt.Errorf("Trino cell %s backend %s has an invalid TLS server name", cell.ID, backend.ID)
-			}
-			if backend.RoutingActive {
-				if !backend.Running {
-					return nil, fmt.Errorf("Trino cell %s routes to a stopped backend", cell.ID)
-				}
-				active++
-			}
-		}
-		if active != 1 && !pooled {
-			return nil, fmt.Errorf("Trino cell %s must have exactly one routing-active backend", cell.ID)
-		}
+
 	}
 	return registry.Cells, nil
 }

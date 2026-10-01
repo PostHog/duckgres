@@ -11,7 +11,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
-// NewTrinoFleetAPI builds isolated coordinator views and preserves the legacy default.
+// NewTrinoFleetAPI builds isolated views for explicitly selected pools.
 func NewTrinoFleetAPI(cells []TrinoCell, clients []TrinoCoordinatorClient, orgs TrinoOrgStore, audit *AuditStore) *TrinoAPI {
 	if len(cells) == 0 || len(cells) != len(clients) || orgs == nil {
 		return nil
@@ -35,6 +35,9 @@ func NewTrinoFleetAPI(cells []TrinoCell, clients []TrinoCoordinatorClient, orgs 
 
 func registerTrinoFleetAPI(r *gin.RouterGroup, api *TrinoAPI) {
 	r.GET("/trino/cells", api.handleCells)
+	r.GET("/trino/instances", api.forCell((*TrinoAPI).handleRecoveryInstances))
+	r.GET("/trino/instances/:id/recovery", api.forCell((*TrinoAPI).handleRecoveryPreview))
+	r.POST("/trino/instances/:id/recovery", api.forCell((*TrinoAPI).handleRequestRecovery))
 	r.GET("/trino/status", api.forCell((*TrinoAPI).handleStatus))
 	r.GET("/trino/queries", api.forCell((*TrinoAPI).handleQueries))
 	r.GET("/trino/queries/:id", api.forCell((*TrinoAPI).handleQueryDetail))
@@ -48,11 +51,11 @@ func registerTrinoFleetAPI(r *gin.RouterGroup, api *TrinoAPI) {
 
 func (a *TrinoAPI) forCell(handle func(*TrinoAPI, *gin.Context)) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if _, explicit := c.GetQuery("cell"); !explicit && a.fleet["legacy"] == nil {
+		if _, explicit := c.GetQuery("cell"); !explicit {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "explicit Trino cell selection is required"})
 			return
 		}
-		id := c.DefaultQuery("cell", "legacy")
+		id := c.Query("cell")
 		selected := a.fleet[id]
 		if selected == nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "unknown Trino cell"})
@@ -77,8 +80,8 @@ func (a *TrinoAPI) handleFleetOrg(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot read Trino assignment"})
 		return
 	}
-	selected := a.fleet["legacy"]
-	if selected == nil && (row == nil || row.TrinoCellID == "") {
+	var selected *TrinoAPI
+	if row == nil || row.TrinoCellID == "" {
 		backend, selectedBackend := trinoBackendDetail(row)
 		response := gin.H{"backend": backend, "backend_selected": selectedBackend, "cell": TrinoCell{}, "enabled": row != nil && row.Enabled, "assigned": false, "available": false}
 		if row != nil && row.Enabled {
@@ -87,13 +90,10 @@ func (a *TrinoAPI) handleFleetOrg(c *gin.Context) {
 		c.JSON(http.StatusOK, response)
 		return
 	}
-	if row != nil && row.TrinoCellID != "" {
-		selected = nil
-		for _, candidate := range a.fleet {
-			if candidate.cell.storedID() == row.TrinoCellID {
-				selected = candidate
-				break
-			}
+	for _, candidate := range a.fleet {
+		if candidate.cell.storedID() == row.TrinoCellID {
+			selected = candidate
+			break
 		}
 	}
 	if selected == nil {

@@ -528,8 +528,6 @@ func SetupMultiTenant(
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
 	var trinoCells trinoFleet
 	var trinoDefaultCell string
-	var rolloutReadiness *trinoRolloutReadinessHandler
-	var rolloutProvisioning *trinoRolloutProvisioningHandler
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
 		// Without the controller, the Trino reconcile loop cannot run.
@@ -572,19 +570,11 @@ func SetupMultiTenant(
 				// that. So a nil here is a wiring bug.
 				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled but buildTrinoWiring returned no wiring; this should be unreachable")
 			}
-			rolloutReadiness, twErr = buildTrinoRolloutReadiness(trinoWire, store)
-			if twErr != nil {
-				return nil, nil, nil, nil, nil, nil, twErr
-			}
-			rolloutProvisioning, twErr = buildTrinoManagedFleet(trinoWire, store, rolloutReadiness)
-			if twErr != nil {
-				return nil, nil, nil, nil, nil, nil, twErr
-			}
 			provCtrl.WithTrinoReconciler(trinoWire)
 			trinoCells = trinoWire
 			trinoDefaultCell = defaultCell
 			for _, wire := range trinoWire {
-				slog.Info("Trino provisioner enabled.", "cell", wire.Cell.consoleCell().ID, "coordinator", wire.Cell.CoordinatorURL)
+				slog.Info("Trino provisioner enabled.", "cell", wire.Cell.consoleCell().ID)
 			}
 		}
 		// SIGTERM stops the reconcile loop immediately, rather than letting a
@@ -658,6 +648,10 @@ func SetupMultiTenant(
 		return nil, nil, nil, nil, nil, nil, err
 	}
 	readOnlyTokens := admin.NewTokenSet(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks)
+	trinoServiceAuthCells, err := trinoCells.loadTrinoServiceAuthCells(adminTokens, readOnlyTokens)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
 	if readOnlyTokens.Count() == 0 {
 		// Keyed off the TokenSet, not just cfg.ReadOnlySecret: fallbacks
 		// alone (mid-rotation) still validate, and saying otherwise here
@@ -673,6 +667,7 @@ func SetupMultiTenant(
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
+	provisioning.RegisterTrinoServiceCredentialAuth(engine, store, trinoServiceAuthCells)
 
 	// Health endpoint (unauthenticated, used by K8s probes)
 	engine.GET("/health", newHealthHandler(isHealthy))
@@ -781,8 +776,11 @@ func SetupMultiTenant(
 	if len(cfg.ManagedHostnameSuffixes) > 0 {
 		ingressSuffix = cfg.ManagedHostnameSuffixes[0]
 	}
-	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store, trinoDefaultCell),
-		provisioning.WithTrinoBackendValidator(validateTrinoBackendAvailability), provisioning.WithTrinoDefaultCell(trinoDefaultCell))
+	provisioningOptions := []provisioning.Option{provisioning.WithTrinoBackendValidator(validateTrinoBackendAvailability), provisioning.WithTrinoDefaultCell(trinoDefaultCell)}
+	if len(trinoServiceAuthCells) > 0 {
+		provisioningOptions = append(provisioningOptions, provisioning.WithTrinoServiceCredentialConnect(trinoCells.serviceCredentialConnect(gormStore, trinoServiceAuthCells)))
+	}
+	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store, trinoDefaultCell), provisioningOptions...)
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))
@@ -836,20 +834,6 @@ func SetupMultiTenant(
 	}
 	attachTrinoPoolOperators(janitorLeader, poolOperators)
 
-	if rolloutReadiness == nil {
-		var rolloutErr error
-		rolloutReadiness, rolloutErr = buildTrinoRolloutReadiness(trinoCells, store)
-		if rolloutErr != nil {
-			return nil, nil, nil, nil, nil, nil, rolloutErr
-		}
-	}
-	if rolloutReadiness != nil {
-		engine.Any(rolloutReadinessPrefix+"*slot", gin.WrapH(rolloutReadiness))
-	}
-	if rolloutProvisioning != nil {
-		engine.Any(trinoRolloutProvisioningPrefix+"*group", gin.WrapH(rolloutProvisioning))
-	}
-
 	// Trino OPA bundle endpoint. Mounted OUTSIDE the /api/v1 admin group on
 	// purpose — it does its own bearer-token auth (the bundle exposes the
 	// customer roster; a separate shared secret between provisioner and the
@@ -902,6 +886,7 @@ func SetupMultiTenant(
 		Addr:    ":8080",
 		Handler: engine,
 	}
+	apiServer.RegisterOnShutdown(trinoPoolMetrics.configurePools(poolOperators))
 	go func() {
 		slog.Info("Starting API server.", "addr", apiServer.Addr)
 		if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

@@ -81,6 +81,81 @@ func newEffects(t *testing.T, epoch int64) (*trinoPoolEffects, *fake.Clientset) 
 	return newTrinoPoolEffects(clientset, blueprint.Namespace, blueprint.SharedResources, epoch), clientset
 }
 
+func TestTrinoPoolCoordinatorAbsenceUsesUnfilteredCompleteUIDInventory(t *testing.T) {
+	for _, scenario := range []string{"absent", "labels-removed", "terminating", "second-page", "second-page-absent", "second-page-error", "empty-namespace"} {
+		t.Run(scenario, func(t *testing.T) {
+			effects, clientset := newEffects(t, 7)
+			inventory := trinoPoolInventory{Namespace: effects.namespace}
+			uid := "admitted-pod-uid"
+			if scenario == "empty-namespace" {
+				inventory.Namespace = ""
+			}
+			calls := 0
+			clientset.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				calls++
+				list := action.(k8stesting.ListActionImpl)
+				options := list.GetListOptions()
+				if options.LabelSelector != "" || options.FieldSelector != "" || options.Limit != trinoPoolListLimit || action.GetNamespace() != effects.namespace {
+					t.Fatal("absence proof used a filtered or wrong-namespace inventory")
+				}
+				if calls == 1 && (scenario == "second-page" || scenario == "second-page-absent" || scenario == "second-page-error") {
+					return true, &corev1.PodList{ListMeta: metav1.ListMeta{Continue: "next-page"}}, nil
+				}
+				if calls > 1 && options.Continue != "next-page" {
+					t.Fatal("absence proof did not follow pagination")
+				}
+				if scenario == "second-page-error" {
+					return true, nil, errors.New("inventory snapshot expired")
+				}
+				pods := &corev1.PodList{Items: []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "replacement", UID: "new-pod"}}}}
+				if scenario != "absent" && scenario != "second-page-absent" {
+					pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "original", UID: types.UID(uid)}}
+					if scenario == "terminating" {
+						now := metav1.Now()
+						pod.DeletionTimestamp = &now
+					}
+					pods.Items = append(pods.Items, pod)
+				}
+				return true, pods, nil
+			})
+			uids, err := effects.NamespacePodUIDs(context.Background(), inventory.Namespace)
+			absent := err == nil && !uids[uid]
+			if absent != (scenario == "absent" || scenario == "second-page-absent") {
+				t.Fatalf("absence = %v, error = %v", absent, err)
+			}
+			if scenario == "second-page-absent" && calls != 2 {
+				t.Fatal("absence was reported without reading every page")
+			}
+			wantErr := scenario == "second-page-error" || scenario == "empty-namespace"
+			if (err != nil) != wantErr {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestTrinoPoolCoordinatorAbsenceUsesPinnedNamespaceAfterPoolMove(t *testing.T) {
+	for _, present := range []bool{false, true} {
+		effects, clientset := newEffects(t, 7)
+		inventory := trinoPoolInventory{Namespace: "previous-pool-namespace"}
+		clientset.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if action.GetNamespace() != inventory.Namespace {
+				t.Fatal("absence checked current desired namespace instead of pinned namespace")
+			}
+			pods := &corev1.PodList{}
+			if present {
+				pods.Items = []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{UID: "original-pod-uid"}}}
+			}
+			return true, pods, nil
+		})
+		uids, err := effects.NamespacePodUIDs(context.Background(), inventory.Namespace)
+		absent := err == nil && !uids["original-pod-uid"]
+		if err != nil || absent == present {
+			t.Fatalf("pinned namespace recovery: present=%v absent=%v err=%v", present, absent, err)
+		}
+	}
+}
+
 func TestEffectsApplyCreatesTheWholeInventory(t *testing.T) {
 	effects, clientset := newEffects(t, 7)
 	_, _, objects := testPoolObjects(t, 7)

@@ -9,6 +9,7 @@ import { StateBadge } from "@/components/StateBadge";
 import { EmptyState, TableSkeleton } from "@/components/states";
 import { OrgRef } from "@/components/OrgRef";
 import { TrinoCellPicker } from "@/components/TrinoCellPicker";
+import { TrinoRecovery } from "./TrinoRecovery";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useOrgLabels, useTrinoNodes, useTrinoOrgs, useTrinoStatus } from "@/hooks/useApi";
 import { fmtDurationMs, fmtInt, fmtPercent, fmtTime } from "@/lib/format";
@@ -49,11 +50,12 @@ export function TrinoCluster() {
         actions={<TrinoCellPicker />}
         description={
           status.data?.cell.id
-            ? `${status.data.cell.id} · ${status.data.cell.coordinator_url}`
+            ? status.data.cell.id
             : "The shared multi-tenant Trino cell."
         }
       />
       <PageBody>
+        <TrinoRecovery cell={cell} />
         {reason && (
           <Card className="mb-4 border-warning/40">
             <CardContent className="flex items-start gap-2 p-4 text-sm">

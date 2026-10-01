@@ -21,6 +21,17 @@ func bindingOrg(users ...string) configstore.TrinoEnabledOrg {
 	return org
 }
 
+func TestBindingServiceAuthenticationPreservesExistingProjection(t *testing.T) {
+	org := bindingOrg("analyst")
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "")
+	disabled := trinoPoolBindingsFor([]configstore.TrinoEnabledOrg{org}, org.CellID)
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
+	enabled := trinoPoolBindingsFor([]configstore.TrinoEnabledOrg{org}, org.CellID)
+	if disabled[0].Revision != enabled[0].Revision || strings.Join(disabled[0].Principals, ",") != strings.Join(enabled[0].Principals, ",") {
+		t.Fatalf("service authentication changed existing bindings: disabled=%+v enabled=%+v", disabled, enabled)
+	}
+}
+
 // A warehouse has many logins and they all belong to one tenant. A binding that
 // carried only the root principal would block every named user at the gate.
 func TestBindingCoversEveryLoginOfTheWarehouse(t *testing.T) {
@@ -44,7 +55,20 @@ func TestBindingCoversEveryLoginOfTheWarehouse(t *testing.T) {
 // contains. Deriving the two from different rules is how a gate ends up
 // blocking a user Trino would authenticate, or admitting one it would not.
 func TestBindingMatchesTheProjectedAuthFile(t *testing.T) {
-	org := bindingOrg("analyst", "dagster")
+	rootless := bindingOrg("analyst", "dagster")
+	// No enabled root: the bare principal leaves password.db, so it must
+	// leave the binding too.
+	rootless.RootPasswordHash = ""
+	for name, org := range map[string]configstore.TrinoEnabledOrg{
+		"with root": bindingOrg("analyst", "dagster"),
+		"rootless":  rootless,
+	} {
+		t.Run(name, func(t *testing.T) { assertBindingMatchesAuthFile(t, org) })
+	}
+}
+
+func assertBindingMatchesAuthFile(t *testing.T, org configstore.TrinoEnabledOrg) {
+	t.Helper()
 	binding := trinoPoolTenantBindingFor(org)
 
 	passwordDB, _ := provisioner.BuildTrinoAuthFiles([]configstore.TrinoEnabledOrg{org},

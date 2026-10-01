@@ -54,6 +54,10 @@ import type {
   TrinoQueriesResponse,
   TrinoQuery,
   TrinoStatus,
+  TrinoInstancesResponse,
+  TrinoRecoveryPreview,
+  TrinoRecoveryBody,
+  TrinoRecoveryRequest,
   UpdateUserBody,
   UserKillResult,
   WarehouseStatusResult,
@@ -314,6 +318,17 @@ export const api = {
   trinoOrgs: (cell?: string) => get<TrinoOrgsResponse>("/trino/orgs", { cell }),
   orgTrino: (org: string) => get<TrinoOrgDetail>(`/orgs/${enc(org)}/trino`),
   trinoCells: () => get<{ cells: TrinoCell[] }>("/trino/cells"),
+  trinoInstances: (cell: string) => get<TrinoInstancesResponse>("/trino/instances", { cell }),
+  trinoRecovery: (instance: string, cell: string) =>
+    get<TrinoRecoveryPreview>(`/trino/instances/${enc(instance)}/recovery`, { cell }),
+  requestTrinoRecovery: async (instance: string, body: TrinoRecoveryBody, cell: string) => {
+    const result = await post<{ request: TrinoRecoveryRequest }>(`/trino/instances/${enc(instance)}/recovery?cell=${enc(cell)}`, body);
+    if (!result?.request || result.request.instance_id !== instance ||
+        Object.entries(body).some(([key, value]) => result.request[key as keyof TrinoRecoveryBody] !== value)) {
+      throw new ApiError(0, "Recovery returned an unexpected response; acceptance is unknown.");
+    }
+    return result;
+  },
   selectTrinoCell: (org: string, cell: string) =>
     put<{ cell: TrinoCell; assigned: boolean }>(`/orgs/${enc(org)}/trino/cell`, { cell }),
   enableTrino: (org: string, tier: string, backend?: "ducklake" | "hoglake") =>

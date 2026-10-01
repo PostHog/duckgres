@@ -364,6 +364,10 @@ func (s *gormStore) RefreshServiceCredential(
 	return s.cs.RefreshServiceCredential(orgID, credentialID, ttl)
 }
 
+func (s *gormStore) RenewServiceCredential(orgID, credentialID string, ttl time.Duration) (*configstore.ServiceCredentialIssue, error) {
+	return s.cs.RenewServiceCredential(orgID, credentialID, ttl)
+}
+
 // OrgExists reports whether the org row exists (the service-credential
 // handlers 404 on a ghost org before minting against it).
 func (s *gormStore) OrgExists(orgID string) (bool, error) {

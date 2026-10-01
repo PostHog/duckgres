@@ -60,7 +60,7 @@ function node(over: Partial<TrinoNode> = {}): TrinoNode {
 
 function status(over: Partial<TrinoStatus> = {}): TrinoStatus {
   return {
-    cell: { id: "legacy", coordinator_url: "https://coordinator" },
+    cell: { id: "legacy" },
     available: true,
     queries_by_state: {},
     blocked_queries: 0,
@@ -248,12 +248,12 @@ describe("trinoUnavailableReason", () => {
     // Different fix: one is "this cluster has no Trino", the other is an
     // incident. Collapsing them sends an operator to the wrong system.
     const none = status({
-      cell: { id: "", coordinator_url: "" },
+      cell: { id: "" },
       available: false,
     });
     expect(trinoUnavailableReason(none)).toBe("no_cell");
     expect(trinoUnavailableMessage("no_cell")).toContain(
-      "DUCKGRES_TRINO_COORDINATOR_URL",
+      "DUCKGRES_TRINO_CELLS_FILE",
     );
   });
 

@@ -23,9 +23,15 @@ type TrinoSettings struct {
 	DefaultCellID string
 	// Tier is the resource-group tier label. Empty == default tier.
 	Tier string
-	// Backend may only confirm the existing selection or Hoglake for a new client.
-	// Empty preserves a pinned selection and otherwise selects Hoglake.
+	// Backend may only confirm the existing selection or, for a new client,
+	// the new-client backend. Empty preserves a pinned selection and otherwise
+	// selects the new-client backend.
 	Backend TrinoBackend
+	// NewClientBackend is the deployment's backend for a client with no
+	// selection yet. Empty means Hoglake. A deployment without managed Hoglake
+	// passes DuckLake, so enabling Trino serves the org's existing warehouse
+	// instead of failing.
+	NewClientBackend TrinoBackend
 }
 
 // EnableTrino marks the org as Trino-enabled and stores the per-org Trino
@@ -35,8 +41,7 @@ type TrinoSettings struct {
 // `POST /orgs/:id/trino` endpoint.
 //
 // A validated deployment default fills an unassigned cell atomically with
-// enablement. Existing ownership always wins. Without a default, legacy
-// reconciliation retains its conditional claim behavior.
+// enablement. Existing ownership always wins. Unassigned rows remain unassigned.
 func (cs *ConfigStore) EnableTrino(orgID string, settings TrinoSettings) error {
 	if orgID == "" {
 		return errors.New("EnableTrino: orgID is required")
@@ -64,15 +69,22 @@ func (backend TrinoBackend) Valid() bool {
 	return backend == TrinoBackendDuckLake || backend == TrinoBackendHoglake
 }
 
-var ErrTrinoBackendSelectionConflict = errors.New("existing Trino backends cannot change; new clients must use Hoglake")
+var ErrTrinoBackendSelectionConflict = errors.New("existing Trino backends cannot change; new clients must use the deployment's new-client backend")
 
 // ResolveTrinoBackend preserves existing clients while sending every new client
-// to Hoglake. Disabled, previously enabled rows retain their pinned backend.
-func ResolveTrinoBackend(row *ManagedWarehouseTrino, requested TrinoBackend) (TrinoBackend, error) {
+// to the deployment's new-client backend (Hoglake unless newClient names
+// another). Disabled, previously enabled rows retain their pinned backend.
+func ResolveTrinoBackend(row *ManagedWarehouseTrino, requested, newClient TrinoBackend) (TrinoBackend, error) {
 	if requested != "" && !requested.Valid() {
 		return "", errors.New("invalid Trino backend")
 	}
+	if newClient != "" && !newClient.Valid() {
+		return "", errors.New("invalid new-client Trino backend")
+	}
 	backend := TrinoBackendHoglake
+	if newClient != "" {
+		backend = newClient
+	}
 	if row != nil && row.BackendSelected {
 		backend = EffectiveTrinoBackend(row.Backend)
 	}
@@ -105,7 +117,7 @@ func EnableTrinoInTransaction(db *gorm.DB, orgID string, settings TrinoSettings)
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, "org_id = ?", orgID).Error; err != nil {
 			return err
 		}
-		backend, err := ResolveTrinoBackend(&row, settings.Backend)
+		backend, err := ResolveTrinoBackend(&row, settings.Backend, settings.NewClientBackend)
 		if err != nil {
 			return err
 		}
@@ -197,42 +209,6 @@ func (cs *ConfigStore) UpdateTrinoState(orgID string, upd TrinoStateUpdate) erro
 		return fmt.Errorf("update trino state for %q: %w", orgID, result.Error)
 	}
 	return nil
-}
-
-// AssignTrinoCell claims an UNASSIGNED Trino-enabled org into a cell. The
-// WHERE clause is the whole point: it only ever writes a row whose
-// trino_cell_id is empty/NULL, so a second cell's provisioner can never
-// steal an org that this cell already owns (which would leave two
-// coordinators projecting the same tenant's credentials and catalog).
-// Moving an org between cells is deliberately NOT expressible here — it
-// needs a drain of the source cell's catalog first and is out of scope.
-//
-// RowsAffected==0 is not an error: it means the row was claimed by someone
-// else (or disabled) between the list and the write. The next tick re-reads
-// and skips the org because its cell no longer matches.
-func (cs *ConfigStore) AssignTrinoCell(orgID, cellID string) error {
-	_, err := cs.ClaimTrinoCell(orgID, cellID)
-	return err
-}
-
-// ClaimTrinoCell reports whether this call acquired the previously unassigned row.
-func (cs *ConfigStore) ClaimTrinoCell(orgID, cellID string) (bool, error) {
-	if orgID == "" {
-		return false, errors.New("ClaimTrinoCell: orgID is required")
-	}
-	if cellID == "" {
-		return false, errors.New("ClaimTrinoCell: cellID is required")
-	}
-	result := cs.db.Model(&ManagedWarehouseTrino{}).
-		Where("org_id = ? AND enabled = ? AND (trino_cell_id IS NULL OR trino_cell_id = ?)", orgID, true, "").
-		Updates(map[string]interface{}{
-			"trino_cell_id": cellID,
-			"updated_at":    time.Now().UTC(),
-		})
-	if result.Error != nil {
-		return false, fmt.Errorf("assign trino cell for %q: %w", orgID, result.Error)
-	}
-	return result.RowsAffected == 1, nil
 }
 
 var (
@@ -374,20 +350,17 @@ func (cs *ConfigStore) DisableTrino(orgID string) error {
 }
 
 // ListTrinoEnabledOrgs returns every org with ManagedWarehouseTrino.Enabled
-// = true joined against its `root` OrgUser row, each carrying the org's full
-// set of projectable logins in Users. The provisioner needs the bcrypt hashes
-// to project the Trino password file.
+// = true, each carrying the org's full set of projectable logins in Users.
+// The provisioner needs the bcrypt hashes to project the Trino password file.
 //
-// The `root` join stays because database_name alone remains a principal in
-// its own right (TrinoPrincipal) for service-to-service use and for every
-// client configured before per-user logins existed. Users is the ADDITIONAL
-// per-human projection; root therefore appears twice, as `<db>` and as
-// `<db>.root`, and both authenticate against the same hash.
-//
-// Orgs that are Trino-enabled but have no `root` OrgUser are skipped — that
-// shape can't legitimately happen via the provisioning API (CreateOrgUser
-// runs in the same handler that toggles Enabled), and silently skipping is
-// safer than projecting a half-built password file.
+// RootPasswordHash backs the bare `<database_name>` principal, kept for
+// service-to-service use and for every client configured before per-user
+// logins existed. It follows the same rules as every other projected login:
+// it is empty when the org has no `root` row, when root is disabled, or when
+// root has a blank password. An empty hash drops only the bare principal --
+// the org still gets its catalog and its per-user logins -- so a root-less
+// org is served rather than silently skipped, and disabling root revokes
+// the bare principal exactly as it revokes `<database_name>.root`.
 //
 // Orgs with no duckgres_orgs row, or a blank database_name, are skipped for
 // the same reason: database_name is the org's Trino principal (see
@@ -428,10 +401,12 @@ func (cs *ConfigStore) listTrinoEnabledOrgsCoherently(db *gorm.DB) ([]TrinoEnabl
 
 func (cs *ConfigStore) listTrinoEnabledOrgsWith(db *gorm.DB, scope trinoScopeResolver) ([]TrinoEnabledOrg, error) {
 	var out []TrinoEnabledOrg
-	// Inner join with duckgres_org_users on (org_id, username='root') so a
-	// missing OrgUser row drops the org from the result. Inner join with
-	// duckgres_orgs for database_name, which is the org's Trino principal —
-	// a missing or blank one drops the org for the same reason.
+	// LEFT join with duckgres_org_users on root: a missing, disabled or
+	// password-less root leaves RootPasswordHash empty (the bare principal is
+	// not projected) without dropping the org. The disabled/password filters
+	// live in the ON clause so they null the hash rather than the row. Inner
+	// join with duckgres_orgs for database_name, which is the org's Trino
+	// principal — a missing or blank one drops the org.
 	err := db.Table("duckgres_managed_warehouse_trino AS t").
 		Select(`t.org_id AS org_id,
 		         o.database_name AS database_name,
@@ -439,10 +414,11 @@ func (cs *ConfigStore) listTrinoEnabledOrgsWith(db *gorm.DB, scope trinoScopeRes
 		         t.backend AS backend,
 		         t.hoglake_initialized AS hoglake_initialized,
 		         COALESCE(t.trino_cell_id, '') AS cell_id,
-		         u.password AS root_password_hash,
+		         COALESCE(u.password, '') AS root_password_hash,
 		         t.state AS state`).
-		Joins(`INNER JOIN duckgres_org_users AS u
-		        ON u.org_id = t.org_id AND u.username = 'root'`).
+		Joins(`LEFT JOIN duckgres_org_users AS u
+		        ON u.org_id = t.org_id AND u.username = 'root'
+		       AND u.disabled = false AND u.password <> ''`).
 		Joins(`INNER JOIN duckgres_orgs AS o ON o.name = t.org_id`).
 		Where("t.enabled = ?", true).
 		Where("o.database_name <> ''").

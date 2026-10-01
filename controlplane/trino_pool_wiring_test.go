@@ -25,6 +25,24 @@ func testPoolFleet() trinoFleet {
 	}}
 }
 
+func TestPoolWiringRefusesAnOperatorWithoutACatalogWriter(t *testing.T) {
+	t.Setenv(envTrinoCellsFile, sharedPoolRegistry(t, blueprintFile(t)))
+	t.Setenv(envTrinoPoolEnabled, "true")
+	t.Setenv(envTrinoPoolOperatorEnabled, "true")
+	t.Setenv(envTrinoPoolCatalogWriter, "false")
+	t.Setenv(envTrinoPoolConfigMap, "trino-pool-config")
+	t.Setenv(envTrinoPoolGatewayURL, "https://gateway.example")
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte(strings.Repeat("a", 32)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DUCKGRES_TRINO_ROLLOUT_TOKEN_FILE", token)
+	_, err := buildTrinoPoolOperators(nil, testPoolFleet(), "cp-test")
+	if err == nil || !strings.Contains(err.Error(), envTrinoPoolCatalogWriter) {
+		t.Fatalf("expected catalog writer configuration error, got %v", err)
+	}
+}
+
 // With no pooled cell in the registry the wiring produces nothing. This is what
 // "ships disabled" has to mean at the startup boundary: the code path is
 // constructed on every boot, and on a fleet that has not opted in it resolves
@@ -52,12 +70,10 @@ func TestPoolWiringRefusesAnOperatorWithoutAGateway(t *testing.T) {
 		t.Fatalf("write blueprint: %v", err)
 	}
 	t.Setenv(envTrinoCellsFile, sharedPoolRegistry(t, blueprint))
-	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	t.Setenv(envTrinoPoolOperatorEnabled, "true")
 	t.Setenv(envTrinoPoolConfigMap, "duckgres-trino-pool")
 	t.Setenv(envTrinoPoolGatewayURL, "")
-	t.Setenv("DUCKGRES_TRINO_MANAGED_GATEWAY_URL", "")
 
 	_, err := buildTrinoPoolOperators(nil, testPoolFleet(), "cp-test")
 	if err == nil {
@@ -90,14 +106,12 @@ func TestPoolWiringBuildsAReadOnlyOperator(t *testing.T) {
 		t.Fatalf("write blueprint: %v", err)
 	}
 	t.Setenv(envTrinoCellsFile, sharedPoolRegistry(t, blueprint))
-	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	t.Setenv(envTrinoPoolOperatorEnabled, "false")
 	// Desired state is published from the API object, so the pool has to be
 	// told which one.
 	t.Setenv(envTrinoPoolConfigMap, "duckgres-trino-pool")
 	t.Setenv(envTrinoPoolGatewayURL, "")
-	t.Setenv("DUCKGRES_TRINO_MANAGED_GATEWAY_URL", "")
 
 	operators, err := buildTrinoPoolOperators(nil, testPoolFleet(), "cp-test")
 	if err != nil {
@@ -139,7 +153,6 @@ func TestPoolWiringRefusesWithoutADesiredStateSource(t *testing.T) {
 		t.Fatalf("write blueprint: %v", err)
 	}
 	t.Setenv(envTrinoCellsFile, sharedPoolRegistry(t, blueprint))
-	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	t.Setenv(envTrinoPoolOperatorEnabled, "false")
 	t.Setenv(envTrinoPoolConfigMap, "")

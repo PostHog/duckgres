@@ -775,8 +775,9 @@ batch contains i if {
 #   /v1/announce (GET)         the discovered node URIs
 #   /v1/maxActiveSplits        one number from the task executor
 #   /v1/integrations/gateway   cluster size / free bytes / system load
+#   /v1/query/{id}/drain-status execution and result-cache absence proof
 #
-# All six are GETs of cluster-operational state; none reads a tenant
+# These are GETs of cluster-operational state; none reads a tenant
 # catalog, a table, or SQL text. `/v1/thread` is the widest -- thread names
 # embed query and task ids -- and is worth knowing about when weighing this
 # grant, which is why the list is written out rather than left implied. The

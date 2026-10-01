@@ -92,6 +92,11 @@ set -eu
 # explicit so a silent death is distinguishable from an eviction.
 trap 'rc=$?; [ "$rc" = 0 ] || echo "HARNESS EXIT rc=$rc (no FAIL line above = killed by set -e or external signal)" >&2' EXIT
 
+if [ "${1:-}" = "--isolated-trino-recovery" ]; then
+    shift
+    exec python3 "$(dirname "$0")/trino-recovery-isolated.py" "$@"
+fi
+
 API="${CP_API:?}"
 PGHOST="${CP_PG_HOST:?}"
 SECRET="${INTERNAL_SECRET:?}"
@@ -164,7 +169,7 @@ log()  { echo ">>> $*" >&2; }
 apk add --no-cache curl jq postgresql-client openssl python3 py3-psycopg2 >/dev/null 2>&1 || true
 
 # kubectl, for the pod-level assertions the Go suite used to make via client-go.
-# The Job runs as the `duckgres` SA (pods get/list/delete/patch + pods/exec +
+# The Job runs as the `duckgres` SA (pods get/list/delete/patch +
 # pods/log in-namespace, and ducklings get/list/watch cross-namespace), and
 # kubectl auto-detects in-cluster config from that mounted SA token. arm64:
 # mw-dev worker nodes are arm64. The version is pinned (no stable.txt lookup —
@@ -1000,7 +1005,7 @@ trino_default_cell_placement() {
 #
 # E2E_TRINO_CELL_MOVE_ORG names an org that is Trino-enabled and ready on some
 # cell; E2E_TRINO_CELL_MOVE_TO names another configured cell (console id, e.g.
-# "cell-001" for the pool or "legacy"). The round trip leaves the org where it
+# "pool-a"). The round trip leaves the org where it
 # started. Each leg asserts the user-visible contract of a move:
 #   - the move is refused while the named source does not own the org (409);
 #   - an accepted move reports the org on the destination, pending, not ready;
@@ -1186,6 +1191,37 @@ trino_shared_pool_active() {
   fi
 
   log "shared pool OK [structure]: $ready ready instance(s), each with its own service and workers"
+
+  if [ "${E2E_TRINO_POOL_NODE_PROTECTION:-0}" = "1" ]; then
+    for pods in "$body" "$workers"; do
+      printf %s "$pods" | jq -e 'all(.items[];
+        .metadata.annotations["karpenter.sh/do-not-disrupt"] == "true")' >/dev/null \
+        || fail "shared pool: a coordinator or worker lacks node-disruption protection"
+    done
+    log "shared pool OK [node protection]: coordinators and workers retain do-not-disrupt"
+  fi
+
+  # Validate the recovery UI's read-only contract without authorizing retirement.
+  # Absent-pod recovery needs an isolated pool and destructive authorization.
+  # This shared-pool Job must not delete coordinators to manufacture that evidence.
+  # Run this harness with --isolated-trino-recovery for the destructive fixture.
+  inventory="$(curl -fsS -H "$H" --get --data-urlencode "cell=$pool" "$API/api/v1/trino/instances")" \
+    || fail "shared pool: recovery inventory request failed"
+  printf %s "$inventory" | jq -e --arg cell "$pool" '
+    .cell == $cell and (.instances | length > 0) and all(.instances[];
+      ((keys - ["node_replacement"]) == ["gateway_state", "instance_id", "phase", "phase_changed_at"])
+      and (.instance_id | type == "string" and length > 0)
+      and .phase != "RETIRED" and .phase != "FAILURE_RETIRED")' >/dev/null \
+    || fail "shared pool: recovery inventory is not scoped and sanitized"
+  recovery_instance="$(printf %s "$inventory" | jq -r '.instances[0].instance_id')"
+  preview="$(curl -fsS -H "$H" --get --data-urlencode "cell=$pool" "$API/api/v1/trino/instances/$recovery_instance/recovery")" \
+    || fail "shared pool: recovery preview request failed"
+  printf %s "$preview" | jq -e --arg cell "$pool" --arg instance "$recovery_instance" '
+    .cell == $cell and .instance.instance_id == $instance and .live_work_verified == false
+    and (.instance | has("blueprint_snapshot") | not)
+    and (.instance | has("endpoint_url") | not)' >/dev/null \
+    || fail "shared pool: recovery preview contract changed"
+  log "shared pool OK [recovery preview]: scoped inventory and stored-state preview; no recovery submitted"
 
   # Tenant admission, when the cell has the Gateway restriction on. This is the
   # user-visible end of the publication barrier: with the gate enabled a

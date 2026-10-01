@@ -58,7 +58,7 @@ func TestTrinoFleetSelectsAuthoritativeOwner(t *testing.T) {
 	legacy := &fakeTrinoCoordinator{}
 	current := &fakeTrinoCoordinator{queries: []TrinoQuery{{Principal: "tenant"}}}
 	store := &fakeTrinoOrgStore{
-		orgs: []configstore.TrinoEnabledOrg{{OrgID: "tenant", DatabaseName: "tenant", CellID: "registered:cell-001"}},
+		orgs: []configstore.TrinoEnabledOrg{{OrgID: "tenant", DatabaseName: "tenant", CellID: "registered:cell-001", RootPasswordHash: "hash"}},
 		rows: map[string]*configstore.ManagedWarehouseTrino{"tenant": {OrgID: "tenant", Enabled: true, TrinoCellID: "registered:cell-001", State: configstore.ManagedWarehouseStateReady}},
 	}
 	api := NewTrinoFleetAPI([]TrinoCell{{ID: "legacy", StoredID: "cell-001"}, {ID: "cell-001", StoredID: "registered:cell-001", ClientURL: "https://gateway.example.com"}}, []TrinoCoordinatorClient{legacy, current}, store, nil)

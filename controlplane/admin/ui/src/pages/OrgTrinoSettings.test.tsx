@@ -74,7 +74,7 @@ describe("Org Trino configuration", () => {
   });
 
   it("offers explicit initial selection for a registry-only blank assignment", () => {
-    hooks.useOrgTrino.mockReturnValue(ok({ enabled: false, assigned: false, available: false, cell: { id: "", coordinator_url: "" } }));
+    hooks.useOrgTrino.mockReturnValue(ok({ enabled: false, assigned: false, available: false, cell: { id: "" } }));
     hooks.useTrinoCells.mockReturnValue(ok({ cells: [{ id: "cell-test" }] }));
     renderSettings();
     expect(screen.getByText("Cell: Not selected")).toBeInTheDocument();
@@ -84,7 +84,7 @@ describe("Org Trino configuration", () => {
   });
 
   it("lets an enabled unassigned warehouse disable before selecting its initial cell", async () => {
-    hooks.useOrgTrino.mockReturnValue(ok({ enabled: true, assigned: false, available: false, cell: { id: "", coordinator_url: "" } }));
+    hooks.useOrgTrino.mockReturnValue(ok({ enabled: true, assigned: false, available: false, cell: { id: "" } }));
     hooks.useTrinoCells.mockReturnValue(ok({ cells: [{ id: "cell-test" }] }));
     renderSettings();
     expect(screen.queryByLabelText("Initial Trino cell")).not.toBeInTheDocument();

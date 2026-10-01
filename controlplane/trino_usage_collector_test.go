@@ -69,7 +69,7 @@ func TestTrinoUsageCollectorCapturesTerminalQueriesOnce(t *testing.T) {
 		{QueryID: "running", State: "RUNNING", Principal: "tenant-db"},
 		{QueryID: "operator", State: "FINISHED", Principal: "__observer"},
 	}}
-	collector := newTrinoUsageCollector(coordinator, trinoUsageFakeOrgs{orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "tenant-db"}}}, func(org, user string) int64 {
+	collector := newTrinoUsageCollector(coordinator, trinoUsageFakeOrgs{orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "tenant-db", RootPasswordHash: "hash"}}}, func(org, user string) int64 {
 		// The bare org principal authenticates with root's password line.
 		if org != "org-a" || user != "root" {
 			t.Fatalf("team lookup = (%q, %q)", org, user)

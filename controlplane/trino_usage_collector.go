@@ -93,7 +93,7 @@ func (c *trinoUsageCollector) collect(ctx context.Context) {
 		if _, ok := c.seen[query.QueryID]; ok {
 			continue
 		}
-		owner, ok := owners[query.Principal]
+		owner, ok := owners.Resolve(query.Principal)
 		if !ok {
 			continue // operator queries do not represent tenant usage
 		}

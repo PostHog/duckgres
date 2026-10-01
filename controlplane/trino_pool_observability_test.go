@@ -52,13 +52,17 @@ func TestTrinoPoolSnapshotFreshnessTracksReadNotLaterEffects(t *testing.T) {
 	observation := metrics.begin("pool-a")
 	defer observation.end()
 	ctx := context.WithValue(context.Background(), trinoPoolObservationKey{}, observation)
-	observation.snapshot(nil, time.Unix(1000, 0))
+	previousInventory := []configstore.TrinoPoolInstance{{InstanceID: "previous-member", Phase: "SERVING", BlueprintSnapshot: `{"namespace":"trino-compute"}`, CoordinatorDeploymentName: "previous-coordinator", WorkerDeploymentName: "previous-worker"}}
+	observation.snapshot(previousInventory, "trino-compute", 2, time.Unix(1000, 0))
 	harness.operator.store = trinoPoolFailingListStore{harness.store}
 	if err := harness.operator.reconcileOnce(ctx); err == nil {
 		t.Fatal("expected inventory error")
 	}
 	if got := gaugeVecLabelValue(t, metrics.snapshotAt, "pool-a"); got != 1000 {
 		t.Fatalf("failed read refreshed snapshot: %v", got)
+	}
+	if got := gaugeVecLabelValue(t, metrics.servingInstances, "pool-a", "previous-member", "trino-compute", "previous-coordinator", "previous-worker"); got != 1 {
+		t.Fatalf("failed read changed serving inventory: %v", got)
 	}
 	harness.operator.store = harness.store
 	harness.store.failAdvance = true
@@ -158,8 +162,8 @@ func TestTrinoPoolObservationSnapshotAndOwnership(t *testing.T) {
 		{InstanceID: "member-c", Phase: "SERVING"},
 		{InstanceID: "member-d", Phase: "future-value"},
 	}
-	old.snapshot(instances, now)
-	other.snapshot(nil, now)
+	old.snapshot(instances, "trino-compute", 2, now)
+	other.snapshot(nil, "trino-compute", 2, now)
 	if got := gaugeVecLabelValue(t, metrics.members, "pool-a", "DRAINING"); got != 2 {
 		t.Fatalf("draining = %v", got)
 	}
@@ -170,8 +174,8 @@ func TestTrinoPoolObservationSnapshotAndOwnership(t *testing.T) {
 		t.Fatalf("unknown phase = %v", got)
 	}
 	next := metrics.begin("pool-a")
-	next.snapshot(nil, now.Add(time.Minute))
-	old.snapshot(instances, now.Add(time.Hour))
+	next.snapshot(nil, "trino-compute", 2, now.Add(time.Minute))
+	old.snapshot(instances, "trino-compute", 2, now.Add(time.Hour))
 	old.end()
 	if got := gaugeVecLabelValue(t, metrics.snapshotAt, "pool-a"); got != 1060 {
 		t.Fatalf("stale term changed current snapshot: %v", got)
@@ -196,13 +200,79 @@ func TestTrinoPoolObservationSnapshotAndOwnership(t *testing.T) {
 	other.end()
 }
 
+func TestTrinoPoolServingInventoryMetricsFollowSnapshotAndTerm(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics := newTrinoPoolMetrics(registry)
+	old := metrics.begin("pool-a")
+	now := time.Unix(1000, 0)
+	instances := []configstore.TrinoPoolInstance{
+		{InstanceID: "member-a", Phase: "SERVING", BlueprintSnapshot: `{"namespace":"pinned-compute"}`, CoordinatorDeploymentName: "member-a-coordinator", WorkerDeploymentName: "member-a-worker"},
+		{InstanceID: "member-b", Phase: "DRAINING", CoordinatorDeploymentName: "member-b-coordinator", WorkerDeploymentName: "member-b-worker"},
+		{InstanceID: "member-c", Phase: "PREPARING"},
+	}
+	old.snapshot(instances, "trino-compute", 3, now)
+	if got := gaugeVecLabelValue(t, metrics.minServing, "pool-a", "trino-compute"); got != 3 {
+		t.Fatalf("configured serving floor = %v", got)
+	}
+	if got := gaugeVecLabelValue(t, metrics.servingInstances, "pool-a", "member-a", "pinned-compute", "member-a-coordinator", "member-a-worker"); got != 1 {
+		t.Fatalf("serving deployment identity = %v", got)
+	}
+	assertInventory := func(want int) {
+		t.Helper()
+		families, err := registry.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		for _, family := range families {
+			if family.GetName() == "duckgres_trino_pool_serving_instance_info" {
+				count = len(family.Metric)
+				for _, metric := range family.Metric {
+					for _, label := range metric.Label {
+						if label.GetName() == "namespace" || label.GetName() == "instance" {
+							t.Fatalf("workload metric conflicts with scrape identity: %s", label.GetName())
+						}
+					}
+				}
+			}
+		}
+		if count != want {
+			t.Fatalf("serving inventory series = %d, want %d", count, want)
+		}
+	}
+	assertInventory(1)
+	instances[0].Phase = "DRAINING"
+	old.snapshot(instances, "trino-compute", 2, now.Add(time.Minute))
+	assertInventory(0)
+	if got := gaugeVecLabelValue(t, metrics.minServing, "pool-a", "trino-compute"); got != 2 {
+		t.Fatalf("zero-serving snapshot lost configured floor: %v", got)
+	}
+	next := metrics.begin("pool-a")
+	next.snapshot(nil, "trino-compute", 4, now.Add(2*time.Minute))
+	instances[0].Phase = "SERVING"
+	old.snapshot(instances, "old-namespace", 9, now.Add(time.Hour))
+	old.end()
+	assertInventory(0)
+	if got := gaugeVecLabelValue(t, metrics.minServing, "pool-a", "trino-compute"); got != 4 {
+		t.Fatalf("stale term changed configured floor: %v", got)
+	}
+	next.snapshot(instances, "trino-compute", 4, now.Add(3*time.Minute))
+	assertInventory(1)
+	next.end()
+	families, err := registry.Gather()
+	if err != nil || len(families) != 0 {
+		t.Fatalf("ended term retained metrics: %v, %v", families, err)
+	}
+}
+
 func TestTrinoPoolCancellationRemovesGaugesBeforeRunReturns(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metrics := newTrinoPoolMetrics(registry)
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx, finish := metrics.beginTerm(ctx, "pool-a")
 	defer finish()
-	poolObservation(ctx).snapshot(nil, time.Now())
+	serving := []configstore.TrinoPoolInstance{{InstanceID: "member-a", Phase: "SERVING", CoordinatorDeploymentName: "member-a-coordinator", WorkerDeploymentName: "member-a-worker"}}
+	poolObservation(ctx).snapshot(serving, "trino-compute", 2, time.Now())
 	cancel()
 	deadline := time.Now().Add(time.Second)
 	for {
@@ -224,13 +294,56 @@ func TestTrinoPoolCancellationRemovesGaugesBeforeRunReturns(t *testing.T) {
 	if len(families) != 0 {
 		t.Fatal("canceled term still exports gauges")
 	}
-	poolObservation(ctx).snapshot(nil, time.Now())
+	poolObservation(ctx).snapshot(serving, "trino-compute", 2, time.Now())
 	families, err = registry.Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(families) != 0 {
 		t.Fatal("canceled term recreated its gauges")
+	}
+}
+
+func TestTrinoPoolConfiguredMetricsOutliveAuthorityButNotConfiguration(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics := newTrinoPoolMetrics(registry)
+	operators := []*trinoPoolOperator{
+		{config: trinoPoolConfig{PublicID: "pool-a", Namespace: "compute-a"}, operatorEnabled: true},
+		{config: trinoPoolConfig{PublicID: "pool-b", Namespace: "compute-b"}, operatorEnabled: true},
+		{config: trinoPoolConfig{PublicID: "paused", Namespace: "compute-c"}},
+	}
+	cleanup := metrics.configurePools(operators)
+	a, b := metrics.begin("pool-a"), metrics.begin("pool-b")
+	a.snapshot(nil, "compute-a", 3, time.Unix(1000, 0))
+	b.snapshot(nil, "compute-b", 2, time.Unix(1000, 0))
+	a.end()
+	for _, pool := range []struct{ id, namespace string }{{"pool-a", "compute-a"}, {"pool-b", "compute-b"}} {
+		if got := gaugeVecLabelValue(t, metrics.configured, pool.id, pool.namespace); got != 1 {
+			t.Fatalf("authority loss hid configured %s: %v", pool.id, got)
+		}
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		if family.GetName() == "duckgres_trino_pool_configured" && len(family.Metric) != 2 {
+			t.Fatal("paused operator exported expected active pool")
+		}
+	}
+	if got := gaugeVecLabelValue(t, metrics.snapshotAt, "pool-b"); got != 1000 {
+		t.Fatalf("other pool lost its authority snapshot: %v", got)
+	}
+	b.end()
+	nextCleanup := metrics.configurePools(operators[:1])
+	cleanup()
+	if got := gaugeVecLabelValue(t, metrics.configured, "pool-a", "compute-a"); got != 1 {
+		t.Fatalf("previous configuration cleanup erased current configuration: %v", got)
+	}
+	nextCleanup()
+	families, err = registry.Gather()
+	if err != nil || len(families) != 0 {
+		t.Fatalf("configuration shutdown retained metrics: %v, %v", families, err)
 	}
 }
 
@@ -263,7 +376,7 @@ func TestTrinoPoolDrainProgressIsBoundedAndPruned(t *testing.T) {
 			t.Errorf("missing %s: %s", want, logs.String())
 		}
 	}
-	observation.snapshot(nil, now)
+	observation.snapshot(nil, "trino-compute", 2, now)
 	observation.waiting(logger, instance, 7, "gateway_obligations", state, now.Add(6*time.Minute+time.Second))
 	if got := strings.Count(logs.String(), "Trino pool member is waiting."); got != 4 {
 		t.Fatalf("departed member cache not pruned: %d", got)

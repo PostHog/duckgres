@@ -77,7 +77,7 @@ func TestIssueServiceCredentialFreshMintShape(t *testing.T) {
 	// Exactly the contract keys — no username/password echo from the old shape.
 	for k := range body {
 		switch k {
-		case "credential_id", "credential_secret", "expires_at", "connect":
+		case "credential_id", "credential_secret", "expires_at", "connect", "secret_rotated":
 		default:
 			t.Fatalf("unexpected key %q in mint response: %v", k, body)
 		}

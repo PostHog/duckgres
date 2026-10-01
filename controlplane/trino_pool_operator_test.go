@@ -394,7 +394,7 @@ func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.Publi
 	if replayed {
 		// PoolStore.inPool resolves the recorded step and applies NOTHING: the
 		// principal rows keep whatever the earlier publication left there.
-		return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}, nil
+		return f.principalAdmission(tenant, request), nil
 	}
 	if f.principals == nil {
 		f.principals = map[string][]string{}
@@ -418,7 +418,11 @@ func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.Publi
 	}
 	f.principals[tenant] = request.Principals
 	f.recordStep(request.Step, intent)
-	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}, nil
+	return f.principalAdmission(tenant, request), nil
+}
+
+func (f *fakePoolGateway) principalAdmission(tenant string, request trinogateway.PublishPrincipalsRequest) trinogateway.TenantAdmission {
+	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}
 }
 
 func (f *fakePoolGateway) ConfigurePool(_ context.Context, poolID string, request trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error) {
@@ -626,6 +630,9 @@ func (f *fakePoolGateway) LostMember(_ context.Context, _, instanceID string, re
 	if request.Evidence == "" || request.Termination.Source == "" {
 		return trinogateway.Member{}, errors.New("a loss claim needs termination evidence")
 	}
+	if request.Evidence == trinogateway.EvidenceDestructiveOverride && (!request.DestructiveAuthorization || request.Reason == "") {
+		return trinogateway.Member{}, trinogateway.ErrEvidenceRequired
+	}
 	payload := fakeRequestPayload(request)
 	if replayed, done, err := f.replay(request.Step, payload); done {
 		return replayed, err
@@ -744,6 +751,10 @@ func (f *fakePoolKube) Apply(_ context.Context, objects trinopool.Objects) (trin
 
 func (f *fakePoolKube) Observe(context.Context, trinoPoolInventory) (trinoPoolObservation, error) {
 	return f.observed, nil
+}
+
+func (f *fakePoolKube) NamespacePodUIDs(context.Context, string) (map[string]bool, error) {
+	return map[string]bool{"pod-uid-1": true}, nil
 }
 
 func (f *fakePoolKube) Delete(_ context.Context, inventory trinoPoolInventory) error {
@@ -1243,6 +1254,55 @@ func TestTenantBindingIsPublishedWhenTheGateIsOn(t *testing.T) {
 	}
 }
 
+func TestTrinoServiceCredentialAuthPreservesPublishedPrincipals(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.tick(t, 1)
+	initial := strings.Join(harness.gateway.principals["org-a"], ",")
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
+	harness.tick(t, 1)
+	if got := strings.Join(harness.gateway.principals["org-a"], ","); got != initial {
+		t.Fatalf("service authentication changed published principals: before=%s after=%s", initial, got)
+	}
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "")
+	harness.tick(t, 1)
+	if got := strings.Join(harness.gateway.principals["org-a"], ","); got != initial {
+		t.Fatalf("authentication rollback changed published principals: before=%s after=%s", initial, got)
+	}
+}
+
+func TestTrinoServiceCredentialAuthAcceptsExistingGatewayReply(t *testing.T) {
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.tick(t, 1)
+	row := harness.publications.rows["org-a"]
+	if row == nil || row.PrincipalRevision == "" {
+		t.Fatal("existing Gateway principal publication reply was not checkpointed")
+	}
+}
+
+func TestTrinoServiceCredentialAuthDoesNotRepublishBindings(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.tick(t, 3)
+	initial := countCalls(harness.gateway.calls, "principals:")
+	revision := harness.publications.rows["org-a"].PrincipalRevision
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
+	harness.tick(t, 3)
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "")
+	harness.tick(t, 3)
+	if got := countCalls(harness.gateway.calls, "principals:"); got != initial {
+		t.Fatalf("service authentication toggles republished bindings: before=%d after=%d", initial, got)
+	}
+	if got := harness.publications.rows["org-a"].PrincipalRevision; got != revision {
+		t.Fatalf("service authentication changed binding revision: before=%s after=%s", revision, got)
+	}
+}
+
 // An unchanged tenant is not republished; a changed login set is, because the
 // Gateway replaces the set whole and a removed login must stop being admitted.
 func TestTenantBindingIsRepublishedOnlyWhenItChanges(t *testing.T) {
@@ -1658,7 +1718,6 @@ func TestBackwardsGenerationFreezesAndKeepsTheLease(t *testing.T) {
 // the API object at the moment of the write - by both replicas, in either
 // order.
 func TestLeadershipSwitchPublishesTheAPIObjectNotTheReplicaSnapshot(t *testing.T) {
-	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	t.Setenv(envTrinoCellsFile, mountedRegistry(t, 3, 3))
 	client := poolConfigMap(t, 5, 4)
@@ -2174,7 +2233,21 @@ func (f *fakePublicationStore) ClearTrinoPoolPublicationFailure(_ context.Contex
 // serving, which is what a publication barrier requires.
 func (h *operatorHarness) servingPool(t *testing.T) {
 	t.Helper()
-	h.tick(t, 12)
+	for tick := 0; tick < 32; tick++ {
+		serving := 0
+		for _, instance := range h.store.instances {
+			if instance.Phase == string(trinopool.PhaseServing) {
+				serving++
+			}
+		}
+		if serving == h.operator.config.Spec.DesiredInstances {
+			break
+		}
+		h.tick(t, 1)
+	}
+	if len(h.store.instances) != h.operator.config.Spec.DesiredInstances {
+		t.Fatalf("instance count = %d, want %d", len(h.store.instances), h.operator.config.Spec.DesiredInstances)
+	}
 	for id, instance := range h.store.instances {
 		if instance.Phase != string(trinopool.PhaseServing) {
 			t.Fatalf("instance %s is %s, want SERVING before a publication", id, instance.Phase)
@@ -3637,4 +3710,11 @@ func TestOnlyADefiniteRefusalClosesAnOccurrence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (f *fakePoolGateway) GetDrainCandidates(context.Context, string, string, string) ([]trinogateway.DrainQueryCandidate, error) {
+	return nil, nil
+}
+func (f *fakePoolGateway) ReconcileQueries(context.Context, string, string, trinogateway.ReconcileQueriesRequest) (trinogateway.ReconcileQueriesResult, error) {
+	return trinogateway.ReconcileQueriesResult{}, nil
 }

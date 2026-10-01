@@ -364,3 +364,23 @@ type RevokeTenantRequest struct {
 	Step
 	Reason string `json:"reason"`
 }
+
+// DrainQueryCandidate is a nonterminal query and its admission-version fence.
+type DrainQueryCandidate struct {
+	QueryID        string `json:"queryId"`
+	AdmissionCount int64  `json:"admissionCount"`
+}
+
+// ReconcileQueriesRequest carries same-process absence proofs. The Gateway
+// rechecks admission versions under its lock before retaining terminal records.
+type ReconcileQueriesRequest struct {
+	Step
+	ExpectedGeneration int64                 `json:"expectedGeneration"`
+	NodeID             string                `json:"nodeId"`
+	CoordinatorID      string                `json:"coordinatorId"`
+	Queries            []DrainQueryCandidate `json:"queries"`
+}
+
+type ReconcileQueriesResult struct {
+	Reconciled int `json:"reconciled"`
+}

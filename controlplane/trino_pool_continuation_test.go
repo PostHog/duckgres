@@ -89,7 +89,7 @@ func TestPoolProbeRejectsUntrustedContinuationOrigins(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(map[string]any{"nextUri": strings.ReplaceAll(target, "%s", host)})
 			}))
 			defer server.Close()
-			client := rolloutSQLClient{baseURL: server.URL, client: server.Client(), username: "observer", password: "test-password", internalHTTP: true}
+			client := trinoPoolSQLClient{baseURL: server.URL, client: server.Client(), username: "observer", password: "test-password", internalHTTP: true}
 			_, err := client.statement(context.Background(), "SELECT 1")
 			if err == nil || err.Error() != "invalid coordinator response endpoint" || requests != 1 {
 				t.Fatalf("unsafe continuation accepted: requests=%d, err=%v", requests, err)
@@ -113,7 +113,7 @@ func TestPoolProbeDoesNotFollowHTTPRedirect(t *testing.T) {
 		http.Redirect(w, r, foreign.URL+"/v1/statement/result", http.StatusTemporaryRedirect)
 	}))
 	defer server.Close()
-	client := rolloutSQLClient{baseURL: server.URL, client: newRolloutHTTPClient(""), username: "observer", password: "test-password", internalHTTP: true}
+	client := trinoPoolSQLClient{baseURL: server.URL, client: newTrinoPoolHTTPClient(""), username: "observer", password: "test-password", internalHTTP: true}
 	if _, err := client.statement(context.Background(), "SELECT 1"); err == nil || foreignRequests != 0 {
 		t.Fatalf("redirect followed: calls=%d, error=%v", foreignRequests, err)
 	}
@@ -126,10 +126,10 @@ func TestLegacyProbeDoesNotAcceptForwardedHTTPSPort(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"nextUri": "https://" + strings.Split(r.Host, ":")[0] + "/v1/statement/result"})
 	}))
 	defer server.Close()
-	client := rolloutSQLClient{baseURL: server.URL, client: server.Client(), username: "observer", password: "test-password"}
+	client := trinoPoolSQLClient{baseURL: server.URL, client: server.Client(), username: "observer", password: "test-password"}
 	_, err := client.statement(context.Background(), "SELECT 1")
 	if err == nil || err.Error() != "invalid coordinator response endpoint" || requests != 1 {
-		t.Fatalf("legacy probe accepted a different HTTPS port: requests=%d, error=%v", requests, err)
+		t.Fatalf("pool probe accepted a different HTTPS port: requests=%d, error=%v", requests, err)
 	}
 }
 
@@ -138,7 +138,7 @@ func TestPoolNodeInventoryFailureKeepsSafeCause(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"nextUri": "https://foreign.example.test/v1/statement/result"})
 	}))
 	defer server.Close()
-	client := rolloutSQLClient{baseURL: server.URL, client: server.Client(), username: "observer", password: "test-password", internalHTTP: true}
+	client := trinoPoolSQLClient{baseURL: server.URL, client: server.Client(), username: "observer", password: "test-password", internalHTTP: true}
 	_, err := registeredWorkerCount(context.Background(), client, "node-1")
 	if !errors.Is(err, errTrinoPoolCandidateNotReady) || !strings.Contains(err.Error(), "invalid coordinator response endpoint") {
 		t.Fatalf("inventory failure lost its safe underlying cause: %v", err)

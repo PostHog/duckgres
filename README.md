@@ -1,7 +1,12 @@
 # Duckgres
 
 Trino operators: see [cell registration and placement](docs/trino-cells.md) for
-the optional registry, unchanged legacy defaults, and migration limitations.
+the shared-pool registry, initial placement, and retirement prerequisites.
+
+`DUCKGRES_TRINO_POOL_NODE_DISRUPTION_ENABLED` defaults to `false`. Enabled shared-pool
+operators protect owned pods and replace instances on drifted or deleting Karpenter
+nodes through normal admission and drain. See the [node replacement runbook](docs/runbooks/trino-pool-node-replacement.md)
+for required permissions, rollout order, and failure boundaries.
 
 <p align="center">
   <img src="media/oh_duck.png" alt="Duckgres Mascot" width="200">
@@ -68,10 +73,6 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 For automatic initial placement, configure [`DUCKGRES_TRINO_DEFAULT_CELL`
 (default unset)](docs/trino-cells.md#automatic-placement-runbook).
 
-The optional [rollout readiness endpoint](docs/runbooks/trino-rollout-readiness.md)
-observes registered backend pods, coordinator identity, workers, and a dedicated
-warehouse canary. It is disabled by default and does not provision or move tenants.
-
 Existing Trino clients retain their DuckLake backend. New Trino clients use
 Hoglake automatically; there is no backend chooser or DuckLake fallback for new
 onboarding. Hoglake requires `DUCKGRES_TRINO_MANAGED_HOGLAKE_URI` and a dedicated
@@ -80,21 +81,13 @@ Disable/re-enable preserves the stored backend. This creates a separate catalog
 and does not migrate DuckLake data. Manual migration is outside this rollout.
 See the [managed Hoglake provisioning runbook](docs/runbooks/trino-hoglake-provisioning.md).
 
-The existing Trino deployment appears as `legacy` in the Trino console API.
-This name does not change its stored org assignments or catalog-store key.
-`DUCKGRES_TRINO_CELL_ID` remains the ownership setting, with the existing default
-`cell-001`; do not change it to `legacy` to match the API display name.
-Connection details remain readiness-gated and use the existing endpoint.
-Trino readiness requires a reconciled catalog and the current tenant password
-file on every active coordinator and worker of every running backend. Secret
-projection lag remains `provisioning`; catalog creation alone does not make a
-tenant ready. Checks use namespace-scoped pod read/exec access, with batches of
-128 files, up to four concurrent observations and a five-second timeout per
-observation within the existing 30-second backend budget. These limits are
-fixed defaults. See the [readiness runbook](docs/runbooks/trino-readiness.md)
-for deployment requirements, local verification, and recovery.
-See the [Trino admin API documentation](controlplane/admin/README.md#trino-cell-views-trinogo--trino_clientgo)
-for local verification, compatibility details, and recovery instructions.
+All configured Trino cells use the shared compute pool. The console requires
+an explicit cell selection. Stored ownership uses `registered:<cell-id>` and
+is not changed by compute replacement. Duckgres publishes catalogs directly to
+the shared catalog store and admits tenants only after the serving instances
+acknowledge their catalog and authorization revisions.
+See [cell registration](docs/trino-cells.md) and the
+[node replacement runbook](docs/runbooks/trino-pool-node-replacement.md).
 
 Trino `SHOW CREATE TABLE` and `SHOW CREATE VIEW` use the same catalog, schema,
 and relation read grants as table reads. Project-scoped logins can inspect only
@@ -274,6 +267,7 @@ column cannot be added to a populated table).
 - [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
 - [Org Connection Admission](docs/runbooks/org-connection-admission.md): Global vCPU admission, exact cleanup ownership, failure recovery, and operational metrics.
+- [Trino Pool Administrative Recovery](docs/runbooks/trino-pool-admin-recovery.md): Explicitly authorized failure retirement of one draining instance, with preview and resumable operator execution.
 - [Managed Warehouse Provisioning Recovery](docs/runbooks/managed-warehouse-provisioning-recovery.md): Diagnose a failed warehouse whose Duckling dependencies were repaired and verify automatic convergence back to ready.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
 - [Resharding Operations](docs/runbooks/resharding.md): Runner recovery, durable respawn reset, safety checks, and local verification.
@@ -298,6 +292,20 @@ fallback. New servers ignore the old field, but a new caller reaching an old
 server could still receive a reused credential without plaintext. Org
 deletion permanently removes its service-grant rows so an old secret cannot
 become valid if that org name is created again.
+
+Trino can validate the same grants through `POST /auth/trino/service-credentials`.
+This route is disabled by default.
+Set `DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE` to a mounted JSON file with `cells` entries containing an exact configured `cell_id` and a `tokens` array.
+Each token must be at least 32 bytes, unique to one cell, and different from the admin and discovery secrets.
+The control plane loads the map at startup and accepts up to four tokens per cell for overlapping rotation.
+Each coordinator receives only its own cell's plain-text token file; never distribute the complete map to coordinators.
+The token identifies the caller's cell and authorizes only validation for organizations currently assigned to that cell; it cannot mint, refresh, or revoke grants.
+With this configured, mint and refresh responses include an optional `trino_connect` block only when the organization's assigned Trino cell is ready and has a token mapping.
+It contains `host`, `port`, `catalog`, `username`, and `http_scheme`, and uses the same `credential_secret` as the pgwire connection.
+Trino clients renew live grants with `rotate_secret: false` on the refresh endpoint so their gateway query-owner fingerprint remains stable.
+Such responses contain `secret_rotated: false` and omit the secret; default refresh continues to rotate it.
+Persistent user passwords remain available for external clients.
+See [Trino service credentials](docs/runbooks/trino-service-credentials.md) for coordinated rollout, local validation, rotation, and failure recovery.
 
 ## Quick Start
 

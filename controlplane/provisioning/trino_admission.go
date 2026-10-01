@@ -35,6 +35,18 @@ func WithTrinoBackendValidator(validate func(configstore.TrinoBackend) error) Op
 	return func(h *handler) { h.trinoBackendValidator = validate }
 }
 
+// newClientTrinoBackend is the backend a client with no selection receives:
+// Hoglake where the deployment runs managed Hoglake, DuckLake everywhere else.
+// Without the fallback, a deployment with no Hoglake could not enable Trino
+// for any new org, and onboarding (which enables Trino in the provision call)
+// failed outright. DuckLake serves the org's existing warehouse.
+func (h *handler) newClientTrinoBackend() configstore.TrinoBackend {
+	if h.trinoBackendValidator != nil && h.trinoBackendValidator(configstore.TrinoBackendHoglake) == nil {
+		return configstore.TrinoBackendHoglake
+	}
+	return configstore.TrinoBackendDuckLake
+}
+
 // Resolve before checking deployment availability, including omitted-field clients.
 // The transactional store repeats resolution to detect a concurrent first enable.
 func (h *handler) resolveTrinoBackend(c *gin.Context, orgID string, requested configstore.TrinoBackend) (configstore.TrinoBackend, bool) {
@@ -42,12 +54,18 @@ func (h *handler) resolveTrinoBackend(c *gin.Context, orgID string, requested co
 		c.JSON(http.StatusBadRequest, gin.H{"error": "backend must be ducklake or hoglake"})
 		return "", false
 	}
+	// An explicit Hoglake request on a deployment without it is "not
+	// configured", not a selection conflict with the DuckLake fallback.
+	if requested == configstore.TrinoBackendHoglake && h.newClientTrinoBackend() != configstore.TrinoBackendHoglake {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "managed Hoglake provisioning is not configured"})
+		return "", false
+	}
 	row, err := h.store.GetManagedWarehouseTrino(orgID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot read Trino backend"})
 		return "", false
 	}
-	backend, err := configstore.ResolveTrinoBackend(row, requested)
+	backend, err := configstore.ResolveTrinoBackend(row, requested, h.newClientTrinoBackend())
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return "", false

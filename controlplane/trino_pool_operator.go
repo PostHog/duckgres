@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -69,6 +70,8 @@ type trinoPoolGateway interface {
 	AdmitMember(ctx context.Context, poolID, instanceID string, request trinogateway.AdmitMemberRequest) (trinogateway.Member, error)
 	GetMember(ctx context.Context, poolID, instanceID string) (trinogateway.Member, error)
 	GetObligations(ctx context.Context, poolID, instanceID string) (trinogateway.Obligations, error)
+	GetDrainCandidates(ctx context.Context, poolID, instanceID, after string) ([]trinogateway.DrainQueryCandidate, error)
+	ReconcileQueries(ctx context.Context, poolID, instanceID string, request trinogateway.ReconcileQueriesRequest) (trinogateway.ReconcileQueriesResult, error)
 	DrainMember(ctx context.Context, poolID, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error)
 	SealMember(ctx context.Context, poolID, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error)
 	SuspectMember(ctx context.Context, poolID, instanceID string, request trinogateway.SuspectMemberRequest) (trinogateway.Member, error)
@@ -83,6 +86,7 @@ type trinoPoolKube interface {
 	Observe(context.Context, trinoPoolInventory) (trinoPoolObservation, error)
 	Delete(context.Context, trinoPoolInventory) error
 	ResourcesAbsent(context.Context, trinoPoolInventory) (bool, error)
+	NamespacePodUIDs(context.Context, string) (map[string]bool, error)
 }
 
 // trinoPoolValidator probes a candidate through its own endpoint.
@@ -92,12 +96,22 @@ type trinoPoolValidator func(ctx context.Context, endpoint string, observed trin
 type trinoPoolIdentityProbe func(ctx context.Context, endpoint string) (string, error)
 
 type trinoPoolOperator struct {
-	config   trinoPoolConfig
-	store    trinoPoolStore
-	gateway  trinoPoolGateway
-	kube     func(epoch int64) trinoPoolKube
-	validate trinoPoolValidator
-	identity trinoPoolIdentityProbe
+	config               trinoPoolConfig
+	store                trinoPoolStore
+	gateway              trinoPoolGateway
+	kube                 func(epoch int64) trinoPoolKube
+	validate             trinoPoolValidator
+	identity             trinoPoolIdentityProbe
+	queryDrainStatus     func(context.Context, string, string) (trinoQueryDrainStatus, error)
+	drainCursors         map[string]string
+	recoveryEvidence     trinoPoolRecoveryEvidence
+	nodeGuard            *trinoPoolNodeGuard
+	nodeProtectionErrors map[string]error
+	nodeProtectionCursor uint64
+	// Registration can commit after its caller times out, even after a member 404.
+	// Only a confirmed higher Gateway fence clears unresolved attempts from a term.
+	registrationAttemptEpoch int64
+	registrationAttempts     map[string]bool
 	// projection reports what this control plane currently serves: the
 	// authorization bundle's revision and the fingerprints of the projected
 	// password and group files. It is what a member is compared against when
@@ -197,6 +211,8 @@ func (o *trinoPoolOperator) Run(ctx context.Context) {
 		interval = trinoPoolReconcileInterval
 	}
 	o.fenced = false
+	o.drainCursors = nil
+	o.recoveryEvidence = trinoPoolRecoveryEvidence{}
 
 	// A new Run is a NEW leadership term. Any lease left on the struct belongs
 	// to the previous term and must not be reused: the janitor lease may have
@@ -337,7 +353,11 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list pool instances: %w", err)
 	}
-	poolObservation(ctx).snapshot(instances, time.Now())
+	poolObservation(ctx).snapshot(instances, o.config.Namespace, o.pool.MinServing, time.Now())
+	nodeErr := o.protectPoolNodes(ctx, instances)
+	if o.fenced {
+		return errors.Join(tenantErr, nodeErr)
+	}
 	// Advance the instances already in flight before starting anything new, so
 	// a slow rollout cannot be overtaken by its own successor.
 	//
@@ -347,12 +367,12 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 	// lifecycle with it.
 	progressed, instanceErr := o.progressInstances(ctx, instances)
 	if instanceErr != nil && o.fenced {
-		return errors.Join(tenantErr, instanceErr)
+		return errors.Join(tenantErr, nodeErr, instanceErr)
 	}
 	if progressed {
-		return errors.Join(tenantErr, instanceErr)
+		return errors.Join(tenantErr, nodeErr, instanceErr)
 	}
-	return errors.Join(tenantErr, instanceErr, o.applyPlan(ctx, pool, instances))
+	return errors.Join(tenantErr, nodeErr, instanceErr, o.applyPlan(ctx, pool, instances))
 }
 
 // refreshConfig replaces the desired configuration with what the authoritative
@@ -492,6 +512,10 @@ func (o *trinoPoolOperator) configureGatewayPool(ctx context.Context) error {
 	if attempt.payload != desired {
 		return fmt.Errorf("%w: previous gateway configuration settled; current settings must be applied next", errTrinoPoolBackoff)
 	}
+	if o.registrationAttemptEpoch != o.lease.Epoch {
+		o.registrationAttempts = nil
+		o.registrationAttemptEpoch = o.lease.Epoch
+	}
 	return nil
 }
 
@@ -533,6 +557,19 @@ func (o *trinoPoolOperator) applyPlan(ctx context.Context, pool *configstore.Tri
 	desiredBlueprintDigest := o.config.Blueprint.Digest()
 	for _, instance := range instances {
 		view := instance.View()
+		validNodeEvidence := false
+		if instance.NodeReplacementEvidence != nil {
+			var evidence trinopool.NodeReplacementEvidence
+			if err := json.Unmarshal([]byte(*instance.NodeReplacementEvidence), &evidence); err != nil || evidence.Validate() != nil {
+				view.RolloutBlocked = true
+				failures = append(failures, fmt.Errorf("instance %s has unreadable node replacement evidence", instance.InstanceID))
+			} else {
+				validNodeEvidence = true
+			}
+		}
+		if o.nodeProtectionErrors[instance.InstanceID] != nil && !validNodeEvidence {
+			view.RolloutBlocked = true
+		}
 		if view.Phase.Serving() {
 			blueprint, err := trinopool.ParseBlueprint([]byte(instance.BlueprintSnapshot))
 			if err != nil {

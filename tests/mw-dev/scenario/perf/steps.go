@@ -2,7 +2,9 @@ package perf
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -202,6 +204,7 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		sinkClosed = true
 		return sink.Close(summary, metrics)
 	}
+	var recorded []perfcore.QueryResult
 	runner := perfcore.NewQueryRunner(perfcore.RunnerConfig{
 		RunID:          spec.RunID,
 		Catalog:        catalog,
@@ -210,7 +213,7 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		FixtureVersion: spec.FixtureVersion,
 		NightlyRunID:   spec.NightlyRunID,
 		Drivers:        drivers,
-		Sink:           closingSink{sink: sink, closeFunc: closeSink},
+		Sink:           closingSink{sink: sink, closeFunc: closeSink, recorded: &recorded},
 		Now:            e.now,
 	})
 	summary, err := runner.Run(ctx)
@@ -224,18 +227,48 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		Summary:   summary,
 	}
 	e.state.StoreResult(result)
+	// Both checks run after the artifacts are closed, so a failure keeps the
+	// measurements that explain it.
+	var failures []error
 	if spec.FailOnQueryErrors && summary.TotalErrors > 0 {
-		return classified(ErrorClassPerf, fmt.Errorf("perf step %s recorded %d query error(s)", step.ID, summary.TotalErrors))
+		failures = append(failures, fmt.Errorf("perf step %s recorded %d query error(s)", step.ID, summary.TotalErrors))
+	}
+	if gateErr := evaluatePerfGate(step.ID, catalog, recorded); gateErr != nil {
+		failures = append(failures, gateErr)
+	}
+	if len(failures) > 0 {
+		return classified(ErrorClassPerf, errors.Join(failures...))
 	}
 	return nil
+}
+
+// evaluatePerfGate checks the catalog's optional expectations against the
+// measured results. Catalogs without expectations are not checked.
+func evaluatePerfGate(stepID string, catalog perfcore.Catalog, results []perfcore.QueryResult) error {
+	if !catalog.HasExpectations() {
+		return nil
+	}
+	err := perfcore.ExpectationsError(perfcore.EvaluateExpectations(catalog, results))
+	if err == nil {
+		fmt.Printf("Perf step %s: perf gate expectations met\n", stepID)
+		return nil
+	}
+	// Step summaries truncate errors; the log keeps every violation.
+	fmt.Printf("Perf step %s: %v\n", stepID, err)
+	return err
 }
 
 type closingSink struct {
 	sink      perfcore.ResultSink
 	closeFunc func(perfcore.RunSummary, string) error
+	// recorded keeps every result for the perf gate.
+	recorded *[]perfcore.QueryResult
 }
 
 func (s closingSink) Record(result perfcore.QueryResult) error {
+	if s.recorded != nil {
+		*s.recorded = append(*s.recorded, result)
+	}
 	return s.sink.Record(result)
 }
 
@@ -478,14 +511,17 @@ func (e *Executor) trinoConnection(spec stepSpec) (trinodriver.ConnectionConfig,
 		status.Cell.ID == "" || status.Status.Cell != status.Cell.ID {
 		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q is incomplete; run wait_trino_ready before perf_queries", spec.OrgID))
 	}
-	if status.Cell.CoordinatorURL == "" {
-		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q has no coordinator URL", spec.OrgID))
+	// The cell's advertised client endpoint, the same one tenants are told to
+	// dial. Pooled cells have no fixed coordinator to connect to directly.
+	connection := status.Status.Connection
+	if connection == nil || connection.Host == "" || connection.Port <= 0 {
+		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q has no advertised client connection (status.connection)", spec.OrgID))
 	}
 	if status.Status.Principal == "" || status.Status.Catalog == "" {
 		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q has no principal or catalog", spec.OrgID))
 	}
 	return trinodriver.ConnectionConfig{
-		ServerURL:          status.Cell.CoordinatorURL,
+		ServerURL:          "https://" + net.JoinHostPort(connection.Host, strconv.Itoa(connection.Port)),
 		CatalogStoreCellID: e.trinoCatalogStoreCellID,
 		HoglakeCatalog:     spec.TrinoHoglakeCatalog,
 		Username:           status.Status.Principal,

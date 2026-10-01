@@ -28,7 +28,7 @@ ${TRINO_GATEWAY_PUBLIC_KEY}
       password: ${CONFIG_STORE_PASSWORD}
       driver: org.postgresql.Driver
     routing:
-      defaultRoutingGroup: cell-test
+      defaultRoutingGroup: pool-test
     monitor:
       taskDelay: 1s
     clusterStatsConfiguration:
@@ -38,6 +38,10 @@ ${TRINO_GATEWAY_PUBLIC_KEY}
       identityKey: ${TRINO_GATEWAY_IDENTITY_KEY}
       adminToken: ${TRINO_GATEWAY_ADMIN_TOKEN}
       terminalRetentionSeconds: 1
+      pool:
+        enabled: true
+        tenantIdentitySource: TRINO_BASIC_PRINCIPAL
+        forwardedProtoHttps: true
     presetUsers:
       cell-rollout:
         password: ${TRINO_GATEWAY_ADMIN_TOKEN}
@@ -137,48 +141,3 @@ metadata:
   namespace: ${NAMESPACE}
 subjects: [{ kind: ServiceAccount, name: duckgres, namespace: "${NAMESPACE}" }]
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: trino-shared-gateway-harness }
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: trino-shared-catalog-harness
-  namespace: ${TRINO_CELL_NAMESPACE}
-rules:
-  - apiGroups: [""]
-    resources: [configmaps]
-    resourceNames: [duckgres-trino-blue-coordinator, duckgres-trino-green-coordinator]
-    verbs: [get, patch]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: trino-shared-catalog-harness
-  namespace: ${TRINO_CELL_NAMESPACE}
-subjects: [{ kind: ServiceAccount, name: duckgres, namespace: "${NAMESPACE}" }]
-roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: trino-shared-catalog-harness }
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: duckgres-ci-pr-${PR_NUMBER}-shared-catalog-secret-reader
-  namespace: ducklings
-  labels:
-    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
-rules:
-  - apiGroups: [""]
-    resources: [secrets]
-    resourceNames: [cnpg-tenant-ci-pr-${PR_NUMBER}-trinod-password]
-    verbs: [get]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: duckgres-ci-pr-${PR_NUMBER}-shared-catalog-secret-reader
-  namespace: ducklings
-  labels:
-    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
-subjects: [{ kind: ServiceAccount, name: duckgres, namespace: "${NAMESPACE}" }]
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: duckgres-ci-pr-${PR_NUMBER}-shared-catalog-secret-reader

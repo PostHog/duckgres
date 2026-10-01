@@ -9,7 +9,6 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
 )
 
@@ -130,13 +129,12 @@ func (c *hoglakeTestCatalog) CatalogConnectors(context.Context) (map[string]stri
 
 func TestTrinoHoglakeManagedReconcile(t *testing.T) {
 	for _, tc := range []struct {
-		name, connector        string
-		missingWorker, badPath bool
+		name, connector string
+		badPath         bool
 	}{
 		{name: "bootstrap and reconcile without metadata password"},
 		{name: "existing ducklake preserved", connector: "ducklake"},
 		{name: "wrong Hoglake path", connector: "hoglake", badPath: true},
-		{name: "missing worker", missingWorker: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			org := configstore.TrinoEnabledOrg{OrgID: "tenant-a", DatabaseName: "tenant_a", Tier: "free", CellID: testCellID, RootPasswordHash: "$2a$10$hash", Backend: configstore.TrinoBackendHoglake}
@@ -155,9 +153,6 @@ func TestTrinoHoglakeManagedReconcile(t *testing.T) {
 			h.provisioner.catalog = client
 			if tc.connector != "" {
 				h.catalog.existing = []string{name}
-			}
-			if tc.missingWorker {
-				h.catalog.nodes = []TrinoNode{{ID: "coordinator", State: "active", Coordinator: true}}
 			}
 			requests := 0
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -205,11 +200,11 @@ func TestTrinoHoglakeManagedReconcile(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			outcomes, e := h.provisioner.reconcileBoundedBackend(context.Background(), []configstore.TrinoEnabledOrg{org}, projection, client, "primary")
+			outcomes, e := h.provisioner.reconcileBackendCatalogs(context.Background(), []configstore.TrinoEnabledOrg{org}, projection, client)
 			if e != nil {
 				t.Fatal(e)
 			}
-			if outcomes[org.OrgID].Pending != tc.missingWorker {
+			if outcomes[org.OrgID].Pending {
 				t.Fatalf("unexpected readiness: %+v", outcomes)
 			}
 			before := requests
@@ -245,78 +240,55 @@ func TestTrinoHoglakeHTTPRejectsRedirectAndCancellation(t *testing.T) {
 	}
 }
 
-func TestTrinoHoglakeLegacyOptionCannotOverridePersistedDuckLake(t *testing.T) {
-	for _, explicit := range []bool{false, true} {
-		t.Run(strconv.FormatBool(explicit), func(t *testing.T) {
-			opts := baseTestOpts()
-			opts.HoglakeURI = "http://benchmark.example:8080"
-			opts.ExplicitAssignmentOnly = explicit
-			p, err := NewTrinoProvisioner(opts)
-			if err != nil {
-				t.Fatal(err)
-			}
-			props := p.buildCatalogProperties("tenant-a", readyWarehouse("tenant-a"), readyDuckling("tenant-a"))
-			if props["connector.name"] != "ducklake" {
-				t.Fatal("deprecated global switch overrode persisted DuckLake backend")
-			}
-		})
-	}
-}
-
 func TestTrinoHoglakePersistedBackendsPreserveExistingClients(t *testing.T) {
-	for _, explicit := range []bool{false, true} {
-		t.Run(strconv.FormatBool(explicit), func(t *testing.T) {
-			old := configstore.TrinoEnabledOrg{OrgID: "old-client", DatabaseName: "old_client", CellID: testCellID, RootPasswordHash: "$2a$10$example", Backend: configstore.TrinoBackendDuckLake}
-			fresh := configstore.TrinoEnabledOrg{OrgID: "new-client", DatabaseName: "new_client", CellID: testCellID, RootPasswordHash: "$2a$10$example", Backend: configstore.TrinoBackendHoglake}
-			cold := configstore.TrinoEnabledOrg{OrgID: "existing-client", DatabaseName: "existing_client", CellID: testCellID, RootPasswordHash: "$2a$10$example", Backend: configstore.TrinoBackendDuckLake}
-			warehouse := readyWarehouse(fresh.OrgID)
-			warehouse.DucklingName = "new-warehouse"
-			h := newTestTrinoProvisioner(t, []configstore.TrinoEnabledOrg{old}, map[string]*configstore.ManagedWarehouse{old.OrgID: readyWarehouse(old.OrgID), cold.OrgID: readyWarehouse(cold.OrgID), fresh.OrgID: warehouse})
-			h.provisioner.explicitAssignmentOnly = explicit
-			if err := h.provisioner.Reconcile(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			oldName := TrinoCatalogName(old.TrinoPrincipal())
-			oldProps := maps.Clone(h.catalog.created[oldName])
-			client := &hoglakeTestCatalog{fakeCatalogClient: h.catalog, connector: "ducklake"}
-			h.provisioner.catalog = client
-			h.store.orgs = append(h.store.orgs, fresh, cold)
-			h.ducklings[cold.OrgID] = readyDuckling(cold.OrgID)
-			h.ducklings[fresh.OrgID] = readyDuckling(fresh.OrgID)
-			h.ducklings[fresh.OrgID].ReadyCondition = true
-			h.ducklings[fresh.OrgID].MetadataStore.Password = ""
-			h.provisioner.hoglakeDucklings = h.provisioner.ducklings
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				switch r.URL.Path {
-				case "/v1/catalogs/new-client":
-					_ = json.NewEncoder(w).Encode(map[string]any{"name": "new-client", "data_path": "s3://example-bucket/trino/new-warehouse/", "capabilities": []string{"atomic-table-creation-v1"}})
-				case "/v1/catalogs/new-client/namespaces/main":
-					_, _ = w.Write([]byte(`{"name":"main"}`))
-				default:
-					t.Errorf("unexpected request %s", r.URL.Path)
-					w.WriteHeader(http.StatusNotFound)
-				}
-			}))
-			defer srv.Close()
-			h.provisioner.managedHoglake = &TrinoManagedHoglakeConfig{URI: srv.URL, DataPath: "s3://example-bucket/trino/", Namespace: "main"}
-			for i := 0; i < 2; i++ {
-				if err := h.provisioner.Reconcile(context.Background()); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if len(h.catalog.dropped) != 0 || !maps.Equal(oldProps, h.catalog.created[oldName]) {
-				t.Fatal("existing DuckLake registration changed")
-			}
-			if got := h.catalog.created[TrinoCatalogName(cold.TrinoPrincipal())]["connector.name"]; got != "ducklake" {
-				t.Fatalf("recreated existing client's backend = %s", got)
-			}
-			if got := h.catalog.created[TrinoCatalogName(fresh.TrinoPrincipal())]["connector.name"]; got != "hoglake" {
-				t.Fatalf("new client's backend = %s", got)
-			}
-			secrets := h.tenantSecret(t)
-			if string(secrets[old.OrgID]) != "pw-"+old.OrgID || string(secrets[cold.OrgID]) != "pw-"+cold.OrgID || len(secrets[fresh.OrgID]) != 0 {
-				t.Fatal("metadata credentials did not follow persisted backends")
-			}
-		})
+	old := configstore.TrinoEnabledOrg{OrgID: "old-client", DatabaseName: "old_client", CellID: testCellID, RootPasswordHash: "$2a$10$example", Backend: configstore.TrinoBackendDuckLake}
+	fresh := configstore.TrinoEnabledOrg{OrgID: "new-client", DatabaseName: "new_client", CellID: testCellID, RootPasswordHash: "$2a$10$example", Backend: configstore.TrinoBackendHoglake}
+	cold := configstore.TrinoEnabledOrg{OrgID: "existing-client", DatabaseName: "existing_client", CellID: testCellID, RootPasswordHash: "$2a$10$example", Backend: configstore.TrinoBackendDuckLake}
+	warehouse := readyWarehouse(fresh.OrgID)
+	warehouse.DucklingName = "new-warehouse"
+	h := newTestTrinoProvisioner(t, []configstore.TrinoEnabledOrg{old}, map[string]*configstore.ManagedWarehouse{old.OrgID: readyWarehouse(old.OrgID), cold.OrgID: readyWarehouse(cold.OrgID), fresh.OrgID: warehouse})
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	oldName := TrinoCatalogName(old.TrinoPrincipal())
+	oldProps := maps.Clone(h.catalog.created[oldName])
+	client := &hoglakeTestCatalog{fakeCatalogClient: h.catalog, connector: "ducklake"}
+	h.provisioner.catalog = client
+	h.store.orgs = append(h.store.orgs, fresh, cold)
+	h.ducklings[cold.OrgID] = readyDuckling(cold.OrgID)
+	h.ducklings[fresh.OrgID] = readyDuckling(fresh.OrgID)
+	h.ducklings[fresh.OrgID].ReadyCondition = true
+	h.ducklings[fresh.OrgID].MetadataStore.Password = ""
+	h.provisioner.hoglakeDucklings = h.provisioner.ducklings
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/catalogs/new-client":
+			_ = json.NewEncoder(w).Encode(map[string]any{"name": "new-client", "data_path": "s3://example-bucket/trino/new-warehouse/", "capabilities": []string{"atomic-table-creation-v1"}})
+		case "/v1/catalogs/new-client/namespaces/main":
+			_, _ = w.Write([]byte(`{"name":"main"}`))
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	h.provisioner.managedHoglake = &TrinoManagedHoglakeConfig{URI: srv.URL, DataPath: "s3://example-bucket/trino/", Namespace: "main"}
+	for i := 0; i < 2; i++ {
+		if err := h.provisioner.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(h.catalog.dropped) != 0 || !maps.Equal(oldProps, h.catalog.created[oldName]) {
+		t.Fatal("existing DuckLake registration changed")
+	}
+	if got := h.catalog.created[TrinoCatalogName(cold.TrinoPrincipal())]["connector.name"]; got != "ducklake" {
+		t.Fatalf("recreated existing client's backend = %s", got)
+	}
+	if got := h.catalog.created[TrinoCatalogName(fresh.TrinoPrincipal())]["connector.name"]; got != "hoglake" {
+		t.Fatalf("new client's backend = %s", got)
+	}
+	secrets := h.tenantSecret(t)
+	if string(secrets[old.OrgID]) != "pw-"+old.OrgID || string(secrets[cold.OrgID]) != "pw-"+cold.OrgID || len(secrets[fresh.OrgID]) != 0 {
+		t.Fatal("metadata credentials did not follow persisted backends")
 	}
 }

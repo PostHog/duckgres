@@ -32,9 +32,8 @@ var ErrTrinoPoolIntentChanged = errors.New("trino pool operation was replayed wi
 // problem, and handed the pool to a replica that would do exactly the same.
 var ErrTrinoPoolStaleGeneration = errors.New("trino pool desired generation is behind the published generation")
 
-// API modes. `legacy` keeps today's fixed blue/green behavior for the cell.
+// The shared-pool API manages all Trino compute instances.
 const (
-	TrinoPoolAPIModeLegacy = "legacy"
 	TrinoPoolAPIModeShared = "shared-pool"
 )
 
@@ -129,20 +128,21 @@ type TrinoPoolInstance struct {
 	// RepairFor names the failed instance this one replaces. The Gateway
 	// charges an activation to the repair budget only when it is set; without
 	// it a repair spends the single planned surge instead.
-	RepairFor                 string `gorm:"column:repair_for"`
-	FailureReason             string `gorm:"column:failure_reason"`
-	CoordinatorDeploymentName string `gorm:"column:coordinator_deployment_name"`
-	CoordinatorDeploymentUID  string `gorm:"column:coordinator_deployment_uid"`
-	WorkerDeploymentName      string `gorm:"column:worker_deployment_name"`
-	WorkerDeploymentUID       string `gorm:"column:worker_deployment_uid"`
-	ServiceName               string `gorm:"column:service_name"`
-	ServiceUID                string `gorm:"column:service_uid"`
-	ConfigMapName             string `gorm:"column:config_map_name"`
-	ConfigMapUID              string `gorm:"column:config_map_uid"`
-	WorkerConfigMapName       string `gorm:"column:worker_config_map_name"`
-	WorkerConfigMapUID        string `gorm:"column:worker_config_map_uid"`
-	CoordinatorPodUID         string `gorm:"column:coordinator_pod_uid"`
-	CoordinatorNodeID         string `gorm:"column:coordinator_node_id"`
+	RepairFor                 string  `gorm:"column:repair_for"`
+	NodeReplacementEvidence   *string `gorm:"column:node_replacement_evidence;type:jsonb"`
+	FailureReason             string  `gorm:"column:failure_reason"`
+	CoordinatorDeploymentName string  `gorm:"column:coordinator_deployment_name"`
+	CoordinatorDeploymentUID  string  `gorm:"column:coordinator_deployment_uid"`
+	WorkerDeploymentName      string  `gorm:"column:worker_deployment_name"`
+	WorkerDeploymentUID       string  `gorm:"column:worker_deployment_uid"`
+	ServiceName               string  `gorm:"column:service_name"`
+	ServiceUID                string  `gorm:"column:service_uid"`
+	ConfigMapName             string  `gorm:"column:config_map_name"`
+	ConfigMapUID              string  `gorm:"column:config_map_uid"`
+	WorkerConfigMapName       string  `gorm:"column:worker_config_map_name"`
+	WorkerConfigMapUID        string  `gorm:"column:worker_config_map_uid"`
+	CoordinatorPodUID         string  `gorm:"column:coordinator_pod_uid"`
+	CoordinatorNodeID         string  `gorm:"column:coordinator_node_id"`
 	// CoordinatorID is the coordinator identity the GATEWAY observed when the
 	// member registered. It is a distinct value from the node id, and a loss
 	// claim has to carry both exactly as the Gateway recorded them, or the
@@ -177,11 +177,13 @@ func (TrinoPoolInstance) TableName() string { return "duckgres_trino_pool_instan
 // View projects the row onto the planner's read-only input.
 func (i TrinoPoolInstance) View() trinopool.InstanceView {
 	return trinopool.InstanceView{
-		ID:        i.InstanceID,
-		Phase:     trinopool.Phase(i.Phase),
-		ReleaseID: i.ReleaseID,
-		Repair:    i.Repair,
-		CreatedAt: i.CreatedAt.UnixNano(),
+		ID:              i.InstanceID,
+		Phase:           trinopool.Phase(i.Phase),
+		ReleaseID:       i.ReleaseID,
+		Repair:          i.Repair,
+		RepairFor:       i.RepairFor,
+		NodeReplacement: i.NodeReplacementEvidence != nil,
+		CreatedAt:       i.CreatedAt.UnixNano(),
 	}
 }
 

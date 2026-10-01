@@ -392,6 +392,31 @@ func (e *trinoPoolEffects) ResourcesAbsent(ctx context.Context, inventory trinoP
 	return len(pods) == 0, nil
 }
 
+// NamespacePodUIDs reads a complete unfiltered inventory in the instance's pinned namespace.
+// Desired namespace changes must not redirect evidence or teardown for an existing instance.
+func (e *trinoPoolEffects) NamespacePodUIDs(ctx context.Context, namespace string) (map[string]bool, error) {
+	if namespace == "" {
+		return nil, errors.New("coordinator absence requires the instance's pinned namespace")
+	}
+	ctx, cancel := context.WithTimeout(ctx, trinoPoolRequestBudget)
+	defer cancel()
+	uids := make(map[string]bool)
+	options := metav1.ListOptions{Limit: trinoPoolListLimit}
+	for {
+		pods, err := e.clientset.CoreV1().Pods(namespace).List(ctx, options)
+		if err != nil {
+			return nil, fmt.Errorf("verify admitted coordinator pod absence: %w", err)
+		}
+		for _, pod := range pods.Items {
+			uids[string(pod.UID)] = true
+		}
+		if pods.Continue == "" {
+			return uids, nil
+		}
+		options.Continue = pods.Continue
+	}
+}
+
 // Observe reports the cluster's current view of the instance.
 func (e *trinoPoolEffects) Observe(ctx context.Context, inventory trinoPoolInventory) (trinoPoolObservation, error) {
 	ctx, cancel := context.WithTimeout(ctx, trinoPoolRequestBudget)

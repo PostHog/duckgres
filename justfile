@@ -343,6 +343,27 @@ test-trino-opa pattern="":
 test-trino pattern="Trino":
     go test -v -count=1 -tags kubernetes -run '{{pattern}}' ./controlplane ./controlplane/admin ./controlplane/provisioner ./controlplane/provisioning
 
+# Run the opt-in recovery boundary against disposable fixtures.
+[group('test')]
+test-trino-recovery-boundary:
+    go test -v -count=1 -tags kubernetes -timeout 8m -run '^TestTrinoPoolRecoveryIsolatedBoundary$' ./controlplane
+
+[group('test')]
+test-trino-recovery-isolated context gateway_image:
+    sh tests/mw-dev/e2e/harness.sh --isolated-trino-recovery --context '{{context}}' --gateway-image '{{gateway_image}}'
+
+# Verify bounded query-obligation reconciliation and the existing seal gates.
+[group('test')]
+test-trino-drain:
+    go test -v -count=1 ./controlplane/trinogateway
+    just test-trino 'TestTrinoPoolReconcil|TestTrinoPoolDrain|TestTrinoDrainProof|TestPoolSeal|TestSealWaits'
+
+# Verify the Trino service-grant lifecycle against local integration Postgres.
+[group('test')]
+test-trino-service-credentials:
+    go test -v -count=1 -run 'TestTrinoServiceCredential' ./controlplane/configstore ./tests/configstore
+    just test-trino 'TestTrinoService|TestBinding|TestBuildTrinoAuthFiles_Refuses|TestTrinoUsageCollector'
+
 [group('test')]
 test-controlplane-k8s:
     go test -v -count=1 -tags kubernetes . ./controlplane ./controlplane/admin ./controlplane/provisioner
@@ -360,7 +381,7 @@ test-trino-hoglake-smoke:
 # Test isolated deployment fixtures without contacting a cluster.
 [group('test')]
 test-mw-fixtures:
-    go test -v -count=1 ./tests/mw-dev
+    go test -v -count=1 ./tests/mw-dev/...
 
 # Print the test impact plan for the current branch
 [group('test')]

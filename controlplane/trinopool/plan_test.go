@@ -5,6 +5,33 @@ import (
 	"testing"
 )
 
+func TestPlanNodeReplacementWaitsForServingReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name                  string
+		serving, surge, floor int
+		action                PlanAction
+	}{
+		{"at desired count above floor", 3, 1, 2, PlanActionCreate},
+		{"replacement serving", 4, 1, 2, PlanActionDrain},
+		{"no surge budget", 3, 0, 2, PlanActionNone},
+		{"serving floor", 3, 1, 3, PlanActionCreate},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := servingPool("r1", test.serving)
+			state.MinServing = test.floor
+			state.MaxSurge = test.surge
+			state.Instances[0].NodeReplacement = true
+			plan := PlanNext(state)
+			if plan.Action != test.action || plan.Repair || plan.RepairFor != "" {
+				t.Fatalf("node replacement plan = %+v", plan)
+			}
+			if plan.Action == PlanActionDrain && plan.InstanceID != state.Instances[0].ID {
+				t.Fatalf("drained unrelated member: %+v", plan)
+			}
+		})
+	}
+}
+
 func TestPlanConfigurationOnlyRollout(t *testing.T) {
 	for _, test := range []struct {
 		name           string
@@ -236,5 +263,120 @@ func TestRepairPrefersAProvenFailure(t *testing.T) {
 	plan := PlanNext(state)
 	if plan.RepairFor != "lost-one" {
 		t.Fatalf("repair names %q, want the lost instance", plan.RepairFor)
+	}
+}
+
+func TestPlanCountsOnlyServingCapacity(t *testing.T) {
+	for _, phase := range []Phase{PhaseDraining, PhaseSealed, PhaseRetiring} {
+		t.Run(string(phase), func(t *testing.T) {
+			state := servingPool("r1", 4)
+			state.Instances[0].Phase = PhaseSuspect
+			for index := 1; index < len(state.Instances); index++ {
+				state.Instances[index].Phase = phase
+			}
+			plan := PlanNext(state)
+			if plan.Action != PlanActionCreate || !plan.Repair || plan.RepairFor != state.Instances[0].ID {
+				t.Fatalf("departing capacity concealed a repair deficit: %+v", plan)
+			}
+		})
+	}
+}
+
+func TestPlanKeepsServingRepairsChargedToBudget(t *testing.T) {
+	state := servingPool("r1", 3)
+	state.Instances[0].Phase = PhaseSuspect
+	state.Instances[1].Phase = PhaseSuspect
+	state.Instances[2].Repair = true
+	plan := PlanNext(state)
+	if plan.Action != PlanActionNone || !strings.Contains(plan.Reason, "repair budget") {
+		t.Fatalf("serving repair released its live budget: %+v", plan)
+	}
+}
+
+func TestPlanSerializesCapacityRecoveryCreates(t *testing.T) {
+	state := servingPool("r1", 0)
+	state.Instances = append(state.Instances, InstanceView{ID: "candidate", Phase: PhaseCreating})
+	if plan := PlanNext(state); plan.Action != PlanActionNone {
+		t.Fatalf("created another candidate before the first resolved: %+v", plan)
+	}
+}
+
+func TestPlanRestoresAllServingCapacityWithoutDeletingPinnedDrains(t *testing.T) {
+	state := servingPool("r1", 4)
+	state.MaxRepair = 3
+	for index := range state.Instances {
+		state.Instances[index].Phase = PhaseDraining
+	}
+	for repair := 0; repair < 3; repair++ {
+		plan := PlanNext(state)
+		if plan.Action != PlanActionCreate || !plan.Repair || plan.RepairFor != state.Instances[repair].ID {
+			t.Fatalf("repair %d failed to select a distinct draining target: %+v", repair, plan)
+		}
+		state.Instances = append(state.Instances, InstanceView{
+			ID: string(rune('x'+repair)) + "-repair", Phase: PhaseCreating,
+			ReleaseID: "r1", Repair: true, RepairFor: plan.RepairFor,
+		})
+		if plan := PlanNext(state); plan.Action != PlanActionNone {
+			t.Fatalf("repair %d allowed concurrent creation: %+v", repair, plan)
+		}
+		state.Instances[len(state.Instances)-1].Phase = PhaseServing
+	}
+	if plan := PlanNext(state); plan.Action != PlanActionNone {
+		t.Fatalf("capacity restoration started another operation: %+v", plan)
+	}
+	if len(state.Instances) != state.DesiredInstances+state.MaxSurge+state.MaxRepair {
+		t.Fatal("fixture did not use the exact configured live capacity limit")
+	}
+	for _, instance := range state.Instances[:4] {
+		if instance.Phase != PhaseDraining {
+			t.Fatal("restoring capacity modified a pinned drain")
+		}
+	}
+}
+
+func TestPlanDrainingRepairRequiresAvailableBudgets(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		repairs, live int
+	}{
+		{"no repair budget", 0, 4},
+		{"live capacity exhausted", 1, 5},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := servingPool("r1", test.live)
+			state.MaxRepair = test.repairs
+			for index := range state.Instances {
+				state.Instances[index].Phase = PhaseDraining
+			}
+			if plan := PlanNext(state); plan.Action != PlanActionNone {
+				t.Fatalf("repair exceeded a configured budget: %+v", plan)
+			}
+		})
+	}
+}
+
+func TestPlanNeverAllocatesTwoLiveRepairsForOneTarget(t *testing.T) {
+	state := servingPool("r1", 3)
+	state.MaxRepair = 3
+	state.Instances[0].Phase = PhaseDraining
+	state.Instances[1].Phase = PhaseFailedPreparing
+	state.Instances[2].Repair = true
+	state.Instances[2].RepairFor = state.Instances[0].ID
+	if plan := PlanNext(state); plan.Action != PlanActionNone || !strings.Contains(plan.Reason, "no unreplaced") {
+		t.Fatalf("duplicated an existing target reservation: %+v", plan)
+	}
+	state.Instances[2].Phase = PhaseRetired
+	plan := PlanNext(state)
+	if plan.Action != PlanActionCreate || plan.Repair {
+		t.Fatalf("retired repair did not release ordinary capacity: %+v", plan)
+	}
+}
+
+func TestPlanDoesNotRepairAPlannedDrainAtServingFloor(t *testing.T) {
+	state := servingPool("r1", 3)
+	state.MaxRepair = 3
+	state.Instances = append(state.Instances, InstanceView{ID: "departing", Phase: PhaseDraining})
+	if plan := PlanNext(state); plan.Action != PlanActionNone {
+		t.Fatalf("planned drain spent the failure repair budget: %+v", plan)
 	}
 }

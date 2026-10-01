@@ -38,6 +38,31 @@ roleRef:
   kind: Role
   name: trino-bootstrap-harness
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trino-pool-operator
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: trino-pool-operator
+  namespace: ${NAMESPACE}
+subjects:
+  - {kind: ServiceAccount, name: duckgres, namespace: "${NAMESPACE}"}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: trino-pool-operator}
+---
 apiVersion: v1
 kind: Secret
 metadata:
@@ -83,6 +108,7 @@ data:
     cache-manager.name=memory
   config.properties: |
     coordinator=true
+    optimizer.dictionary-aggregation=true
     node-scheduler.include-coordinator=false
     http-server.http.port=8080
     http-server.https.enabled=true
@@ -90,9 +116,9 @@ data:
     http-server.https.keystore.path=/etc/trino/tls/keystore.p12
     http-server.https.keystore.key=${ENV:TRINO_TLS_KEYSTORE_PASSWORD}
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
-    query.max-memory=6GB
+    query.max-memory=${TRINO_QUERY_MEMORY}
     # The coordinator does not execute tasks and retains headroom in its 2G
-    # heap; execution workers carry the 2GB per-node allowance below.
+    # heap; execution workers use the selected profile below.
     query.max-memory-per-node=1GB
     catalog.management=dynamic
     # Both targets load the same managers; catalog fs.cache.enabled gates use.
@@ -114,6 +140,7 @@ data:
     access-control.name=opa
     opa.policy.uri=http://localhost:8181/v1/data/trino/allow
     opa.policy.batched-uri=http://localhost:8181/v1/data/trino/batch
+    opa.policy.revision-uri=http://localhost:8181/v1/data/trino/revision
   resource-groups.properties: |
     resource-groups.configuration-manager=file
     resource-groups.config-file=/etc/trino/resource-groups/resource-groups.json
@@ -134,7 +161,7 @@ data:
     node.data-dir=/data/trino
   jvm.config: |
     -server
-    -Xmx3G
+    -Xmx${TRINO_WORKER_HEAP}
     -XX:+UseG1GC
     -XX:+ExitOnOutOfMemoryError
     -Dfile.encoding=UTF-8
@@ -148,14 +175,14 @@ data:
     cache-manager.name=memory
   config.properties: |
     coordinator=false
+    optimizer.dictionary-aggregation=true
     http-server.http.port=8080
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
-    query.max-memory=6GB
-    query.max-memory-per-node=2GB
-    # Overlap scan work at the existing CPU/memory budget: 4x the expected
-    # one-CPU defaults (2 threads / 4 leaf drivers). Keep task.concurrency default.
-    task.max-worker-threads=8
-    task.min-drivers=16
+    query.max-memory=${TRINO_QUERY_MEMORY}
+    query.max-memory-per-node=${TRINO_WORKER_QUERY_MEMORY}
+    # Worker parallelism follows the rendering profile; task.concurrency stays default.
+    task.max-worker-threads=${TRINO_WORKER_THREADS}
+    task.min-drivers=${TRINO_WORKER_MIN_DRIVERS}
     shutdown.grace-period=10s
     catalog.management=dynamic
     # Both targets load the same managers; catalog fs.cache.enabled gates use.
@@ -178,7 +205,7 @@ data:
     bundles:
       trino:
         service: provisioner
-        resource: /bundles/trino
+        resource: /bundles/trino/pool-test
         persist: true
         polling:
           min_delay_seconds: 2
@@ -263,7 +290,7 @@ spec:
             - { name: tls, mountPath: /etc/trino/tls, readOnly: true }
             - { name: data, mountPath: /data/trino }
         - name: duckgres-trino-opa
-          image: openpolicyagent/opa:0.70.0-static
+          image: openpolicyagent/opa@sha256:5679cbbedd1908063b7a68e8af28e662dce4ae3e069b4b5459531b141c6b6ff0
           args: ["run", "--server", "--addr=0.0.0.0:8181", "--config-file=/etc/opa/config.yaml", "/etc/opa/bootstrap"]
           ports: [{ name: opa, containerPort: 8181 }]
           readinessProbe: { httpGet: { path: "/health?bundles=false", port: opa }, initialDelaySeconds: 5, periodSeconds: 5 }
@@ -319,11 +346,9 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 5
           resources:
-            requests: { cpu: "1", memory: 4Gi }
-            # Three replicas provide the same aggregate 3-CPU/12Gi execution
-            # budget as the frozen-perf Duckgres worker. Keep requests equal
-            # to limits so node contention cannot change the comparison.
-            limits: { cpu: "1", memory: 4Gi }
+            requests: { cpu: "${TRINO_WORKER_CPU}", memory: "${TRINO_WORKER_MEMORY}" }
+            # Requests equal limits for the selected three-worker profile.
+            limits: { cpu: "${TRINO_WORKER_CPU}", memory: "${TRINO_WORKER_MEMORY}" }
           volumeMounts:
             - { name: config, mountPath: /etc/trino/node.properties, subPath: node.properties }
             - { name: config, mountPath: /etc/trino/jvm.config, subPath: jvm.config }

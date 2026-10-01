@@ -53,9 +53,9 @@ type trinoPoolTenantBinding struct {
 // so publishing it would bind a principal that can never authenticate.
 func trinoPoolTenantBindingFor(org configstore.TrinoEnabledOrg) trinoPoolTenantBinding {
 	principals := map[string]bool{}
-	// The bare database name is the org's root login. It is always present:
-	// ListTrinoEnabledOrgs only returns orgs that have one.
-	if root := strings.TrimSpace(org.TrinoPrincipal()); root != "" {
+	// The bare database name is the org's root login, projected only while
+	// root has a hash -- the same condition BuildTrinoAuthFiles applies.
+	if root := strings.TrimSpace(org.TrinoPrincipal()); root != "" && org.RootPasswordHash != "" {
 		principals[root] = true
 	}
 	for _, user := range org.Users {

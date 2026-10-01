@@ -5,7 +5,7 @@ export function TrinoCellPicker() {
   const cells = useTrinoCells();
   const [params, setParams] = useSearchParams();
   const entries = cells.data?.cells ?? [];
-  const selected = params.get("cell") ?? (entries.some((cell) => cell.id === "legacy") ? "legacy" : "");
+  const selected = params.get("cell") ?? "";
   if (!entries.length) return null;
   return (
     <select

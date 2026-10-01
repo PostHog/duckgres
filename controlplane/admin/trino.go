@@ -48,10 +48,8 @@ type TrinoOrgStore interface {
 type TrinoCell struct {
 	ID string `json:"id"`
 	// StoredID separates persisted ownership from the API identity. Empty uses ID.
-	StoredID       string `json:"-"`
-	CoordinatorURL string `json:"coordinator_url"`
-	TLSServerName  string `json:"-"`
-	ClientURL      string `json:"-"`
+	StoredID  string `json:"-"`
+	ClientURL string `json:"-"`
 }
 
 func (c TrinoCell) storedID() string {
@@ -72,6 +70,23 @@ type TrinoConnection struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
 	Username string `json:"username"`
+}
+
+// ServiceCredentialConnection preserves the cell's authoritative endpoint and
+// uses a bare grant only when that endpoint supplies the tenant qualification.
+func (c TrinoCell) ServiceCredentialConnection(principal, credentialID string) *TrinoConnection {
+	connection := c.connectionFor(principal)
+	if connection == nil {
+		return nil
+	}
+	clientURL := c.ClientURL
+	_, perOrgHost, _ := ResolveTrinoClientURL(clientURL, principal)
+	if perOrgHost {
+		connection.Username = credentialID
+	} else {
+		connection.Username = principal + configstore.TrinoPrincipalSeparator + credentialID
+	}
+	return connection
 }
 
 // TrinoOrgStatus is one org's Trino provisioning state, joined with what
@@ -135,9 +150,6 @@ func (c TrinoCell) connectionFor(principal string) *TrinoConnection {
 	}
 
 	clientURL := c.ClientURL
-	if clientURL == "" {
-		clientURL = c.CoordinatorURL
-	}
 	clientURL, perOrgHost, ok := ResolveTrinoClientURL(clientURL, principal)
 	if !ok {
 		return nil
@@ -156,9 +168,6 @@ func (c TrinoCell) connectionFor(principal string) *TrinoConnection {
 	}
 
 	host := parsedClientURL.Hostname()
-	if c.ClientURL == "" && c.TLSServerName != "" {
-		host = c.TLSServerName
-	}
 
 	username := principal
 	if perOrgHost {
@@ -299,6 +308,9 @@ func registerTrinoAPI(r *gin.RouterGroup, api *TrinoAPI) {
 		registerTrinoFleetAPI(r, api)
 		return
 	}
+	r.GET("/trino/instances", api.handleRecoveryInstances)
+	r.GET("/trino/instances/:id/recovery", api.handleRecoveryPreview)
+	r.POST("/trino/instances/:id/recovery", api.handleRequestRecovery)
 	r.GET("/trino/status", api.handleStatus)
 	r.GET("/trino/queries", api.handleQueries)
 	r.GET("/trino/queries/:id", api.handleQueryDetail)
@@ -324,7 +336,7 @@ func (a *TrinoAPI) index() (principalIndex, error) {
 	if a.filterCell {
 		idx.rows = nil
 		for _, row := range rows {
-			if row.CellID == a.cell.storedID() || (row.CellID == "" && a.cell.ID == "legacy") {
+			if row.CellID == a.cell.storedID() {
 				idx.rows = append(idx.rows, row)
 			}
 		}
@@ -720,7 +732,10 @@ func (a *TrinoAPI) writeOrgDetail(c *gin.Context, orgID string, row *configstore
 	status.FailedAt = row.FailedAt
 	status.Tier = row.Tier
 	status.Cell = a.cell.publicID(row.TrinoCellID)
-	if available && status.State == string(configstore.ManagedWarehouseStateReady) && row.TrinoCellID != "" && row.TrinoCellID == a.cell.storedID() {
+	// The advertised username is root (per-org host) or the bare principal,
+	// and both authenticate with root's hash: an org without an enabled root
+	// has neither, so it advertises no connection rather than a dead login.
+	if available && status.State == string(configstore.ManagedWarehouseStateReady) && row.TrinoCellID != "" && row.TrinoCellID == a.cell.storedID() && enabled.RootPasswordHash != "" {
 		status.Connection = a.cell.connectionFor(status.Principal)
 	}
 

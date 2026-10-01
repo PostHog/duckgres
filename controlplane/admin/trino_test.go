@@ -120,7 +120,7 @@ func twoOrgTrinoStore() *fakeTrinoOrgStore {
 
 func testTrinoAPI(t *testing.T, coord *fakeTrinoCoordinator, store *fakeTrinoOrgStore) *TrinoAPI {
 	t.Helper()
-	api := NewTrinoAPI(TrinoCell{ID: "cell-test", CoordinatorURL: "https://coordinator.invalid"}, coord, store, nil)
+	api := NewTrinoAPI(TrinoCell{ID: "cell-test"}, coord, store, nil)
 	if api == nil {
 		t.Fatal("NewTrinoAPI returned nil for a fully-wired cell")
 	}
@@ -571,10 +571,8 @@ func TestReadyOrgDetailReturnsTenantClientConnection(t *testing.T) {
 	}
 	api := NewTrinoAPI(
 		TrinoCell{
-			ID:             "cell-test",
-			CoordinatorURL: "https://coordinator.invalid:8443",
-			TLSServerName:  "coordinator.example.com",
-			ClientURL:      "https://trino.example.com:443",
+			ID:        "cell-test",
+			ClientURL: "https://trino.example.com:443",
 		},
 		&fakeTrinoCoordinator{},
 		store,
@@ -610,12 +608,12 @@ func TestReadyOrgDetailReturnsTenantClientConnection(t *testing.T) {
 // Trino qualifies that login with the org the host names.
 func TestReadyOrgDetailAdvertisesPerOrgClientHost(t *testing.T) {
 	store := &fakeTrinoOrgStore{
-		orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "tenant-a", CellID: "cell-test", State: configstore.ManagedWarehouseStateReady}},
+		orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "tenant-a", CellID: "cell-test", RootPasswordHash: "hash", State: configstore.ManagedWarehouseStateReady}},
 		rows: map[string]*configstore.ManagedWarehouseTrino{
 			"org-a": {OrgID: "org-a", Enabled: true, TrinoCellID: "cell-test", State: configstore.ManagedWarehouseStateReady},
 		},
 	}
-	api := NewTrinoAPI(TrinoCell{ID: "cell-test", CoordinatorURL: "https://coordinator.invalid", ClientURL: "https://{database_name}.dw.example.com"}, &fakeTrinoCoordinator{}, store, nil)
+	api := NewTrinoAPI(TrinoCell{ID: "cell-test", ClientURL: "https://{database_name}.dw.example.com"}, &fakeTrinoCoordinator{}, store, nil)
 	r := trinoTestRouter(api, RoleViewer)
 
 	code, body := doTrinoJSON(t, r, http.MethodGet, "/api/v1/orgs/org-a/trino", "")
@@ -625,6 +623,33 @@ func TestReadyOrgDetailAdvertisesPerOrgClientHost(t *testing.T) {
 	connection := body["status"].(map[string]any)["connection"].(map[string]any)
 	if connection["host"] != "tenant-a.dw.example.com" || connection["port"] != float64(443) || connection["username"] != "root" {
 		t.Errorf("connection = %v, want tenant-a.dw.example.com:443 as root", connection)
+	}
+}
+
+// The advertised login (root on a per-org host, the bare principal
+// otherwise) authenticates with root's hash. An org without an enabled root
+// is still ready -- its other logins work -- but must not be handed a
+// username that cannot authenticate.
+func TestReadyOrgWithoutRootAdvertisesNoConnection(t *testing.T) {
+	store := &fakeTrinoOrgStore{
+		orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "tenant-a", CellID: "cell-test", State: configstore.ManagedWarehouseStateReady}},
+		rows: map[string]*configstore.ManagedWarehouseTrino{
+			"org-a": {OrgID: "org-a", Enabled: true, TrinoCellID: "cell-test", State: configstore.ManagedWarehouseStateReady},
+		},
+	}
+	api := NewTrinoAPI(TrinoCell{ID: "cell-test", ClientURL: "https://{database_name}.dw.example.com"}, &fakeTrinoCoordinator{}, store, nil)
+	r := trinoTestRouter(api, RoleViewer)
+
+	code, body := doTrinoJSON(t, r, http.MethodGet, "/api/v1/orgs/org-a/trino", "")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	status := body["status"].(map[string]any)
+	if status["state"] != string(configstore.ManagedWarehouseStateReady) {
+		t.Errorf("state = %v, want ready", status["state"])
+	}
+	if connection, ok := status["connection"]; ok && connection != nil {
+		t.Errorf("connection = %v, want none without an enabled root", connection)
 	}
 }
 
@@ -651,27 +676,27 @@ func TestResolveTrinoClientURL(t *testing.T) {
 }
 
 func TestTrinoCellAPIAliasPreservesStoredOwnership(t *testing.T) {
-	for _, storedID := range []string{"stored-cell", "another-cell", "legacy", ""} {
+	for _, storedID := range []string{"registered:pool-a", "another-cell", "legacy", ""} {
 		t.Run("stored="+storedID, func(t *testing.T) {
 			store := &fakeTrinoOrgStore{
-				orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "db_a", CellID: storedID, State: configstore.ManagedWarehouseStateReady}},
+				orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "db_a", CellID: storedID, RootPasswordHash: "hash", State: configstore.ManagedWarehouseStateReady}},
 				rows: map[string]*configstore.ManagedWarehouseTrino{
 					"org-a": {OrgID: "org-a", Enabled: true, TrinoCellID: storedID, State: configstore.ManagedWarehouseStateReady},
 				},
 			}
-			cell := TrinoCell{ID: "legacy", StoredID: "stored-cell", CoordinatorURL: "https://coordinator.example.test"}
+			cell := TrinoCell{ID: "pool-a", StoredID: "registered:pool-a", ClientURL: "https://gateway.example.test"}
 			api := NewTrinoAPI(cell, &fakeTrinoCoordinator{}, store, nil)
 			router := trinoTestRouter(api, RoleViewer)
 			wantID := storedID
-			if storedID == "stored-cell" {
-				wantID = "legacy"
+			if storedID == "registered:pool-a" {
+				wantID = "pool-a"
 			}
 			for _, endpoint := range []string{"/api/v1/orgs/org-a/trino", "/api/v1/trino/orgs"} {
 				code, body := doTrinoJSON(t, router, http.MethodGet, endpoint, "")
 				if code != http.StatusOK {
 					t.Fatalf("%s: status %d", endpoint, code)
 				}
-				if body["cell"].(map[string]any)["id"] != "legacy" {
+				if body["cell"].(map[string]any)["id"] != "pool-a" {
 					t.Fatalf("API cell identity: %+v", body)
 				}
 				var status map[string]any
@@ -680,14 +705,14 @@ func TestTrinoCellAPIAliasPreservesStoredOwnership(t *testing.T) {
 				} else {
 					status = body["status"].(map[string]any)
 					_, connected := status["connection"]
-					if connected != (storedID == "stored-cell") {
+					if connected != (storedID == "registered:pool-a") {
 						t.Fatalf("connection must match persisted ownership: %+v", status)
 					}
 				}
 				if status["cell"] != wantID {
 					t.Fatalf("status cell = %v, want %s", status["cell"], wantID)
 				}
-				if identity := body["cell"].(map[string]any); len(identity) != 2 || identity["coordinator_url"] != cell.CoordinatorURL {
+				if identity := body["cell"].(map[string]any); len(identity) != 1 || identity["id"] != cell.ID {
 					t.Fatalf("unexpected public identity fields: %+v", identity)
 				}
 			}

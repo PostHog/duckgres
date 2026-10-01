@@ -47,15 +47,12 @@ func TestTrinoHoglakeInventoryIsBatchedPerBackend(t *testing.T) {
 			h := newTestTrinoProvisioner(t, orgs, warehouses)
 			client := &countedHoglakeInventory{hoglakeTestCatalog: &hoglakeTestCatalog{fakeCatalogClient: h.catalog, connector: "hoglake"}}
 			h.provisioner.catalog = client
-			second := &countedHoglakeInventory{hoglakeTestCatalog: &hoglakeTestCatalog{fakeCatalogClient: &fakeCatalogClient{}, connector: "hoglake"}}
-			h.provisioner.additionalCatalogs = []TrinoCatalogClient{second}
 			h.provisioner.hoglakeDucklings = h.provisioner.ducklings
 			for _, org := range orgs {
 				h.ducklings[org.OrgID].ReadyCondition = true
 				h.ducklings[org.OrgID].MetadataStore.Password = ""
 				if existing {
 					h.catalog.existing = append(h.catalog.existing, TrinoCatalogName(org.TrinoPrincipal()))
-					second.existing = append(second.existing, TrinoCatalogName(org.TrinoPrincipal()))
 				}
 			}
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -80,16 +77,15 @@ func TestTrinoHoglakeInventoryIsBatchedPerBackend(t *testing.T) {
 			if !existing {
 				want = 2
 			}
-			if client.reads != want || second.reads != want {
-				t.Fatalf("inventory reads=%d/%d want=%d per backend for %d tenants", client.reads, second.reads, want, len(orgs))
+			if client.reads != want {
+				t.Fatalf("inventory reads=%d want=%d for %d tenants", client.reads, want, len(orgs))
 			}
 			client.reads = 0
-			second.reads = 0
 			if err := h.provisioner.Reconcile(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			if client.reads != 1 || second.reads != 1 {
-				t.Fatalf("steady-state inventory reads=%d/%d want=1 per backend", client.reads, second.reads)
+			if client.reads != 1 {
+				t.Fatalf("steady-state inventory reads=%d want=1", client.reads)
 			}
 		})
 	}
@@ -116,57 +112,5 @@ func TestTrinoHoglakeInventoryFailurePreventsAdmission(t *testing.T) {
 				t.Fatal("created catalog without inventory")
 			}
 		})
-	}
-}
-
-type countedHoglakeTarget struct{ *countedHoglakeInventory }
-
-func (c *countedHoglakeTarget) CatalogStates(context.Context) (map[string]string, error) {
-	states := map[string]string{}
-	for _, name := range c.existing {
-		states[name] = "OPERATIONAL"
-	}
-	return states, nil
-}
-
-func TestTrinoHoglakeTargetInventoryIsBatched(t *testing.T) {
-	h, lifecycle, _ := managedHarness(t)
-	h.store.orgs = nil
-	projected := map[string]bool{}
-	target := &countedHoglakeTarget{&countedHoglakeInventory{hoglakeTestCatalog: &hoglakeTestCatalog{fakeCatalogClient: &fakeCatalogClient{}, connector: "hoglake"}}}
-	for i := 0; i < 12; i++ {
-		id := fmt.Sprintf("tenant-%d", i)
-		org := configstore.TrinoEnabledOrg{OrgID: id, DatabaseName: fmt.Sprintf("tenant_%d", i), Backend: configstore.TrinoBackendHoglake, HoglakeInitialized: true}
-		h.store.orgs = append(h.store.orgs, org)
-		projected[id] = true
-		warehouse := readyWarehouse(id)
-		warehouse.DucklingName = id
-		h.warehouses.rows[id] = warehouse
-		target.existing = append(target.existing, TrinoCatalogName(org.TrinoPrincipal()))
-	}
-	lifecycle.admitted = h.store.orgs
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Error("certification mutated metadata")
-			w.WriteHeader(500)
-			return
-		}
-		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-		if len(parts) == 3 {
-			_ = json.NewEncoder(w).Encode(map[string]any{"name": parts[2], "data_path": "s3://example-bucket/trino/" + parts[2] + "/", "capabilities": []string{"atomic-table-creation-v1"}})
-		} else {
-			_, _ = w.Write([]byte(`{"name":"main"}`))
-		}
-	}))
-	defer srv.Close()
-	h.provisioner.managedHoglake = &TrinoManagedHoglakeConfig{URI: srv.URL, DataPath: "s3://example-bucket/trino/", Namespace: "main"}
-	h.provisioner.managed.Target = func(context.Context, *configstore.TrinoCellFreeze) (*TrinoManagedBackend, error) {
-		return &TrinoManagedBackend{Name: "green", Catalog: target}, nil
-	}
-	if err := h.provisioner.prepareManagedTarget(context.Background(), configstore.TrinoCellLease{}, &configstore.TrinoCellFreeze{Stable: true, TargetBackend: "green"}, tenantSecretProjection{projected: projected}); err != nil {
-		t.Fatal(err)
-	}
-	if target.reads != 1 || lifecycle.certificate == nil {
-		t.Fatalf("reads=%d certificate=%v", target.reads, lifecycle.certificate)
 	}
 }

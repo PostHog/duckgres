@@ -6,9 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"regexp"
 	"sort"
@@ -29,13 +26,12 @@ import (
 
 // --- fakes ---
 
+const TrinoCustomerNamespace = "trino-test"
+
 type fakeTrinoStore struct {
-	mu       sync.Mutex
-	orgs     []configstore.TrinoEnabledOrg
-	states   map[string]configstore.TrinoStateUpdate // captured per-org state writes
-	cells    map[string]string                       // captured cell claims
-	cellErr  error                                   // injectable: fail AssignTrinoCell
-	claimLog []string
+	mu     sync.Mutex
+	orgs   []configstore.TrinoEnabledOrg
+	states map[string]configstore.TrinoStateUpdate // captured per-org state writes
 }
 
 func (s *fakeTrinoStore) ListTrinoEnabledOrgs() ([]configstore.TrinoEnabledOrg, error) {
@@ -54,27 +50,6 @@ func (s *fakeTrinoStore) UpdateTrinoState(orgID string, upd configstore.TrinoSta
 	}
 	s.states[orgID] = upd
 	return nil
-}
-
-func (s *fakeTrinoStore) ClaimTrinoCell(orgID, cellID string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.claimLog = append(s.claimLog, orgID+"->"+cellID)
-	if s.cellErr != nil {
-		return false, s.cellErr
-	}
-	if s.cells == nil {
-		s.cells = make(map[string]string)
-	}
-	s.cells[orgID] = cellID
-	// Mirror the real store: the claim is durable, so the next listing
-	// returns the row already stamped.
-	for i := range s.orgs {
-		if s.orgs[i].OrgID == orgID && s.orgs[i].CellID == "" {
-			s.orgs[i].CellID = cellID
-		}
-	}
-	return true, nil
 }
 
 func (s *fakeTrinoStore) lastState(orgID string) (configstore.TrinoStateUpdate, bool) {
@@ -138,18 +113,6 @@ type fakeCatalogClient struct {
 	dropped   []string
 	listErr   error
 	createErr error
-	nodes     []TrinoNode
-	nodesErr  error
-}
-
-func (c *fakeCatalogClient) ListNodes(context.Context) ([]TrinoNode, error) {
-	if c.nodesErr != nil {
-		return nil, c.nodesErr
-	}
-	if c.nodes != nil {
-		return append([]TrinoNode{}, c.nodes...), nil
-	}
-	return readyTrinoNodes(), nil
 }
 
 func (c *fakeCatalogClient) ListCatalogs(ctx context.Context) ([]string, error) {
@@ -802,15 +765,13 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 			}
 			return h.ducklings[orgID], nil
 		},
-		Kubernetes:              h.kube,
-		SecretReadiness:         &fakeTrinoSecretReadiness{},
-		AuthenticationReadiness: &fakeTrinoAuthenticationReadiness{ready: true},
-		Namespace:               TrinoCustomerNamespace,
-		CellID:                  testCellID,
-		Catalog:                 h.catalog,
-		BundleStore:             h.bundles,
-		BundleBuilder:           h.builder,
-		AWSRegion:               "us-east-1",
+		Kubernetes:    h.kube,
+		Namespace:     TrinoCustomerNamespace,
+		CellID:        testCellID,
+		Catalog:       h.catalog,
+		BundleStore:   h.bundles,
+		BundleBuilder: h.builder,
+		AWSRegion:     "us-east-1",
 	})
 	if err != nil {
 		t.Fatalf("NewTrinoProvisioner: %v", err)
@@ -1398,138 +1359,32 @@ func TestReconcile_StateTransitions(t *testing.T) {
 	}
 }
 
-// --- tenant secret mount lag ---
-
-// trinoSecretMountLagError reproduces what the coordinator actually returned in
-// production when a catalog was created in the same tick that projected the
-// org's key onto the tenant Secret, before the kubelet refreshed the mount.
-func trinoSecretMountLagError(orgID string) error {
-	return &TrinoStatementError{
-		ErrorName: "GENERIC_INTERNAL_ERROR",
-		ErrorType: "INTERNAL_ERROR",
-		Message: "Configuration errors:\n\n1) Error: Invalid configuration property " +
-			trinoDuckLakePasswordFileProperty + ": file does not exist: " +
-			DefaultTrinoTenantSecretMountPath + "/" + orgID +
-			" (for class DuckLakeConfig.connectionPasswordFile)\n\n1 error\n",
-	}
-}
-
-// A freshly onboarded org races the kubelet's Secret refresh. That window is a
-// wait, not a failure: before this the org was stamped Failed with a Trino
-// configuration error in status_message, then flipped to Ready seconds later.
-func TestReconcile_TenantSecretMountLagIsPendingNotFailed(t *testing.T) {
-	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h", Tier: "free"},
-	}
-	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-	h.catalog.createErr = trinoSecretMountLagError("42")
-
-	// The tick itself must report success — otherwise the reconcile loop logs
-	// "Trino provisioner reconcile failed" for a routine onboarding.
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: a mount-lag race must not fail the tick: %v", err)
-	}
-	st, ok := h.store.lastState("42")
-	if !ok {
-		t.Fatalf("no state written for 42")
-	}
-	if st.State != configstore.ManagedWarehouseStateProvisioning {
-		t.Errorf("state = %q, want provisioning (msg=%q)", st.State, st.StatusMessage)
-	}
-	if !strings.Contains(st.StatusMessage, "tenant password file") {
-		t.Errorf("status_message = %q, want the mount-lag reason", st.StatusMessage)
-	}
-	if st.FailedAt != nil && !st.FailedAt.IsZero() {
-		t.Errorf("a mount-lag race must not stamp failed_at, got %v", st.FailedAt)
-	}
-
-	// Next tick, once the kubelet has caught up: converges unaided.
-	h.catalog.createErr = nil
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile (after the mount catches up): %v", err)
-	}
-	if st, _ := h.store.lastState("42"); st.State != configstore.ManagedWarehouseStateReady {
-		t.Errorf("state = %q, want ready once the password file exists", st.State)
-	}
-}
-
-// The classifier decides whether a real failure gets silently downgraded to
-// "still waiting", so it must match ONLY this org's missing password file.
-// Catalog properties carry tenant-influenced values that Trino echoes back in
-// configuration errors, which is exactly how a loose substring match would
-// misfire.
-func TestTenantSecretNotMountedYetOnlyMatchesThisOrgsMissingPasswordFile(t *testing.T) {
-	h := newTestTrinoProvisioner(t, nil, nil)
-
-	cases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"the production mount-lag error", trinoSecretMountLagError("42"), true},
-		{"another org's password file", trinoSecretMountLagError("43"), false},
-		{
-			"a different property missing a different file",
-			&TrinoStatementError{
-				ErrorName: "GENERIC_INTERNAL_ERROR",
-				Message: "Invalid configuration property ducklake.metadata.connection-url: " +
-					"file does not exist: /etc/trino/somewhere-else",
-			},
-			false,
-		},
-		{
-			"tenant data echoed back inside an unrelated config error",
-			&TrinoStatementError{
-				ErrorName: "GENERIC_INTERNAL_ERROR",
-				Message: `Invalid configuration property ducklake.data-path: cannot read bucket ` +
-					`"file does not exist: ` + DefaultTrinoTenantSecretMountPath + `/42"`,
-			},
-			false,
-		},
-		{
-			"the same text as an untyped error",
-			errors.New(trinoSecretMountLagError("42").Error()),
-			false,
-		},
-		{"an unrelated coordinator failure", errors.New("trino: 503 service unavailable"), false},
-		{"no error at all", nil, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := h.provisioner.tenantSecretNotMountedYet(tc.err, "42"); got != tc.want {
-				t.Errorf("tenantSecretNotMountedYet = %v, want %v", got, tc.want)
+func TestReconcile_CatalogPublicationFailureRecoversOnNextTick(t *testing.T) {
+	for _, publicationErr := range []error{errors.New("catalog publisher unavailable"), context.DeadlineExceeded} {
+		t.Run(publicationErr.Error(), func(t *testing.T) {
+			org := configstore.TrinoEnabledOrg{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h", Tier: "free"}
+			h := newTestTrinoProvisioner(t, []configstore.TrinoEnabledOrg{org}, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
+			h.catalog.createErr = publicationErr
+			if err := h.provisioner.Reconcile(context.Background()); !errors.Is(err, publicationErr) {
+				t.Fatalf("publication error was suppressed: %v", err)
+			}
+			state, ok := h.store.lastState("42")
+			if !ok || state.State != configstore.ManagedWarehouseStateFailed || state.FailedAt == nil {
+				t.Fatalf("publication failure was not recorded: %+v", state)
+			}
+			h.catalog.createErr = nil
+			if err := h.provisioner.Reconcile(context.Background()); err != nil {
+				t.Fatalf("next reconcile did not recover: %v", err)
+			}
+			state, _ = h.store.lastState("42")
+			if state.State != configstore.ManagedWarehouseStateReady {
+				t.Fatalf("recovered publication state = %+v", state)
 			}
 		})
 	}
 }
 
 // --- cell awareness ---
-
-func TestReconcile_ClaimsUnassignedOrgsIntoThisCell(t *testing.T) {
-	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", DatabaseName: "db42", CellID: "", RootPasswordHash: "$2a$10$h"},
-	}
-	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	if got := h.store.cells["42"]; got != testCellID {
-		t.Errorf("expected org 42 claimed into %q, got %q", testCellID, got)
-	}
-	if _, ok := h.catalog.created[TrinoCatalogName("db42")]; !ok {
-		t.Errorf("a newly claimed org must be reconciled in the same tick, got %+v", h.catalog.created)
-	}
-
-	// Second tick: the row is already stamped, so no re-claim.
-	before := len(h.store.claimLog)
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile (2): %v", err)
-	}
-	if len(h.store.claimLog) != before {
-		t.Errorf("an already-claimed org must not be re-claimed, log=%v", h.store.claimLog)
-	}
-}
 
 func TestReconcile_IgnoresOrgsOwnedByAnotherCell(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
@@ -1568,14 +1423,13 @@ func TestReconcile_IgnoresOrgsOwnedByAnotherCell(t *testing.T) {
 	}
 }
 
-func TestReconcile_FailedClaimDefersTheOrg(t *testing.T) {
+func TestReconcile_NeverClaimsUnassignedOrgs(t *testing.T) {
 	// A claim that doesn't land means ownership is unrecorded; projecting
 	// the tenant anyway risks two cells serving it.
 	orgs := []configstore.TrinoEnabledOrg{
 		{OrgID: "42", DatabaseName: "db42", CellID: "", RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-	h.store.cellErr = errors.New("db unavailable")
 
 	if err := h.provisioner.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -1593,8 +1447,8 @@ func TestNewTrinoProvisioner_DefaultsCellAndMountPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTrinoProvisioner: %v", err)
 	}
-	if p.CellID() != configstore.DefaultTrinoCellID {
-		t.Errorf("CellID() = %q, want the default %q", p.CellID(), configstore.DefaultTrinoCellID)
+	if p.CellID() != testCellID {
+		t.Errorf("CellID() = %q, want the default %q", p.CellID(), testCellID)
 	}
 	if got := p.tenantPasswordFilePath("42"); got != DefaultTrinoTenantSecretMountPath+"/42" {
 		t.Errorf("tenantPasswordFilePath = %q, want the default mount path", got)
@@ -1612,23 +1466,10 @@ func TestNewTrinoProvisioner_DefaultsCellAndMountPath(t *testing.T) {
 	}
 }
 
-func TestRenderWithClauseDeterministic(t *testing.T) {
-	a := renderWithClause(map[string]string{"k1": "v1", "k2": "v2"})
-	b := renderWithClause(map[string]string{"k2": "v2", "k1": "v1"})
-	if a != b {
-		t.Errorf("renderWithClause not deterministic:\n a=%q\n b=%q", a, b)
-	}
-}
-
-func TestRenderWithClauseEscapesQuotes(t *testing.T) {
-	got := renderWithClause(map[string]string{"k": "v'with'quotes"})
-	if !strings.Contains(got, "v''with''quotes") {
-		t.Errorf("expected SQL-escaped quotes, got %q", got)
-	}
-}
-
 func baseTestOpts() TrinoProvisionerOpts {
 	return TrinoProvisionerOpts{
+		CellID:            testCellID,
+		Namespace:         TrinoCustomerNamespace,
 		Store:             &fakeTrinoStore{},
 		BootstrapSentinel: newFakeSentinel(),
 		Warehouses:        &fakeWarehouseStore{},
@@ -1847,50 +1688,6 @@ func TestReconcile_BundleGrantsObserverNoCatalog(t *testing.T) {
 // an operator (and the admin console's live view) tells reconcile-loop DDL
 // apart from tenant SQL. An untagged hop shows up as an unattributed query
 // from a privileged principal.
-func TestCatalogHTTPClientTagsItsSource(t *testing.T) {
-	var mu sync.Mutex
-	var sources, users []string
-
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		sources = append(sources, r.Header.Get("X-Trino-Source"))
-		users = append(users, r.Header.Get("X-Trino-User"))
-		hop := len(sources)
-		mu.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		if hop == 1 {
-			// First hop hands back a nextUri so the drain loop runs and
-			// the follow-up GET's headers are exercised too.
-			fmt.Fprintf(w, `{"id":"q1","nextUri":%q}`, srv.URL+"/v1/statement/q1/1")
-			return
-		}
-		fmt.Fprint(w, `{"id":"q1","data":[["system"]]}`)
-	}))
-	defer srv.Close()
-
-	c := NewTrinoCatalogHTTPClient(srv.URL, opa.AdminPrincipal, "pw", "")
-	if _, err := c.ListCatalogs(context.Background()); err != nil {
-		t.Fatalf("ListCatalogs: %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(sources) < 2 {
-		t.Fatalf("expected the POST and at least one nextUri GET, got %d requests", len(sources))
-	}
-	for i, got := range sources {
-		if got != TrinoProvisionerSource {
-			t.Errorf("request %d: X-Trino-Source = %q, want %q", i, got, TrinoProvisionerSource)
-		}
-	}
-	for i, got := range users {
-		if got != opa.AdminPrincipal {
-			t.Errorf("request %d: X-Trino-User = %q, want %q", i, got, opa.AdminPrincipal)
-		}
-	}
-}
 
 func TestCatalogFilesystemCacheSetting(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
@@ -1928,21 +1725,23 @@ func TestBuildTrinoAuthFiles_ProjectsEveryOrgUser(t *testing.T) {
 		Users: []configstore.TrinoOrgUser{
 			{Username: "root", PasswordHash: "$2a$10$roothash"},
 			{Username: "analyst", PasswordHash: "$2a$10$analysthash"},
+			{Username: "svc_airbyte", PasswordHash: "$2a$10$servicehash"},
 		},
 	}}
 	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
 
 	wantPW := "acme:$2a$10$roothash\n" +
 		"acme.root:$2a$10$roothash\n" +
-		"acme.analyst:$2a$10$analysthash\n"
+		"acme.analyst:$2a$10$analysthash\n" +
+		"acme.svc_airbyte:$2a$10$servicehash\n"
 	if pw != wantPW {
 		t.Errorf("password.db =\n%q\nwant\n%q", pw, wantPW)
 	}
-	// All three principals share the org group, which the bundle grants the
-	// whole catalog, and all three carry the tier claim that routes them to
+	// All principals share the org group, which the bundle grants the
+	// whole catalog, and all carry the tier claim that routes them to
 	// the org's resource group.
-	wantGrp := "org_acme:acme,acme.analyst,acme.root\n" +
-		"tier_free:acme,acme.analyst,acme.root\n"
+	wantGrp := "org_acme:acme,acme.analyst,acme.root,acme.svc_airbyte\n" +
+		"tier_free:acme,acme.analyst,acme.root,acme.svc_airbyte\n"
 	if grp != wantGrp {
 		t.Errorf("group.db =\n%q\nwant\n%q", grp, wantGrp)
 	}
@@ -2245,44 +2044,6 @@ func TestTenantAdmissionGateIsInertWhenUnset(t *testing.T) {
 	provisioner.applyTenantAdmissionGate(outcomes)
 	if outcomes["org-a"].Pending {
 		t.Fatalf("an outcome changed with no gate installed: %+v", outcomes["org-a"])
-	}
-}
-
-// A pooled cell has no fixed coordinator, so the legacy readiness probe - which
-// asks one coordinator for its node inventory - cannot apply to it. Treating
-// that as a failure marked EVERY pooled warehouse failed on every tick with
-// "no coordinator client for node inventory"; the pool proves the same thing
-// per member, at admission.
-func TestPooledCellSkipsTheFixedCoordinatorReadinessProbe(t *testing.T) {
-	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
-	}
-	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-	h.catalog.nodesErr = ErrTrinoNodeInventoryUnavailable
-
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("reconcile with a pooled catalog client: %v", err)
-	}
-
-	if state := h.store.states["42"]; state.State == configstore.ManagedWarehouseStateFailed {
-		t.Fatalf("a pooled warehouse was marked failed by a probe that does not apply to it: %+v", state)
-	}
-}
-
-// The legacy path is unchanged: a fixed cell whose coordinator cannot answer is
-// still a failure, because there the inventory IS the readiness evidence.
-func TestFixedCellStillFailsWhenTheNodeInventoryIsUnreadable(t *testing.T) {
-	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
-	}
-	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-	h.catalog.nodesErr = errors.New("coordinator unreachable")
-
-	if err := h.provisioner.Reconcile(context.Background()); err == nil {
-		t.Fatal("an unreadable node inventory was accepted on a fixed cell")
-	}
-	if state := h.store.states["42"]; state.State != configstore.ManagedWarehouseStateFailed {
-		t.Fatalf("org state = %+v, want Failed", state)
 	}
 }
 

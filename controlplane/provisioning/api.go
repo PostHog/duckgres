@@ -164,9 +164,9 @@ func RegisterAPIWithTrinoAdmission(r *gin.RouterGroup, store Store, tenantStore 
 	// backend job (dagster) mints a per-credential grant — its own
 	// duckgres_service_grants row, never a duckgres_org_users row — and
 	// connects with (credential_id, secret). Every mint creates a fresh grant;
-	// principal is audit metadata only. Refresh ALWAYS rotates the explicitly
-	// named grant. Plaintext is returned only here; the store persists only
-	// the bcrypt hash.
+	// principal is audit metadata only. Refresh rotates the named grant by
+	// default; explicit non-rotating renewal preserves live HTTP sessions.
+	// The store persists only the bcrypt hash.
 	r.POST("/orgs/:id/service-credentials", func(c *gin.Context) {
 		h.issueServiceCredential(c, tenantStore)
 	})
@@ -189,10 +189,11 @@ func RegisterDiscoveryAPI(r *gin.RouterGroup, store Store) {
 }
 
 type handler struct {
-	store                 Store
-	trinoAdmission        func(string) error
-	trinoDefaultCell      string
-	trinoBackendValidator func(configstore.TrinoBackend) error
+	store                         Store
+	trinoAdmission                func(string) error
+	trinoDefaultCell              string
+	trinoBackendValidator         func(configstore.TrinoBackend) error
+	trinoServiceCredentialConnect func(string, string) *TrinoServiceCredentialConnect
 	// bucketSuffix is the env suffix (e.g. "mw-prod-us") used to compute the
 	// CP-owned s3bucket name; empty disables CP naming. See
 	// configstore.DucklingBucketName.
@@ -512,7 +513,7 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		if !h.admitTrino(c, orgID) {
 			return
 		}
-		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier, Backend: req.Trino.Backend, DefaultCellID: h.trinoDefaultCell}
+		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier, Backend: req.Trino.Backend, NewClientBackend: h.newClientTrinoBackend(), DefaultCellID: h.trinoDefaultCell}
 	}
 
 	// One transaction wraps warehouse + root user + optional Trino opt-in.
@@ -638,24 +639,6 @@ func (h *handler) enableTrino(c *gin.Context) {
 		return
 	}
 
-	// Preflight: the org's `root` login is the tenant's Trino principal —
-	// ListTrinoEnabledOrgs inner-joins on it, so an org without one is
-	// dropped from every projection and the reconcile loop never reports
-	// why. Orgs provisioned before the root-user convention are exactly
-	// this shape. Reject here so the caller learns immediately instead of
-	// watching the org sit at Pending forever; POST /orgs/:id/reset-password
-	// creates the missing login on a Ready warehouse.
-	if _, err := h.store.GetOrgUser(orgID, "root"); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": "org has no root user, so it cannot be projected into a Trino cell; POST /orgs/" + orgID + "/reset-password to create one",
-			})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
 	backend, ok := h.resolveTrinoBackend(c, orgID, req.Backend)
 	if !ok {
 		return
@@ -665,7 +648,7 @@ func (h *handler) enableTrino(c *gin.Context) {
 	if !h.admitTrino(c, orgID) {
 		return
 	}
-	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier, Backend: req.Backend, DefaultCellID: h.trinoDefaultCell}); err != nil {
+	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier, Backend: req.Backend, NewClientBackend: h.newClientTrinoBackend(), DefaultCellID: h.trinoDefaultCell}); err != nil {
 		if errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) || errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return

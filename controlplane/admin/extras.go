@@ -26,7 +26,7 @@ type Extras struct {
 	ClusterClient kubernetes.Interface
 	// Trino backs the Trino cell views (/trino/*, /orgs/:id/trino). nil
 	// whenever the deployment has no Trino cell — which is every deployment
-	// that leaves DUCKGRES_TRINO_COORDINATOR_URL unset — and the routes are
+	// that leaves DUCKGRES_TRINO_CELLS_FILE unset — and the routes are
 	// then simply absent rather than present-and-broken.
 	Trino *TrinoAPI
 }
