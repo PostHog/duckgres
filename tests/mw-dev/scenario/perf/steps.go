@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -510,14 +511,17 @@ func (e *Executor) trinoConnection(spec stepSpec) (trinodriver.ConnectionConfig,
 		status.Cell.ID == "" || status.Status.Cell != status.Cell.ID {
 		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q is incomplete; run wait_trino_ready before perf_queries", spec.OrgID))
 	}
-	if status.Cell.CoordinatorURL == "" {
-		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q has no coordinator URL", spec.OrgID))
+	// The cell's advertised client endpoint, the same one tenants are told to
+	// dial. Pooled cells have no fixed coordinator to connect to directly.
+	connection := status.Status.Connection
+	if connection == nil || connection.Host == "" || connection.Port <= 0 {
+		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q has no advertised client connection (status.connection)", spec.OrgID))
 	}
 	if status.Status.Principal == "" || status.Status.Catalog == "" {
 		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q has no principal or catalog", spec.OrgID))
 	}
 	return trinodriver.ConnectionConfig{
-		ServerURL:          status.Cell.CoordinatorURL,
+		ServerURL:          "https://" + net.JoinHostPort(connection.Host, strconv.Itoa(connection.Port)),
 		CatalogStoreCellID: e.trinoCatalogStoreCellID,
 		HoglakeCatalog:     spec.TrinoHoglakeCatalog,
 		Username:           status.Status.Principal,

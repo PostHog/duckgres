@@ -111,9 +111,10 @@ cell or its observer credentials.
 A `perf_queries` step targeting Trino consumes that stored readiness state. It
 uses `status.principal` as the Trino username (not `root`), `status.catalog` as
 the catalog, the provision response's root password, and schema `posthog` by
-default. The coordinator URL comes from `cell.coordinator_url`. Isolated cells
-must mount their per-run CA and set `trino_ca_cert_file`; the driver requires
-verified HTTPS and never disables certificate verification.
+default. The server URL is `https://<host>:<port>` from `status.connection`,
+the cell's advertised client endpoint (the Gateway for a pooled cell). Isolated
+cells must mount their per-run CA and set `trino_ca_cert_file`; the driver
+requires verified HTTPS and never disables certificate verification.
 
 Optional perf-step settings are:
 

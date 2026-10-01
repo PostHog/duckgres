@@ -75,8 +75,7 @@ type TrinoStatus struct {
 }
 
 type TrinoCell struct {
-	ID             string `json:"id"`
-	CoordinatorURL string `json:"coordinator_url,omitempty"`
+	ID string `json:"id"`
 }
 
 type TrinoOrgStatus struct {
@@ -90,8 +89,16 @@ type TrinoOrgStatus struct {
 	StatusMessage    string     `json:"status_message,omitempty"`
 	ReadyAt          *time.Time `json:"ready_at,omitempty"`
 	FailedAt         *time.Time `json:"failed_at,omitempty"`
-	RunningQueries   int        `json:"running_queries"`
-	QueuedQueries    int        `json:"queued_queries"`
+	// Connection is the cell's advertised client endpoint. The admin API
+	// includes it only once the org is ready on a reachable cell.
+	Connection     *TrinoConnection `json:"connection,omitempty"`
+	RunningQueries int              `json:"running_queries"`
+	QueuedQueries  int              `json:"queued_queries"`
+}
+
+type TrinoConnection struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
 }
 
 type ConnectionDetails struct {
