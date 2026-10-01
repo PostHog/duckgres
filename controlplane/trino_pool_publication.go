@@ -1162,7 +1162,9 @@ func (o *trinoPoolOperator) acknowledge(
 	if trinopool.Phase(instance.Phase) != trinopool.PhaseServing && trinopool.Phase(instance.Phase) != trinopool.PhaseAdmitted {
 		return trinoPoolAcknowledgement{}, fmt.Errorf("member %s is %s", instance.InstanceID, instance.Phase)
 	}
-	acknowledgement, err := o.acknowledgement(ctx, instance.EndpointURL, basis.Projection, basis.CatalogRevision)
+	projection := basis.Projection
+	projection.ServiceAuthRevision = o.expectationFor(instance).ServiceAuthRevision
+	acknowledgement, err := o.acknowledgement(ctx, instance.EndpointURL, projection, basis.CatalogRevision)
 	if err != nil {
 		return trinoPoolAcknowledgement{}, err
 	}

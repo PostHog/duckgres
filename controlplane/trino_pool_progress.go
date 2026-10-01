@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -345,6 +346,12 @@ func (o *trinoPoolOperator) validateCandidate(ctx context.Context, instance conf
 			"pool", o.config.PublicID, "instance", instance.InstanceID, "reason", err)
 		return false, nil
 	}
+	if !slices.Contains(validation.Checks, trinoPoolCheckAuthRevision) {
+		slog.Info("Trino pool candidate has not acknowledged the expected authentication state.",
+			"pool", o.config.PublicID, "instance", instance.InstanceID,
+			"unacknowledged", validation.Unacknowledged)
+		return false, nil
+	}
 	// The registered boot identity is what the Gateway will compare the receipt
 	// against. If the coordinator restarted since registration, this member's
 	// incarnation is gone: admitting it is impossible, and waiting for it is
@@ -644,6 +651,16 @@ func (o *trinoPoolOperator) expectationFor(instance configstore.TrinoPoolInstanc
 	// it is required to be running.
 	if blueprint, err := trinopool.ParseBlueprint([]byte(instance.BlueprintSnapshot)); err == nil {
 		expectation.Image = blueprint.Image
+		for _, container := range blueprint.Coordinator.PodTemplate.Spec.Containers {
+			if container.Name != blueprint.IdentityBinding.CoordinatorContainerName {
+				continue
+			}
+			for _, env := range container.Env {
+				if env.Name == "TRINO_SERVICE_CREDENTIAL_ENDPOINT" && env.Value != "" {
+					expectation.ServiceAuthRevision = trinoServiceAuthRevision(env.Value, o.config.PoolID)
+				}
+			}
+		}
 	}
 	return expectation
 }

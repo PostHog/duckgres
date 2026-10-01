@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/trinogateway"
 	"github.com/posthog/duckgres/controlplane/trinopool"
 	corev1 "k8s.io/api/core/v1"
@@ -284,5 +285,30 @@ func TestTrinoUnreadableServingBlueprintDoesNotBlockOtherInstances(t *testing.T)
 				}
 			})
 		}
+	}
+}
+
+func TestTrinoServiceAuthenticationExpectationUsesInstanceSnapshot(t *testing.T) {
+	h := newOperatorHarness(t)
+	const endpoint = "https://auth.example.com/auth/trino/service-credentials"
+	b := h.operator.config.Blueprint
+	b.Coordinator.PodTemplate.Spec.Containers[0].Env = append(b.Coordinator.PodTemplate.Spec.Containers[0].Env, corev1.EnvVar{Name: "TRINO_SERVICE_CREDENTIAL_ENDPOINT", Value: endpoint})
+	raw, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := configstore.TrinoPoolInstance{BlueprintSnapshot: string(raw)}
+	b.Coordinator.PodTemplate.Spec.Containers[0].Env = nil
+	got := h.operator.expectationFor(instance)
+	if got.ServiceAuthRevision != trinoServiceAuthRevision(endpoint, h.operator.config.PoolID) {
+		t.Fatal("expectation did not bind the instance endpoint and stored pool ID")
+	}
+	raw, err = json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = h.operator.expectationFor(configstore.TrinoPoolInstance{BlueprintSnapshot: string(raw)})
+	if got.ServiceAuthRevision != "" {
+		t.Fatal("disabled instance acquired a service-auth requirement")
 	}
 }

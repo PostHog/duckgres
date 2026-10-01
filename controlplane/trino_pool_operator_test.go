@@ -819,7 +819,7 @@ func newOperatorHarness(t *testing.T) *operatorHarness {
 				return trinoPoolValidation{
 					NodeID: "node-1", ProcessID: "process-1", CoordinatorID: "abcde",
 					AppliedRevision: 42, AuthRevision: "auth", ReadyWorkers: 4,
-					Checks: []string{trinoPoolCheckImage}, CertificateHash: "hash",
+					Checks: []string{trinoPoolCheckImage, trinoPoolCheckWorkers, trinoPoolCheckCatalogRevision, trinoPoolCheckAuthRevision}, CertificateHash: "hash",
 				}, nil
 			},
 			identity:     func(context.Context, string) (string, error) { return "process-1", nil },
@@ -1602,7 +1602,7 @@ func TestFailedCandidateIsCleanedUpAndReleasesItsSlot(t *testing.T) {
 		return trinoPoolValidation{
 			NodeID: "node-1", ProcessID: "process-restarted", CoordinatorID: "abcde",
 			AppliedRevision: 42, AuthRevision: "auth", ReadyWorkers: 4,
-			Checks: []string{trinoPoolCheckImage}, CertificateHash: "hash",
+			Checks: []string{trinoPoolCheckImage, trinoPoolCheckWorkers, trinoPoolCheckCatalogRevision, trinoPoolCheckAuthRevision}, CertificateHash: "hash",
 		}, nil
 	}
 	harness.tick(t, 1)
@@ -3717,4 +3717,27 @@ func (f *fakePoolGateway) GetDrainCandidates(context.Context, string, string, st
 }
 func (f *fakePoolGateway) ReconcileQueries(context.Context, string, string, trinogateway.ReconcileQueriesRequest) (trinogateway.ReconcileQueriesResult, error) {
 	return trinogateway.ReconcileQueriesResult{}, nil
+}
+
+func TestTrinoCandidateWaitsForAuthenticationAcknowledgement(t *testing.T) {
+	h := newOperatorHarness(t)
+	validate := h.operator.validate
+	acknowledged := false
+	h.operator.validate = func(ctx context.Context, endpoint string, observed trinoPoolObservation, expected trinoPoolExpectation) (trinoPoolValidation, error) {
+		v, err := validate(ctx, endpoint, observed, expected)
+		if !acknowledged {
+			v.Checks = []string{trinoPoolCheckImage, trinoPoolCheckWorkers, trinoPoolCheckCatalogRevision}
+		}
+		return v, err
+	}
+	h.tick(t, 12)
+	instance := h.store.instances[h.store.order[0]]
+	if instance.Phase != string(trinopool.PhasePreparing) || instance.ValidationReceipt != "{}" {
+		t.Fatalf("unacknowledged candidate advanced to %s", instance.Phase)
+	}
+	acknowledged = true
+	h.tick(t, 20)
+	if instance.Phase != string(trinopool.PhaseServing) {
+		t.Fatalf("acknowledged candidate stuck in %s", instance.Phase)
+	}
 }
