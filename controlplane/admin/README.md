@@ -186,6 +186,26 @@ Prometheus response and retains only the `status`, `reason`, or `source` labels 
 the corresponding chart. Unknown metrics and windows return 400; unknown orgs
 return 404 with `code: "managed_warehouse_not_found"` before Prometheus is called.
 
+#### Trino monitoring (`monitoring_trino.go`)
+
+The PostHog backend reads `GET /api/v1/orgs/:id/monitoring/trino/snapshot` for
+organizations whose customers query through Trino. Auth and scoping follow the
+rules above: internal secret only, and the org is fixed by the path.
+
+The snapshot reports the org's Trino lifecycle state (`not_enabled`, `pending`,
+`provisioning`, `ready`, `failed`), its tier's concurrency and queue limits,
+in-flight totals, and at most 200 in-flight queries, longest-running first.
+`available` is false when the coordinator or the org index cannot be read; the
+totals are then zero and must not be shown as an idle warehouse. `in_flight`
+counts every non-terminal query. `running` counts every in-flight query past
+the queue, which is what the concurrency limit counts, so
+`in_flight = running + queued`. `blocked` is the subset of `running` whose
+drivers are all blocked. Query text has literals replaced with `?` and comments
+removed (`trino_sql_mask.go`), and becomes a fixed placeholder when it cannot
+be lexed. The snapshot intentionally omits cell ids, Trino principals,
+resource-group and tier names, status messages, driver counts, error codes, and
+connection details.
+
 ### Trino cell views (`trino.go` + `trino_client.go`)
 
 The **Trino cell → Instance recovery** panel lets admins select a shared-pool
