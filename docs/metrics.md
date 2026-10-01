@@ -470,6 +470,32 @@ the current NetworkPolicy. These new lifecycle/logging assertions are covered
 by operator tests; a real blocked-drain deployment remains a separate validation
 step. No network permissions or live deployment behavior change in this work.
 
+## Per-org Trino query metrics
+
+The Trino usage collector exports these metrics while it holds the leader
+lease. They back the product monitoring series route
+(`GET /api/v1/orgs/:id/monitoring/trino/series`).
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `duckgres_trino_org_queries` | `org`, `state` | Queries in flight at the last successful coordinator poll. `state` is `queued`, `running`, `blocked`, or `other`, and the four values partition the in-flight set. |
+| `duckgres_trino_org_query_total` | `org`, `status`, `error_type` | Finished queries observed. `status` is `success` or `error`. `error_type` is `none`, `user`, `internal`, `insufficient_resources`, `external`, or `unknown`. |
+| `duckgres_trino_org_query_duration_seconds` | `org` | Elapsed time of finished queries. |
+| `duckgres_trino_org_query_queued_seconds` | `org` | Time finished queries spent queued. |
+| `duckgres_trino_org_query_physical_input_bytes_total` | `org` | Physical input bytes read by finished queries. |
+| `duckgres_trino_org_query_cpu_seconds_total` | `org` | CPU seconds used by finished queries. |
+
+One collector runs per Trino cell and writes the gauge only for the orgs
+assigned to its cell. The gauge is removed when a poll fails and when the
+collector stops, so a coordinator outage appears as a gap rather than a frozen
+value. During a leader handover two pods can export the gauge briefly; queries
+must take the maximum across pods, not the sum.
+
+The counters and histograms are best-effort. The coordinator keeps finished
+queries only briefly, so a very busy cell can drop some between polls, and a
+new leader can count a bounded overlap twice because the dedupe set is held in
+memory. They describe operational activity and must not be used for billing.
+
 ## Admission metric migration
 
 The pre-canonical admission family is retired. Existing TSDB history remains,
