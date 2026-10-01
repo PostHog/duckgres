@@ -188,8 +188,8 @@ return 404 with `code: "managed_warehouse_not_found"` before Prometheus is calle
 
 #### Trino monitoring (`monitoring_trino.go`)
 
-The PostHog backend reads `GET /api/v1/orgs/:id/monitoring/trino/snapshot` for
-organizations whose customers query through Trino. Auth and scoping follow the
+The PostHog backend reads `GET /api/v1/orgs/:id/monitoring/trino/snapshot` and
+`/monitoring/trino/series` for organizations whose customers query through Trino. Auth and scoping follow the
 rules above: internal secret only, and the org is fixed by the path.
 
 The snapshot reports the org's Trino lifecycle state (`not_enabled`, `pending`,
@@ -205,6 +205,15 @@ removed (`trino_sql_mask.go`), and becomes a fixed placeholder when it cannot
 be lexed. The snapshot intentionally omits cell ids, Trino principals,
 resource-group and tier names, status messages, driver counts, error codes, and
 connection details.
+
+The series endpoint accepts only `queries_in_flight`, `query_rate`,
+`error_ratio`, `duration_p50`, `duration_p95`, `queue_time_p95`,
+`scanned_bytes_rate`, `cpu_seconds_rate`, and `storage_bytes`, over the same
+windows as the DuckDB series endpoint. Every query carries an exact `org` label
+selector, and only the `state`, `status`, and `error_type` labels are returned.
+Unknown metrics and windows return 400 and unknown orgs return 404 with
+`code: "managed_warehouse_not_found"`, both before Prometheus is called. The
+metrics are defined in `docs/metrics.md`, "Per-org Trino query metrics".
 
 ### Trino cell views (`trino.go` + `trino_client.go`)
 

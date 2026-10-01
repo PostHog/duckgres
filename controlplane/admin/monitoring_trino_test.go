@@ -261,3 +261,80 @@ func TestTrinoInFlightStatePartitionsActiveQueries(t *testing.T) {
 		}
 	}
 }
+
+func TestTrinoMonitoringMetricAllowListAlwaysRequiresOrgSelector(t *testing.T) {
+	for metric, spec := range trinoMonitoringMetrics {
+		if !strings.Contains(spec.PromQL, "$ORG") {
+			t.Errorf("Trino monitoring metric %q does not require an org selector: %s", metric, spec.PromQL)
+		}
+	}
+}
+
+func TestTrinoMonitoringSeriesIsAllowListedOrgScopedAndNormalized(t *testing.T) {
+	var upstreamQuery string
+	prom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamQuery = r.URL.Query().Get("query")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"org":"org-a","state":"running","pod":"must-not-leak"},"values":[[1723456800,"3"],[1723456815,"4"]]}]}}`))
+	}))
+	defer prom.Close()
+	r := trinoMonitoringRouter(&fakeMonitoringStore{snapshot: monitoringTestSnapshot("org-a")}, nil, NewMetricsProxy(prom.URL), "internal-secret")
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/orgs/org-a/monitoring/trino/series?metric=queries_in_flight&window=6h", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(upstreamQuery, `duckgres_trino_org_queries{org="org-a"}`) {
+		t.Fatalf("upstream PromQL is not fixed to org-a's Trino gauge: %s", upstreamQuery)
+	}
+	var got monitoringSeriesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.SchemaVersion != 1 || got.OrgID != "org-a" || got.Metric != "queries_in_flight" || got.Unit != "queries" {
+		t.Fatalf("series identity = %+v", got)
+	}
+	if len(got.Series) != 1 || len(got.Series[0].Points) != 2 || got.Series[0].Points[1].Value != 4 {
+		t.Fatalf("series shape = %+v", got.Series)
+	}
+	if len(got.Series[0].Labels) != 1 || got.Series[0].Labels["state"] != "running" {
+		t.Fatalf("labels = %v, want only state=running", got.Series[0].Labels)
+	}
+}
+
+func TestTrinoMonitoringSeriesRejectsBadRequestsBeforePrometheus(t *testing.T) {
+	var calls int
+	prom := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	defer prom.Close()
+	r := trinoMonitoringRouter(&fakeMonitoringStore{snapshot: monitoringTestSnapshot("org-a")}, nil, NewMetricsProxy(prom.URL), "internal-secret")
+
+	for path, want := range map[string]int{
+		// DuckDB-worker metrics are not part of the Trino contract.
+		"/api/v1/orgs/org-a/monitoring/trino/series?metric=sessions_active&window=1h": http.StatusBadRequest,
+		"/api/v1/orgs/org-a/monitoring/trino/series?metric=acquire_p95&window=1h":     http.StatusBadRequest,
+		"/api/v1/orgs/org-a/monitoring/trino/series?metric=query_rate&window=2h":      http.StatusBadRequest,
+		"/api/v1/orgs/org-b/monitoring/trino/series?metric=query_rate&window=1h":      http.StatusNotFound,
+	} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != want {
+			t.Errorf("GET %s status = %d, want %d: %s", path, rec.Code, want, rec.Body.String())
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("Prometheus called %d times for rejected requests, want 0", calls)
+	}
+}
+
+func TestTrinoMonitoringSeriesReportsUnconfiguredMetrics(t *testing.T) {
+	r := trinoMonitoringRouter(&fakeMonitoringStore{snapshot: monitoringTestSnapshot("org-a")}, nil, NewMetricsProxy(""), "internal-secret")
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/orgs/org-a/monitoring/trino/series?metric=query_rate&window=1h", nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: %s", rec.Code, rec.Body.String())
+	}
+}

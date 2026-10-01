@@ -51,6 +51,48 @@ func TrinoInFlightState(q TrinoQuery) (state string, ok bool) {
 	}
 }
 
+// trinoMonitoringMetrics is the allow-list behind the Trino series route.
+// Every template carries $ORG, so no series can be read without an exact org
+// selector. The in-flight gauge takes the maximum across pods: the collector
+// runs under a leader lease, and during a handover two pods can export it.
+var trinoMonitoringMetrics = map[string]monitoringMetricSpec{
+	"queries_in_flight": {
+		PromQL: `max by (state) (duckgres_trino_org_queries$ORG)`, Unit: "queries",
+		AllowedLabels: labelSet("state"),
+	},
+	"query_rate": {
+		PromQL: `sum by (status, error_type) (rate(duckgres_trino_org_query_total$ORG[$WIN]))`, Unit: "queries_per_second",
+		AllowedLabels: labelSet("status", "error_type"),
+	},
+	"error_ratio": {
+		PromQL: `(sum(rate(duckgres_trino_org_query_total$ORGERR[$WIN])) or vector(0)) / clamp_min((sum(rate(duckgres_trino_org_query_total$ORG[$WIN])) or vector(0)), 1e-9)`,
+		Unit:   "ratio", AllowedLabels: labelSet(),
+	},
+	"duration_p50": {
+		PromQL: `histogram_quantile(0.50, sum by (le) (rate(duckgres_trino_org_query_duration_seconds_bucket$ORG[$WIN])))`, Unit: "seconds",
+		AllowedLabels: labelSet(),
+	},
+	"duration_p95": {
+		PromQL: `histogram_quantile(0.95, sum by (le) (rate(duckgres_trino_org_query_duration_seconds_bucket$ORG[$WIN])))`, Unit: "seconds",
+		AllowedLabels: labelSet(),
+	},
+	"queue_time_p95": {
+		PromQL: `histogram_quantile(0.95, sum by (le) (rate(duckgres_trino_org_query_queued_seconds_bucket$ORG[$WIN])))`, Unit: "seconds",
+		AllowedLabels: labelSet(),
+	},
+	"scanned_bytes_rate": {
+		PromQL: `(sum(rate(duckgres_trino_org_query_physical_input_bytes_total$ORG[$WIN])) or vector(0))`, Unit: "bytes_per_second",
+		AllowedLabels: labelSet(),
+	},
+	"cpu_seconds_rate": {
+		PromQL: `(sum(rate(duckgres_trino_org_query_cpu_seconds_total$ORG[$WIN])) or vector(0))`, Unit: "cpu_seconds_per_second",
+		AllowedLabels: labelSet(),
+	},
+	"storage_bytes": {
+		PromQL: `max(duckgres_org_storage_tracked_bytes$ORG)`, Unit: "bytes", AllowedLabels: labelSet(),
+	},
+}
+
 type trinoMonitoringStore interface {
 	Snapshot() *configstore.Snapshot
 }
@@ -122,6 +164,7 @@ func registerTrinoMonitoringAPI(r *gin.RouterGroup, store trinoMonitoringStore, 
 	h := &trinoMonitoringHandler{store: store, trino: trino, metrics: metrics}
 	group := r.Group("/orgs/:id/monitoring/trino", requireInternalSecret())
 	group.GET("/snapshot", h.snapshot)
+	group.GET("/series", h.series)
 }
 
 // orgCell returns the cell API that owns orgID's Trino assignment, with the
@@ -269,6 +312,35 @@ func (h *trinoMonitoringHandler) snapshot(c *gin.Context) {
 			Blocked:            q.State == trinoStateRunning && q.FullyBlocked,
 		})
 	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *trinoMonitoringHandler) series(c *gin.Context) {
+	metric := c.Query("metric")
+	spec, ok := trinoMonitoringMetrics[metric]
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unknown monitoring metric"})
+		return
+	}
+	window, ok := monitoringWindows[c.DefaultQuery("window", "24h")]
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported monitoring window"})
+		return
+	}
+	if !h.warehouseExists(c) {
+		return
+	}
+	if h.metrics == nil || h.metrics.promURL == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "metrics not configured"})
+		return
+	}
+
+	response, err := h.metrics.queryMonitoringRange(c, c.Param("id"), metric, spec, window)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "metrics unavailable"})
+		return
+	}
+	response.SchemaVersion = trinoMonitoringSchemaVersion
 	c.JSON(http.StatusOK, response)
 }
 
