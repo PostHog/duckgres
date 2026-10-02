@@ -842,6 +842,10 @@ func isTrinoPoolCommittedPublication(err error) bool {
 // commit. Reusing an identity would resolve the previous attempt's recorded
 // outcome and leave this intent unapplied.
 func (o *trinoPoolOperator) openBarrier(ctx context.Context, binding trinoPoolTenantBinding) error {
+	basis, published, err := o.tenantBarrierBasis(ctx, binding)
+	if err != nil || !published {
+		return err
+	}
 	poolState, err := o.gateway.GetPool(ctx, o.config.RoutingGroup)
 	if err != nil {
 		return fmt.Errorf("read pool state for %s: %w", o.config.PublicID, err)
@@ -867,7 +871,7 @@ func (o *trinoPoolOperator) openBarrier(ctx context.Context, binding trinoPoolTe
 		o.config.PoolID, binding.Tenant, publicationID, target); err != nil {
 		return o.dropAuthority(fmt.Errorf("record publication intent for %s: %w", binding.Tenant, err))
 	}
-	o.rememberBarrierBasis(publicationID)
+	o.rememberBarrierBasis(publicationID, basis)
 	opened, err := o.issueOpenPublication(ctx, binding, target, publicationID, poolState.MembershipGeneration)
 	if err != nil {
 		return err
@@ -922,12 +926,19 @@ func (o *trinoPoolOperator) stepLiveBarrier(
 		}
 		// Recorded but absent on the Gateway: the open never landed. Re-issuing
 		// it under the SAME identity is the resolution, not a second barrier.
+		basis, published, err := o.tenantBarrierBasis(ctx, binding)
+		if err != nil {
+			return err
+		}
+		if !published {
+			return o.releaseBarrier(ctx, publication, "the tenant's catalog has not been published")
+		}
 		current, err = o.issueOpenPublication(ctx, binding, publication.TargetRevision,
 			publication.PublicationID, poolState.MembershipGeneration)
 		if err != nil {
 			return err
 		}
-		o.rememberBarrierBasis(publication.PublicationID)
+		o.rememberBarrierBasis(publication.PublicationID, basis)
 		return nil
 	}
 
@@ -1174,16 +1185,29 @@ func (o *trinoPoolOperator) acknowledge(
 	return acknowledgement, nil
 }
 
-// rememberBarrierBasis captures the configuration an attempt is admitting
-// against. There is at most one live attempt, so this holds one entry.
-func (o *trinoPoolOperator) rememberBarrierBasis(publicationID string) {
+func (o *trinoPoolOperator) tenantBarrierBasis(ctx context.Context, binding trinoPoolTenantBinding) (trinoPoolBarrierBasis, bool, error) {
+	if o.catalogPublicationRevision == nil {
+		return trinoPoolBarrierBasis{}, false, fmt.Errorf("pool %s cannot verify tenant catalog publication", o.config.PublicID)
+	}
+	revision, present, err := o.catalogPublicationRevision(ctx, binding.Catalog)
+	if err != nil {
+		return trinoPoolBarrierBasis{}, false, err
+	}
+	if !present {
+		return trinoPoolBarrierBasis{}, false, nil
+	}
+	return trinoPoolBarrierBasis{
+		Projection:      o.expectedProjection(),
+		CatalogRevision: max(revision, o.publishedCatalogRevision()),
+	}, true, nil
+}
+
+// There is at most one live attempt, so this holds one entry.
+func (o *trinoPoolOperator) rememberBarrierBasis(publicationID string, basis trinoPoolBarrierBasis) {
 	if o.barrierBasis == nil {
 		o.barrierBasis = map[string]trinoPoolBarrierBasis{}
 	}
-	o.barrierBasis[publicationID] = trinoPoolBarrierBasis{
-		Projection:      o.expectedProjection(),
-		CatalogRevision: o.publishedCatalogRevision(),
-	}
+	o.barrierBasis[publicationID] = basis
 }
 
 func (o *trinoPoolOperator) barrierBasisFor(publicationID string) (trinoPoolBarrierBasis, bool) {

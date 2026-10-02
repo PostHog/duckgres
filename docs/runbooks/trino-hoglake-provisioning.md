@@ -78,10 +78,22 @@ single-file mount contract and configure Trino to load those files. If readiness
 reports a provider observation failure, check that provider's mount and the
 control plane's pod-exec access; changing tenant passwords will not repair it.
 
-Readiness also requires the existing authentication and cell gates. It verifies
-metadata and connector availability, but does not perform S3 writes. The smoke
-test below provides that verification. The administrative OPA grant permits
-connector inventory; it does not grant tenant data writes.
+Before publishing a new Trino catalog, the control plane assumes the tenant's
+storage role and verifies a small object write, read, and delete inside that
+tenant's configured Hoglake prefix. An unavailable role or denied storage
+operation keeps provisioning pending; the normal reconciliation retries it.
+The probe never uses the control plane's own S3 permissions as a fallback.
+It uses the reserved `.duckgres-readiness/` child prefix, with a five-second
+attempt deadline and an independent three-second cleanup deadline. Retries
+reuse a process-specific object key, including after an uncertain write.
+Existing catalogs do not repeat this initialization probe.
+
+Readiness also requires the existing authentication and cell gates. Tenant
+admission waits for a published catalog-store snapshot containing that tenant's
+catalog, then waits for the serving members to acknowledge that revision.
+The smoke test below still verifies the complete Trino query path. The
+administrative OPA grant permits connector inventory; it does not grant tenant
+data writes.
 
 Hoglake warehouse deprovisioning, organization deletion, and warehouse replacement
 are blocked, including for disabled Trino clients. These operations must wait for
@@ -106,10 +118,10 @@ or ownership mismatches explicitly; do not drop catalogs to force a switch.
    Apply their infrastructure and verify the service can maintain the reserved
    S3 prefix.
 3. Apply tenant-role policies granting each tenant access only to its own
-   Duckling-name child prefix. The Trino pod role must be allowed to assume that
-   role. Custom roles outside the managed composition require equivalent grants.
+   Duckling-name child prefix. Both the control-plane role and the Trino pod role must be allowed to assume
+   that role. Custom roles outside the managed composition require equivalent grants.
 4. Allow the control plane and Trino cells to reach the Hoglake REST service, and
-   allow Trino and Hoglake to reach the required storage services.
+   allow the control plane, Trino, and Hoglake to reach the required storage services.
 5. Verify healthy control plane and shared-pool admission. The pool controller
    creates its own validation tenant; no static canary credentials are required.
 6. Enable the managed configuration, create a dedicated pilot tenant, select its

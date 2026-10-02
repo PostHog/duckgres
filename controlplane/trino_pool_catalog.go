@@ -157,6 +157,26 @@ func (w *trinoPoolCatalogWriter) PublishedRevision(ctx context.Context) (int64, 
 	return state.Revision, nil
 }
 
+// CatalogPublicationRevision reads inclusion and revision in one database snapshot,
+// so admission cannot certify a revision that predates this tenant's catalog.
+func (w *trinoPoolCatalogWriter) CatalogPublicationRevision(ctx context.Context, catalog string) (int64, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, trinocatalog.DefaultTimeout)
+	defer cancel()
+	var revision int64
+	err := w.db.QueryRowContext(ctx, `
+		SELECT writer.revision
+		FROM trino_catalog_writer_state AS writer
+		JOIN trino_catalogs AS catalog ON catalog.cell_id = writer.cell_id
+		WHERE writer.cell_id = $1 AND catalog.catalog_name = $2`, w.cellID, catalog).Scan(&revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("read tenant catalog publication: %w", err)
+	}
+	return revision, true, nil
+}
+
 // checkpoint records a revision on the pool row under the CURRENT authority.
 func (w *trinoPoolCatalogWriter) checkpoint(ctx context.Context, revision int64) error {
 	lease, held := w.authority()

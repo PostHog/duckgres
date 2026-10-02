@@ -246,6 +246,7 @@ func buildTrinoPoolOperators(
 			// itself, so a checkpoint that failed after a committed catalog is
 			// recovered rather than waiting for a mutation that will never come.
 			operator.catalogWatermark = writer.PublishedRevision
+			operator.catalogPublicationRevision = writer.CatalogPublicationRevision
 			operator.installWriter = func(ctx context.Context, lease configstore.TrinoPoolLease) error {
 				held := lease
 				authority.Store(&held)

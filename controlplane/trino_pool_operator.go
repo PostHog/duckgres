@@ -162,6 +162,9 @@ type trinoPoolOperator struct {
 	// publishes through a coordinator, where the store is not duckgres-side and
 	// this question has no local answer.
 	catalogWatermark func(ctx context.Context) (int64, error)
+	// catalogPublicationRevision checks catalog presence and its store revision
+	// together; revision zero may contain catalogs imported before the writer.
+	catalogPublicationRevision func(ctx context.Context, catalog string) (int64, bool, error)
 	// bindingCursor and barrierCursor rotate which tenant is worked on. The
 	// driver performs one external step per tick, so a fixed order lets one
 	// permanently failing tenant hold the front of the queue forever - and with

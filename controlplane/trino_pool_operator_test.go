@@ -824,6 +824,9 @@ func newOperatorHarness(t *testing.T) *operatorHarness {
 			},
 			identity:     func(context.Context, string) (string, error) { return "process-1", nil },
 			publications: publications,
+			catalogPublicationRevision: func(context.Context, string) (int64, bool, error) {
+				return store.pool.PublicationRevision, true, nil
+			},
 			// Every member is serving the projection the control plane is
 			// publishing. Tests that need the opposite override this.
 			acknowledgement: func(_ context.Context, _ string, _ trinoPoolProjectionRevisions, _ int64) (trinoPoolAcknowledgement, error) {

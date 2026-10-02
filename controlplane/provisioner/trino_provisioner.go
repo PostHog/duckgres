@@ -345,7 +345,8 @@ type TrinoProvisionerOpts struct {
 	// catalogs. Defaults to false. Trino nodes must configure a cache manager.
 	FilesystemCacheEnabled bool
 
-	ManagedHoglake *TrinoManagedHoglakeConfig
+	ManagedHoglake      *TrinoManagedHoglakeConfig
+	HoglakeStorageCheck TrinoHoglakeStorageCheck
 }
 
 // TrinoBootstrapSentinelStore is the narrow configstore surface the
@@ -434,6 +435,7 @@ type TrinoProvisioner struct {
 	s3MaxConnections       int
 	filesystemCacheEnabled bool
 	managedHoglake         *TrinoManagedHoglakeConfig
+	hoglakeStorageCheck    TrinoHoglakeStorageCheck
 
 	// adminPasswordHash is cached on each Reconcile from the
 	// trino-auth K8s Secret and prepended to password.db on projection.
@@ -550,6 +552,7 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		s3MaxConnections:       maxConns,
 		filesystemCacheEnabled: opts.FilesystemCacheEnabled,
 		managedHoglake:         opts.ManagedHoglake,
+		hoglakeStorageCheck:    opts.HoglakeStorageCheck,
 	}
 	return result, nil
 }
@@ -1611,7 +1614,9 @@ func (p *TrinoProvisioner) reconcileBackendCatalogs(
 			if err == nil {
 				err = p.reconcileHoglakeCatalog(ctx, catalog, name, o.OrgID, tenants.statuses[o.OrgID], existingSet[name], connectors)
 			}
-			if err != nil {
+			if errors.Is(err, ErrHoglakeStorageNotReady) {
+				outcomes[o.OrgID] = catalogOutcome{Pending: true, PendingReason: err.Error()}
+			} else if err != nil {
 				outcomes[o.OrgID] = catalogOutcome{Err: err}
 				errs = append(errs, err)
 			} else {

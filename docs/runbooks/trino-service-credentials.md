@@ -126,4 +126,10 @@ This callback check proves reachability and pool-token acceptance, not tenant-gr
 Deploy the Duckgres readiness endpoint and controller checks before the Trino reporting implementation.
 Then publish the new Trino image through the normal blueprint rollout and verify the disposable service-credential fixture lane with `TRINO_SERVICE_CREDENTIALS_ENABLED=true`.
 Existing `VALIDATING` candidates retain their durable receipt; this change does not rewrite or replay it with a different intent.
-Use the existing guarded recovery procedure separately if such a candidate blocks replacement.
+When a candidate's immutable blueprint no longer matches the desired release or configuration, the controller reads the candidate's Gateway state before retrying admission.
+An already-active member resolves its original admission and follows the normal serving rollout.
+A never-admitted `PREPARING` member must obtain the Gateway's generation-guarded retirement claim before entering `FAILED_PREPARING` cleanup.
+A concurrent admission, unavailable Gateway, or changed identity prevents cleanup; a lost retirement response resumes through read-back.
+The candidate retains capacity until Kubernetes confirms resource absence and Gateway retirement completes.
+To verify recovery, observe the obsolete candidate reach `FAILURE_RETIRED`, then verify that its replacement uses the desired blueprint and reaches `SERVING`.
+Do not rewrite validation receipts or delete candidate pods to bypass this lifecycle.

@@ -160,6 +160,20 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 	if len(storageResolvers) > 0 {
 		storageResolver = storageResolvers[0]
 	}
+	var storageCheck provisioner.TrinoHoglakeStorageCheck
+	if managedHoglake != nil {
+		broker, brokerErr := NewSTSBroker(context.Background(), strings.TrimSpace(os.Getenv(envTrinoAWSRegion)))
+		if brokerErr != nil {
+			return nil, fmt.Errorf("construct Hoglake storage credential broker: %w", brokerErr)
+		}
+		storageCheck = provisioner.NewHoglakeStorageProbe(func(ctx context.Context, roleARN string) (string, string, string, error) {
+			creds, assumeErr := broker.AssumeRole(ctx, roleARN)
+			if assumeErr != nil {
+				return "", "", "", assumeErr
+			}
+			return creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken, nil
+		}).Check
+	}
 	bundleStore := &opa.BundleStore{}
 
 	trinoProv, err := provisioner.NewTrinoProvisioner(provisioner.TrinoProvisionerOpts{
@@ -179,6 +193,7 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 		S3MaxConnections:       envInt(envTrinoS3MaxConnections),
 		FilesystemCacheEnabled: filesystemCacheEnabled,
 		ManagedHoglake:         managedHoglake,
+		HoglakeStorageCheck:    storageCheck,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Trino provisioner: %w", err)
