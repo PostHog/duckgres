@@ -776,6 +776,7 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 	if err != nil {
 		t.Fatalf("NewTrinoProvisioner: %v", err)
 	}
+	p.hoglakeStorageCheck = func(context.Context, string, string, string) error { return nil }
 	h.provisioner = p
 	return h
 }

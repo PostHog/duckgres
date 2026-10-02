@@ -133,6 +133,60 @@ func TestPooledCatalogWriterReportsPublishedConnectors(t *testing.T) {
 	}
 }
 
+func TestPooledCatalogWriterReadsTenantPublicationFromStore(t *testing.T) {
+	lease := configstore.TrinoPoolLease{PoolID: "registered:cell-001", Owner: "cp-test", Epoch: 1}
+	writer := scopedCatalogWriter(t, lease.PoolID, &recordingRevisionStore{}, lease)
+	ctx := context.Background()
+	if _, err := writer.db.ExecContext(ctx, `INSERT INTO trino_catalogs
+		(cell_id, catalog_name, connector_name, catalog_version, properties)
+		VALUES ($1, 'org_imported', 'hoglake', 'imported', '{}')`, writer.cellID); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.ClaimWriter(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertRevision := func(catalog string, want int64, wantPresent bool) {
+		t.Helper()
+		got, present, err := writer.CatalogPublicationRevision(ctx, catalog)
+		if err != nil || got != want || present != wantPresent {
+			t.Fatalf("catalog %s revision = %d, present=%t, err=%v; want %d, present=%t", catalog, got, present, err, want, wantPresent)
+		}
+	}
+	assertRevision("org_imported", 0, true)
+	assertRevision("org_first", 0, false)
+	properties := map[string]string{"connector.name": "hoglake", "hoglake.catalog": "example"}
+	if err := writer.CreateCatalog(ctx, "org_first", properties); err != nil {
+		t.Fatal(err)
+	}
+	assertRevision("org_first", 1, true)
+	assertRevision("org_second", 0, false)
+	if err := writer.CreateCatalog(ctx, "org_second", properties); err != nil {
+		t.Fatal(err)
+	}
+	assertRevision("org_first", 2, true)
+	assertRevision("org_second", 2, true)
+	if err := writer.DropCatalog(ctx, "org_first"); err != nil {
+		t.Fatal(err)
+	}
+	assertRevision("org_first", 0, false)
+
+	otherPartition := *writer
+	otherPartition.cellID = "another-pool-store"
+	if err := otherPartition.ClaimWriter(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := otherPartition.CreateCatalog(ctx, "org_first", properties); err != nil {
+		t.Fatal(err)
+	}
+	assertRevision("org_first", 0, false)
+
+	restarted := &trinoPoolCatalogWriter{db: writer.db, cellID: writer.cellID}
+	got, present, err := restarted.CatalogPublicationRevision(ctx, "org_second")
+	if err != nil || got != 3 || !present {
+		t.Fatalf("fresh writer revision = %d, %v; want the durable revision 3", got, err)
+	}
+}
+
 // The watermark the admission gate certifies against comes from the catalog
 // store, so a checkpoint that failed after a committed catalog is recoverable.
 //

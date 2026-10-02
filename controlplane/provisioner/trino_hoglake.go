@@ -29,6 +29,8 @@ type TrinoManagedHoglakeConfig struct {
 	Namespace string
 }
 
+var ErrHoglakeStorageNotReady = errors.New("hoglake tenant storage is not ready")
+
 var hoglakeIdentifier = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // The trusted, configured service origin is internal infrastructure traffic.
@@ -44,19 +46,26 @@ func (c TrinoManagedHoglakeConfig) Validate() error {
 	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" || (u.Path != "" && u.Path != "/") {
 		return errors.New("managed Hoglake URI must be an HTTP(S) origin without credentials")
 	}
-	p, err := url.Parse(c.DataPath)
-	if err != nil || p.Scheme != "s3" || p.Hostname() == "" || p.Host != p.Hostname() || p.User != nil || p.RawQuery != "" || p.ForceQuery || p.Fragment != "" || p.RawPath != "" || strings.ContainsAny(c.DataPath, "%\t\r\n ") || !strings.HasSuffix(p.Path, "/") || p.Path == "/" || p.Path == "" || strings.Contains(p.Path, "//") {
-		return errors.New("managed Hoglake data path must be a dedicated s3://bucket/prefix/ URI")
-	}
-	for _, part := range strings.Split(strings.Trim(p.Path, "/"), "/") {
-		if part == "" || part == "." || part == ".." {
-			return errors.New("managed Hoglake data path has an invalid segment")
-		}
+	if _, err := parseHoglakeDataPath(c.DataPath); err != nil {
+		return err
 	}
 	if !hoglakeIdentifier.MatchString(c.Namespace) {
 		return errors.New("managed Hoglake namespace must contain only letters, digits, underscores or hyphens")
 	}
 	return nil
+}
+
+func parseHoglakeDataPath(dataPath string) (*url.URL, error) {
+	p, err := url.Parse(dataPath)
+	if err != nil || p.Scheme != "s3" || p.Hostname() == "" || p.Host != p.Hostname() || p.User != nil || p.RawQuery != "" || p.ForceQuery || p.Fragment != "" || p.RawPath != "" || strings.ContainsAny(dataPath, "%\t\r\n ") || !strings.HasSuffix(p.Path, "/") || p.Path == "/" || p.Path == "" || strings.Contains(p.Path, "//") {
+		return nil, errors.New("managed Hoglake data path must be a dedicated s3://bucket/prefix/ URI")
+	}
+	for _, part := range strings.Split(strings.Trim(p.Path, "/"), "/") {
+		if part == "" || part == "." || part == ".." {
+			return nil, errors.New("managed Hoglake data path has an invalid segment")
+		}
+	}
+	return p, nil
 }
 
 func (c TrinoManagedHoglakeConfig) catalogPath(orgID string) (string, error) {
@@ -185,14 +194,14 @@ func isManagedHoglake(org configstore.TrinoEnabledOrg) bool {
 
 // ManagedHoglakeConfigured reports whether this provisioner can provision a
 // managed Hoglake tenant at all: the service configuration AND the storage
-// resolver that supplies the tenant's IAM role and region.
+// resolver that supplies the tenant's IAM role and region, plus the initial storage check.
 //
 // It is exported for the startup wiring's own test. A cell that silently lost
 // either input builds and reconciles perfectly until the first Hoglake tenant
 // is provisioned, and then holds that warehouse pending with an error about
 // configuration nobody changed. Test these dependencies at the pool wiring boundary.
 func (p *TrinoProvisioner) ManagedHoglakeConfigured() bool {
-	return p.managedHoglake != nil && p.hoglakeDucklings != nil
+	return p.managedHoglake != nil && p.hoglakeDucklings != nil && p.hoglakeStorageCheck != nil
 }
 
 func (p *TrinoProvisioner) managedHoglakeProperties(orgID string, d *DucklingStatus) (map[string]string, error) {
@@ -263,6 +272,16 @@ func (p *TrinoProvisioner) reconcileHoglakeCatalog(ctx context.Context, client T
 		return err
 	}
 	if !exists {
+		if p.hoglakeStorageCheck == nil {
+			return errors.New("hoglake storage readiness checker is unavailable")
+		}
+		dataPath, pathErr := p.managedHoglake.catalogPath(warehouse.DucklingName)
+		if pathErr != nil {
+			return pathErr
+		}
+		if err = p.hoglakeStorageCheck(ctx, status.IAMRoleARN, props["s3.region"], dataPath); err != nil {
+			return fmt.Errorf("%w: %s", ErrHoglakeStorageNotReady, err)
+		}
 		if err = client.CreateCatalog(ctx, name, props); err != nil {
 			return err
 		}
