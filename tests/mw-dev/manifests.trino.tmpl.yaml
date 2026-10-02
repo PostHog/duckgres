@@ -108,6 +108,7 @@ data:
     cache-manager.name=memory
   config.properties: |
     coordinator=true
+    optimizer.dictionary-aggregation=true
     node-scheduler.include-coordinator=false
     http-server.http.port=8080
     http-server.https.enabled=true
@@ -174,6 +175,7 @@ data:
     cache-manager.name=memory
   config.properties: |
     coordinator=false
+    optimizer.dictionary-aggregation=true
     http-server.http.port=8080
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
     query.max-memory=${TRINO_QUERY_MEMORY}

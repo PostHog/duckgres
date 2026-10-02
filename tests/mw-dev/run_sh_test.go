@@ -227,7 +227,7 @@ func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 		}
 		data := manifest["data"].(map[string]any)
 		config := data["config.properties"].(string)
-		for _, want := range []string{"query.max-memory=6GB", "query.max-memory-per-node=" + expectedPerNode} {
+		for _, want := range []string{"query.max-memory=6GB", "query.max-memory-per-node=" + expectedPerNode, "optimizer.dictionary-aggregation=true"} {
 			if !strings.Contains(config, want) {
 				t.Errorf("Trino %s config missing %q:\n%s", name, want, config)
 			}

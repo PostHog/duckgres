@@ -839,6 +839,12 @@ The former `posthog_frozen_perf_trino_cached` selection has been removed; use
 `posthog_frozen_perf` instead. Omit the workflow's `duckgres_image` override so the
 control-plane build explicitly persists the expected baseline cache setting.
 
+This experimental branch enables `optimizer.dictionary-aggregation=true` in
+the isolated Trino coordinator and worker configurations. The shared fixture
+template also applies this setting to isolated Trino E2E clusters. Production
+configuration is managed separately. For an off/on benchmark, use the same
+digest-pinned Trino image and the full query corpus in both runs.
+
 For local invocation, set `SCENARIO_NAME=posthog_frozen_perf` and `E2E_SUITE=trino`
 before both `tests/mw-dev/run.sh deploy` and `test-scenario`. Use the existing lane
 credentials, images, and namespace requirements. The harness starts three Trino
