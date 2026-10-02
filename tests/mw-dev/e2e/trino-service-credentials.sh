@@ -5,6 +5,27 @@
 api "$API/api/v1/orgs/$ORG_A" | jq -e --arg cell "registered:pool-test" \
   '.trino.trino_cell_id == $cell and .trino.enabled == true' >/dev/null \
   || fail "service fixture requires its exact persisted cell assignment"
+log "checking service-auth readiness on every serving fixture coordinator"
+svc_observer="$("$KUBECTL" -n "$NS" get secret trino-auth -o json | jq -er '.data["observer-password"] | @base64d')"
+svc_instances="$(api "$API/api/v1/trino/instances?cell=pool-test" | jq -er '[.instances[] | select(.phase == "SERVING") | .instance_id] | select(length > 0) | .[]')"
+for svc_instance in $svc_instances; do
+  svc_callback="$("$KUBECTL" -n "$NS" get deployment "$svc_instance-coordinator" -o json | jq -er \
+    '[.spec.template.spec.containers[].env[]? | select(.name == "TRINO_SERVICE_CREDENTIAL_ENDPOINT") | .value] | unique | select(length == 1) | .[0]')"
+  svc_revision="service-auth-v1:sha256:$(printf 'duckgres-service-credential-v1\n%s\nregistered:pool-test' "$svc_callback" | sha256sum | cut -d ' ' -f 1)"
+  printf 'user = "__duckgres_observer:%s"\n' "$svc_observer" | \
+    curl --config - --connect-timeout 5 --max-time 30 -fsS \
+      -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-Port: 443' \
+      "http://$svc_instance.$NS.svc:8080/v1/catalog/sync" | \
+    jq -e --arg revision "$svc_revision" '
+      .ready == true and .failedCatalogs == 0 and
+      all(.securityRevisions[]; (.error // "") == "" and (.revision | length > 0)) and
+      ([.securityRevisions[] | select(.kind == "password-authenticator" and .name == "duckgres-service-credential")] | length == 1) and
+      any(.securityRevisions[]; .name == "duckgres-service-credential" and .revision == $revision) and
+      any(.securityRevisions[]; .kind == "password-authenticator" and .name == "file")
+    ' >/dev/null || fail "serving coordinator did not acknowledge both authenticators"
+done
+unset svc_observer svc_instances svc_callback svc_revision
+
 log "checking Trino service credentials and non-rotating renewal"
 svc_mint="$(api -X POST -H 'Content-Type: application/json' \
   -d '{"principal":"harness:trino-service-credentials","ttl_seconds":60}' \

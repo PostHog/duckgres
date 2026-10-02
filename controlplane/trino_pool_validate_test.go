@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/posthog/duckgres/controlplane/provisioner"
@@ -506,5 +507,71 @@ func TestValidationClaimsTheAuthRevisionWhenEveryProjectionMatches(t *testing.T)
 	}
 	if !claimed {
 		t.Fatalf("checks = %v, want the auth revision claimed", validation.Checks)
+	}
+}
+
+func TestValidateCandidateServiceAuthentication(t *testing.T) {
+	const endpoint = "https://control.example.com/auth/trino/service-credentials"
+	const cellID = "registered:cell-a"
+	revision := trinoServiceAuthRevision(endpoint, cellID)
+	for _, tc := range []struct {
+		name, reported, componentError                      string
+		missing, duplicate, unexpected, staleFile, wantAuth bool
+	}{
+		{name: "both authenticators", reported: revision, wantAuth: true},
+		{name: "missing component", missing: true},
+		{name: "unreported", componentError: "COMPONENT_DOES_NOT_REPORT"},
+		{name: "callback failed", componentError: "COMPONENT_UNAVAILABLE"},
+		{name: "different pool", reported: trinoServiceAuthRevision(endpoint, "registered:cell-b")},
+		{name: "different endpoint", reported: trinoServiceAuthRevision("https://other.example.com/auth/trino/service-credentials", cellID)},
+		{name: "duplicate component", reported: revision, duplicate: true},
+		{name: "unexpected authenticator", reported: revision, unexpected: true},
+		{name: "stale password file", reported: revision, staleFile: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newFakeCoordinator(t)
+			components := c.sync["securityRevisions"].([]any)
+			if tc.staleFile {
+				components[0].(map[string]any)["revision"] = "stale"
+			}
+			component := map[string]any{"kind": "password-authenticator", "name": "duckgres-service-credential", "revision": tc.reported, "error": tc.componentError}
+			if !tc.missing {
+				components = append(components, component)
+			}
+			if tc.duplicate {
+				components = append(components, component)
+			}
+			c.sync["securityRevisions"] = components
+			expected := trinoPoolExpectation{Image: fakeCoordinatorImage, CatalogRevision: 42,
+				ProjectionDigest: provisioner.TrinoProjectionDigest(fakePolicyRevision, fakePasswordRevision, fakeGroupRevision), ServiceAuthRevision: revision}
+			if tc.unexpected {
+				expected.ServiceAuthRevision = ""
+			}
+			validation, err := c.validateWith(t, trinoPoolObservation{ReadyWorkers: 2, CoordinatorImage: fakeCoordinatorImage, WorkerImage: fakeCoordinatorImage}, expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := slices.Contains(validation.Checks, trinoPoolCheckAuthRevision); got != tc.wantAuth {
+				t.Fatalf("auth-revision=%v, checks=%v", got, validation.Checks)
+			}
+			acknowledgement, err := probeMemberAcknowledgement(context.Background(), c.server.Client(), c.server.URL,
+				func() (string, string) { return "observer", "secret" }, trinoPoolProjectionRevisions{
+					Policy: fakePolicyRevision, Password: fakePasswordRevision, Group: fakeGroupRevision,
+					ServiceAuthRevision: expected.ServiceAuthRevision,
+				}, 42)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if acknowledgement.ProjectionCurrent != tc.wantAuth {
+				t.Fatalf("publication acknowledgement=%v", acknowledgement.ProjectionCurrent)
+			}
+		})
+	}
+}
+
+func TestTrinoServiceAuthRevisionContract(t *testing.T) {
+	got := trinoServiceAuthRevision("https://auth.example.com/auth/trino/service-credentials", "registered:cell-a")
+	if got != "service-auth-v1:sha256:e404f60570334ffe2d55047999bc09477fefa5f13ae77e72b5d3d47d10dce21d" {
+		t.Fatalf("wire contract changed: %s", got)
 	}
 }

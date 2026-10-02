@@ -107,3 +107,23 @@ Before using this opt-in, configure the isolated fixture control plane and candi
 The fixture map uses `registered:pool-test`; its public status label is `pool-test`.
 The lane checks the persisted assignment before minting and does not generate or mount these authentication files.
 The lane cannot prove cross-service behavior against an old Trino image that lacks the authenticator.
+
+## Pool readiness
+
+The coordinator implements `LoadedConfiguration` for the service authenticator.
+It calls `GET /auth/trino/service-credentials` with the same pool bearer token used by credential validation.
+The endpoint returns only the authenticated `cell_id`, uses `Cache-Control: no-store`, and does not mint or validate a tenant grant.
+Its revision is `service-auth-v1:sha256:` followed by the lowercase SHA-256 of UTF-8
+`duckgres-service-credential-v1\n<endpoint>\n<stored-cell-id>`, with no trailing newline.
+Tokens and token hashes are never part of this revision.
+
+Candidate admission and tenant publication compare that proof with the endpoint in the instance's immutable blueprint and its stored pool ID.
+They separately verify the file-password, group, and authorization projection.
+A missing, duplicated, unavailable, unexpected, or mismatched service authenticator cannot satisfy readiness.
+An incomplete authentication acknowledgement keeps a fresh candidate in `PREPARING`, where a later successful probe can advance it.
+This callback check proves reachability and pool-token acceptance, not tenant-grant validity or database availability; retain the service-login, renewal, isolation, and revocation smoke tests.
+
+Deploy the Duckgres readiness endpoint and controller checks before the Trino reporting implementation.
+Then publish the new Trino image through the normal blueprint rollout and verify the disposable service-credential fixture lane with `TRINO_SERVICE_CREDENTIALS_ENABLED=true`.
+Existing `VALIDATING` candidates retain their durable receipt; this change does not rewrite or replay it with a different intent.
+Use the existing guarded recovery procedure separately if such a candidate blocks replacement.

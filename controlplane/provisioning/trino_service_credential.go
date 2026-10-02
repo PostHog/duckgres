@@ -25,7 +25,7 @@ type TrinoServiceAuthCell struct {
 	Tokens []string `json:"tokens"`
 }
 
-// RegisterTrinoServiceCredentialAuth mounts only the credential-check surface.
+// RegisterTrinoServiceCredentialAuth mounts credential validation and callback readiness.
 // Its dedicated token must not be accepted by any provisioning/admin route.
 func RegisterTrinoServiceCredentialAuth(engine *gin.Engine, store TrinoServiceCredentialValidator, cells []TrinoServiceAuthCell) {
 	if len(cells) == 0 {
@@ -41,7 +41,7 @@ func RegisterTrinoServiceCredentialAuth(engine *gin.Engine, store TrinoServiceCr
 			expected = append(expected, cellToken{sha256.Sum256([]byte(token)), cell.CellID})
 		}
 	}
-	engine.POST("/auth/trino/service-credentials", func(c *gin.Context) {
+	authenticate := func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		authorization := c.GetHeader("Authorization")
 		provided := sha256.Sum256([]byte(strings.TrimPrefix(authorization, "Bearer ")))
@@ -55,6 +55,13 @@ func RegisterTrinoServiceCredentialAuth(engine *gin.Engine, store TrinoServiceCr
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			return
 		}
+		c.Set("trinoServiceAuthCell", cellID)
+	}
+	engine.GET("/auth/trino/service-credentials", authenticate, func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"cell_id": c.GetString("trinoServiceAuthCell")})
+	})
+	engine.POST("/auth/trino/service-credentials", authenticate, func(c *gin.Context) {
+		cellID := c.GetString("trinoServiceAuthCell")
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)
 		var input struct {
 			Username string `json:"username"`

@@ -305,6 +305,8 @@ It contains `host`, `port`, `catalog`, `username`, and `http_scheme`, and uses t
 Trino clients renew live grants with `rotate_secret: false` on the refresh endpoint so their gateway query-owner fingerprint remains stable.
 Such responses contain `secret_rotated: false` and omit the secret; default refresh continues to rotate it.
 Persistent user passwords remain available for external clients.
+Pool admission also verifies a bearer-authenticated readiness callback, separately from the replicated password-file revision. The callback is disabled when no service-auth cells are configured.
+
 See [Trino service credentials](docs/runbooks/trino-service-credentials.md) for coordinated rollout, local validation, rotation, and failure recovery.
 
 ## Quick Start

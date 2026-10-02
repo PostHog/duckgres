@@ -103,6 +103,9 @@ type trinoPoolExpectation struct {
 	// from the control plane's durable record rather than from this process's
 	// memory of what it last published.
 	ProjectionDigest string
+	// ServiceAuthRevision binds a successful callback to the intended endpoint and pool.
+	// Empty means the blueprint does not enable service authentication.
+	ServiceAuthRevision string
 	// PasswordRevision and GroupRevision are the fingerprints of the
 	// authentication files this control plane has projected.
 	//
@@ -265,7 +268,7 @@ func validateTrinoPoolCandidate(
 	// replica's own memory says what IT published, which is exactly the thing
 	// in question when replicas disagree.
 	projectionAcknowledged := expected.ProjectionDigest != "" &&
-		reportedProjectionDigest(sync.SecurityRevisions) == expected.ProjectionDigest
+		reportedProjectionDigest(sync.SecurityRevisions, expected.ServiceAuthRevision) == expected.ProjectionDigest
 	if len(acknowledged) > 0 && len(unacknowledged) == 0 && projectionAcknowledged {
 		checks = append(checks, trinoPoolCheckAuthRevision)
 	}
@@ -298,13 +301,23 @@ const (
 // deciding and authenticating with, in the SAME form the control plane names
 // what it published.
 //
+// The callback authenticator proves its endpoint and pool separately; it does
+// not consume the projected password file.
 // It is empty - matching nothing - unless each required component is present
 // exactly once and reported a revision. A second password authenticator reads a
 // file this control plane does not write, so it could authenticate principals
 // outside the projection; two disagreeing answers are not a projection.
-func reportedProjectionDigest(revisions []componentRevision) string {
+func reportedProjectionDigest(revisions []componentRevision, serviceAuthRevision string) string {
 	reported := map[string]string{}
+	serviceAuthSeen := false
 	for _, revision := range revisions {
+		if revision.Kind == trinoPasswordAuthenticator && revision.Name == "duckgres-service-credential" {
+			if serviceAuthSeen || serviceAuthRevision == "" || revision.Error != "" || revision.Revision != serviceAuthRevision {
+				return ""
+			}
+			serviceAuthSeen = true
+			continue
+		}
 		switch revision.Kind {
 		case trinoAccessControlKind, trinoPasswordAuthenticator, trinoGroupProviderComponent:
 		default:
@@ -318,37 +331,14 @@ func reportedProjectionDigest(revisions []componentRevision) string {
 		}
 		reported[revision.Kind] = revision.Revision
 	}
+	if serviceAuthRevision != "" && !serviceAuthSeen {
+		return ""
+	}
 	return provisioner.TrinoProjectionDigest(
 		reported[trinoAccessControlKind],
 		reported[trinoPasswordAuthenticator],
 		reported[trinoGroupProviderComponent],
 	)
-}
-
-// reportsRevision reports whether this kind of component is present AND every
-// instance of it acknowledged exactly this revision.
-//
-// Equality, not ordering: the question is whether the coordinator decides with
-// the data being served, and a coordinator carrying a LATER revision than this
-// replica knows about is equally uncertifiable here.
-//
-// EVERY instance has to match, not merely one. A coordinator configured with a
-// second password authenticator - a file this control plane does not write -
-// can authenticate principals outside the projection, and admitting it on the
-// strength of the one component that agrees would put that file inside the
-// pool's trust boundary without anybody stating it.
-func reportsRevision(revisions []componentRevision, kind, revision string) bool {
-	found := false
-	for _, reported := range revisions {
-		if reported.Kind != kind {
-			continue
-		}
-		if reported.Error != "" || reported.Revision != revision {
-			return false
-		}
-		found = true
-	}
-	return found
 }
 
 // authRevisionFingerprint condenses what the process's security components have
@@ -530,9 +520,10 @@ func probeProcessIdentity(ctx context.Context, client *http.Client, coordinatorU
 // HTTP on OPA's schedule, while the files arrive as a mounted Secret the
 // kubelet refreshes on its own.
 type trinoPoolProjectionRevisions struct {
-	Policy   string
-	Password string
-	Group    string
+	ServiceAuthRevision string
+	Policy              string
+	Password            string
+	Group               string
 }
 
 // probeMemberAcknowledgement asks one serving member what configuration it is
@@ -570,10 +561,10 @@ func probeMemberAcknowledgement(
 		return trinoPoolAcknowledgement{}, fmt.Errorf("%w: applied catalog revision %v is behind the published revision %d",
 			errTrinoPoolCandidateNotReady, revisionText(sync.AppliedRevision), catalogRevision)
 	}
-	current := expected.Policy != "" && expected.Password != "" && expected.Group != "" &&
-		reportsRevision(sync.SecurityRevisions, trinoAccessControlKind, expected.Policy) &&
-		reportsRevision(sync.SecurityRevisions, trinoPasswordAuthenticator, expected.Password) &&
-		reportsRevision(sync.SecurityRevisions, trinoGroupProviderComponent, expected.Group)
+	_, unacknowledged := splitSecurityRevisions(sync.SecurityRevisions)
+	current := expected.Policy != "" && expected.Password != "" && expected.Group != "" && len(unacknowledged) == 0 &&
+		reportedProjectionDigest(sync.SecurityRevisions, expected.ServiceAuthRevision) ==
+			provisioner.TrinoProjectionDigest(expected.Policy, expected.Password, expected.Group)
 	return trinoPoolAcknowledgement{
 		ProcessID:         sync.ProcessID,
 		AppliedRevision:   *sync.AppliedRevision,

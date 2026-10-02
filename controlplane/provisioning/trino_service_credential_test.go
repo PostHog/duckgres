@@ -139,3 +139,51 @@ func TestTrinoServiceCredentialMintAndRefreshTarget(t *testing.T) {
 		t.Fatal("renewal must explicitly retain the same credential and omit secret")
 	}
 }
+
+func TestTrinoServiceCredentialReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		name, token, cell string
+		status            int
+	}{
+		{"current", "current-a", "registered:cell-a", 200},
+		{"overlap", "previous-a", "registered:cell-a", 200},
+		{"other pool", "current-b", "registered:cell-b", 200},
+		{"missing", "", "", 401},
+		{"incorrect", "unknown", "", 401},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			validator := &fakeTrinoServiceCredentialValidator{}
+			r := gin.New()
+			RegisterTrinoServiceCredentialAuth(r, validator, []TrinoServiceAuthCell{
+				{CellID: "registered:cell-a", Tokens: []string{"current-a", "previous-a"}},
+				{CellID: "registered:cell-b", Tokens: []string{"current-b"}},
+			})
+			req := httptest.NewRequest(http.MethodGet, "/auth/trino/service-credentials?cell_id=registered:other", nil)
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != tc.status || validator.calls != 0 {
+				t.Fatalf("status=%d calls=%d", rec.Code, validator.calls)
+			}
+			if rec.Header().Get("Cache-Control") != "no-store" {
+				t.Fatal("readiness must not be cached")
+			}
+			if tc.status == 200 {
+				var got map[string]string
+				if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+					t.Fatal(err)
+				}
+				if len(got) != 1 || got["cell_id"] != tc.cell {
+					t.Fatalf("unexpected readiness: %v", got)
+				}
+			}
+		})
+	}
+	r := gin.New()
+	RegisterTrinoServiceCredentialAuth(r, &fakeTrinoServiceCredentialValidator{}, nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth/trino/service-credentials", nil))
+	if rec.Code != 404 {
+		t.Fatalf("disabled readiness status=%d", rec.Code)
+	}
+}

@@ -4,6 +4,8 @@ package controlplane
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -99,4 +101,11 @@ func (f trinoFleet) serviceCredentialConnect(store interface {
 			Catalog: configstore.TrinoCatalogName(org.DatabaseName), HTTPScheme: "https",
 		}
 	}
+}
+
+// trinoServiceAuthRevision matches the callback proof reported by the Trino
+// authenticator. No token or grant material enters the public fingerprint.
+func trinoServiceAuthRevision(endpoint, cellID string) string {
+	digest := sha256.Sum256([]byte("duckgres-service-credential-v1\n" + endpoint + "\n" + cellID))
+	return "service-auth-v1:sha256:" + hex.EncodeToString(digest[:])
 }
