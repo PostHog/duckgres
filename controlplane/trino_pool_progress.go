@@ -88,7 +88,7 @@ func (o *trinoPoolOperator) progressInstance(ctx context.Context, instance confi
 			return false, err
 		}
 		// Configuration changes cannot repair an immutable candidate snapshot.
-		// VALIDATING can have an unknown admission outcome and must resolve it first.
+		// VALIDATING requires an admission read-back and guarded retirement first.
 		// Cleanup still requires the Gateway's guarded retirement claim before deletion.
 		if superseded {
 			return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing,
@@ -382,6 +382,15 @@ func (o *trinoPoolOperator) validateCandidate(ctx context.Context, instance conf
 // the budgets, the certificate freshness and any open publication barrier, and
 // independently verifies the live process identity.
 func (o *trinoPoolOperator) admitCandidate(ctx context.Context, instance configstore.TrinoPoolInstance) error {
+	superseded, err := o.candidateSuperseded(instance)
+	if err != nil {
+		return err
+	}
+	if superseded {
+		if retired, err := o.retireSupersededCandidate(ctx, instance); retired || err != nil {
+			return err
+		}
+	}
 	validation, err := unmarshalValidationReceipt(instance.ValidationReceipt)
 	if err != nil {
 		return fmt.Errorf("instance %s has an unreadable validation receipt: %w", instance.InstanceID, err)
@@ -465,6 +474,35 @@ func (o *trinoPoolOperator) admitCandidate(ctx context.Context, instance configs
 			"gateway_state":      member.Phase,
 			"gateway_generation": member.Generation,
 		}))
+}
+
+// retireSupersededCandidate requires a Gateway claim before changing the local phase.
+// Its CAS serializes retirement with an admission whose response may be lost.
+func (o *trinoPoolOperator) retireSupersededCandidate(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {
+	member, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID)
+	if err != nil {
+		return false, o.dropAuthority(fmt.Errorf("read superseded candidate %s: %w", instance.InstanceID, err))
+	}
+	if member.Incarnation != instance.GatewayIncarnation || member.PodUID != instance.CoordinatorPodUID || member.BootID != instance.CoordinatorBootID {
+		return false, errors.New("superseded candidate read-back identity changed")
+	}
+	switch member.Phase {
+	case "ACTIVE":
+		return false, nil
+	case "PREPARING":
+		_, err := o.gateway.RetireMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
+			Step:               o.step(instance.InstanceID, "retire"),
+			ExpectedGeneration: member.Generation,
+		})
+		if err != nil {
+			return false, o.dropAuthority(fmt.Errorf("claim retirement of superseded candidate %s: %w", instance.InstanceID, err))
+		}
+	case "RETIRING", "RETIRED":
+		// Read-back resolves a lost retirement response or local checkpoint.
+	default:
+		return false, fmt.Errorf("superseded candidate %s is not a never-admitted member: %s", instance.InstanceID, member.Phase)
+	}
+	return true, o.failCandidate(ctx, instance, trinopool.PhaseValidating, "candidate blueprint was superseded before admission")
 }
 
 // markServing records that the Gateway considers the member eligible. Serving

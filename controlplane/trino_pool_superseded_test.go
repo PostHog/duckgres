@@ -370,3 +370,59 @@ func TestSupersededCandidateRetirementRequiresAuthority(t *testing.T) {
 		}
 	})
 }
+
+func TestSupersededValidatingCandidateRecoversAfterRejection(t *testing.T) {
+	for _, newRelease := range []bool{false, true} {
+		t.Run(fmt.Sprint("new release=", newRelease), func(t *testing.T) {
+			h, instance := supersededCandidateHarness(t)
+			h.tick(t, 1)
+			original := *instance
+			h.gateway.admitErr = trinogateway.ErrNotCertified
+			h.tickTolerant(2)
+			if instance.Phase != string(trinopool.PhaseValidating) {
+				t.Fatal("unchanged rejected candidate must retain its slot")
+			}
+			current := changedCandidateConfig(t, h.operator.config, newRelease)
+			h.operator.resolveConfig = func() (trinoPoolConfig, error) { return current, nil }
+			h.gateway.loseResponse = map[string]bool{"retire": true}
+			h.tickTolerant(1)
+			if h.gateway.members[instance.InstanceID].Phase != "RETIRING" || instance.Phase != string(trinopool.PhaseValidating) || h.kube.deleted[instance.InstanceID] {
+				t.Fatal("lost retirement response must retain the candidate until read-back")
+			}
+			h.gateway.admitErr = nil
+			h.tick(t, 1)
+			if instance.Phase != string(trinopool.PhaseFailedPreparing) || h.kube.deleted[instance.InstanceID] {
+				t.Fatal("superseded rejected candidate did not enter guarded cleanup")
+			}
+			if instance.ValidationReceipt != original.ValidationReceipt || instance.BlueprintSnapshot != original.BlueprintSnapshot || instance.ReleaseID != original.ReleaseID || instance.SpecDigest != original.SpecDigest {
+				t.Fatal("supersession rewrote immutable admission intent")
+			}
+			h.tick(t, 1)
+			if !h.kube.deleted[instance.InstanceID] || !trinopool.Phase(instance.Phase).OccupiesCapacity() || len(h.store.order) != 1 {
+				t.Fatal("candidate capacity released before resource absence")
+			}
+			h.kube.absent = true
+			h.tick(t, 1)
+			if instance.Phase != string(trinopool.PhaseFailureRetired) || h.gateway.members[instance.InstanceID].Phase != "RETIRED" {
+				t.Fatal("candidate cleanup did not finish")
+			}
+			h.gateway.admitErr = nil
+			h.tick(t, 6)
+			replacement := h.store.instances[h.store.order[1]]
+			if replacement.Phase != string(trinopool.PhaseServing) || replacement.ReleaseID != current.Spec.DesiredReleaseID || replacement.SpecDigest != current.Blueprint.SpecDigest(h.operator.identityFor(replacement.InstanceID)) {
+				t.Fatal("replacement did not serve the desired blueprint")
+			}
+		})
+	}
+}
+
+func TestSupersededValidatingCandidatePreservesUnreadableAdmission(t *testing.T) {
+	h, instance := supersededCandidateHarness(t)
+	h.tick(t, 1)
+	h.operator.config = changedCandidateConfig(t, h.operator.config, true)
+	h.operator.gateway = &unreadableCreatingMemberGateway{h.gateway}
+	h.tickTolerant(2)
+	if instance.Phase != string(trinopool.PhaseValidating) || h.kube.deleted[instance.InstanceID] || h.gateway.members[instance.InstanceID].Phase != "PREPARING" {
+		t.Fatal("unreadable admission outcome authorized cleanup")
+	}
+}
