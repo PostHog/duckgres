@@ -817,7 +817,7 @@ func SetupMultiTenant(
 		// emits each terminal query, independent of admin-console traffic.
 		for _, wire := range trinoCells {
 			for _, observer := range wire.Observers {
-				janitorLeader.AttachLeaderLoop(newTrinoUsageCollector(observer, store, store.OrgUsageTeamID).Run)
+				janitorLeader.AttachLeaderLoop(newTrinoUsageCollector(observer, store, store.OrgUsageTeamID).withOrgMetrics(trinoOrgMetrics, wire.Cell.ID).Run)
 			}
 		}
 	}

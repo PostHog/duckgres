@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/admin"
@@ -23,12 +24,27 @@ const (
 type trinoUsageTeamResolver func(orgID, username string) int64
 
 type trinoUsageCollector struct {
+	// mu guards seen and gauged: a new leader term can start before the
+	// previous term's loop has returned, so two loops may overlap.
+	mu          sync.Mutex
 	coordinator admin.TrinoCoordinatorClient
 	orgs        admin.TrinoOrgStore
 	teamID      trinoUsageTeamResolver
 	seen        map[string]time.Time
 	now         func() time.Time
 	interval    time.Duration
+
+	// Per-org Prometheus metrics. nil leaves the collector emitting only
+	// product-analytics events.
+	metrics *trinoOrgMetricSet
+	// cellID is the stored id of the cell this collector observes. One
+	// collector runs per cell, and each may only write the in-flight gauges
+	// of its own cell's orgs: another cell's collector sees none of their
+	// queries and would overwrite the gauges with zero.
+	cellID string
+	// gauged is the set of orgs whose in-flight gauges this collector set
+	// on its last successful poll.
+	gauged map[string]struct{}
 }
 
 func newTrinoUsageCollector(coordinator admin.TrinoCoordinatorClient, orgs admin.TrinoOrgStore, teamID trinoUsageTeamResolver) *trinoUsageCollector {
@@ -42,6 +58,14 @@ func newTrinoUsageCollector(coordinator admin.TrinoCoordinatorClient, orgs admin
 	}
 }
 
+// withOrgMetrics makes the collector export per-org query metrics for the
+// orgs assigned to cellID.
+func (c *trinoUsageCollector) withOrgMetrics(metrics *trinoOrgMetricSet, cellID string) *trinoUsageCollector {
+	c.metrics = metrics
+	c.cellID = cellID
+	return c
+}
+
 // Run is a leader-only loop. A new leader may see recently completed queries
 // after failover; the query_id property lets downstream consumers deduplicate
 // that bounded overlap without ever capturing customer SQL.
@@ -49,6 +73,9 @@ func (c *trinoUsageCollector) Run(ctx context.Context) {
 	if c == nil || c.coordinator == nil || c.orgs == nil {
 		return
 	}
+	// A gauge is a statement about now. Once this process stops polling it
+	// must stop exporting the last value it saw.
+	defer c.clearInFlight()
 	c.collect(ctx)
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
@@ -66,15 +93,19 @@ func (c *trinoUsageCollector) collect(ctx context.Context) {
 	if c == nil || c.coordinator == nil || c.orgs == nil {
 		return
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	orgs, err := c.orgs.ListTrinoEnabledOrgs()
 	if err != nil {
 		slog.Warn("Trino usage collection skipped: list enabled orgs failed", "error", err)
+		c.clearInFlightLocked()
 		return
 	}
 	owners := configstore.NewTrinoPrincipalOwners(orgs)
 	queries, err := c.coordinator.Queries(ctx)
 	if err != nil {
 		slog.Warn("Trino usage collection skipped: list queries failed", "error", err)
+		c.clearInFlightLocked()
 		return
 	}
 	now := c.now()
@@ -83,8 +114,15 @@ func (c *trinoUsageCollector) collect(ctx context.Context) {
 			delete(c.seen, id)
 		}
 	}
+	inFlight := make(map[string]map[string]int)
 	for _, query := range queries {
-		if query.State != "FINISHED" && query.State != "FAILED" {
+		if state, active := admin.TrinoInFlightState(query); active {
+			if owner, ok := owners.Resolve(query.Principal); ok {
+				if inFlight[owner.OrgID] == nil {
+					inFlight[owner.OrgID] = make(map[string]int)
+				}
+				inFlight[owner.OrgID][state]++
+			}
 			continue
 		}
 		if query.QueryID == "" {
@@ -110,8 +148,50 @@ func (c *trinoUsageCollector) collect(ctx context.Context) {
 		} else {
 			analytics.Default().Capture("query_failed", orgID, props)
 		}
+		c.metrics.observeFinished(orgID, query)
 		c.seen[query.QueryID] = now
 	}
+	c.recordInFlight(orgs, inFlight)
+}
+
+func (c *trinoUsageCollector) recordInFlight(orgs []configstore.TrinoEnabledOrg, inFlight map[string]map[string]int) {
+	if c.metrics == nil {
+		return
+	}
+	current := make(map[string]struct{}, len(orgs))
+	for _, org := range orgs {
+		if c.cellID != "" && org.CellID != c.cellID {
+			continue
+		}
+		current[org.OrgID] = struct{}{}
+		c.metrics.setInFlight(org.OrgID, inFlight[org.OrgID])
+	}
+	for orgID := range c.gauged {
+		if _, ok := current[orgID]; !ok {
+			c.metrics.clearInFlight(orgID)
+		}
+	}
+	c.gauged = current
+}
+
+func (c *trinoUsageCollector) clearInFlight() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clearInFlightLocked()
+}
+
+// clearInFlightLocked requires c.mu to be held.
+func (c *trinoUsageCollector) clearInFlightLocked() {
+	if c == nil || c.metrics == nil {
+		return
+	}
+	for orgID := range c.gauged {
+		c.metrics.clearInFlight(orgID)
+	}
+	c.gauged = nil
 }
 
 func trinoUsageProperties(query admin.TrinoQuery, teamID int64) map[string]any {

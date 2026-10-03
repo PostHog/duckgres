@@ -38,6 +38,7 @@ func RegisterExtras(r *gin.RouterGroup, x Extras) {
 	r.GET("/me", meHandler)
 	registerLiveAPI(r, x.Live, x.Fetcher, x.Users)
 	registerMonitoringAPI(r, x.Monitoring, x.Live, x.Fetcher, x.Metrics, x.MonitoringWorkerDefaults)
+	registerTrinoMonitoringAPI(r, x.Monitoring, x.Trino, x.Metrics)
 	if x.ClusterClient != nil {
 		registerClusterAPI(r, x.ClusterClient)
 	}

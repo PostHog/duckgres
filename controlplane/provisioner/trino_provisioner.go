@@ -2439,6 +2439,14 @@ func tierLimits(tier string) resourceGroupSubGroup {
 	}
 }
 
+// TrinoTierLimits returns the concurrency and queue limits a tenant on tier
+// gets from the generated resource groups. An unknown tier gets the free lane,
+// the same fallback the resource-group selector applies.
+func TrinoTierLimits(tier string) (maxRunning, maxQueued int) {
+	limits := tierLimits(normalizeTier(tier))
+	return limits.HardConcurrencyLimit, limits.MaxQueued
+}
+
 // BuildTrinoResourceGroups renders resource-groups.json. Pure function for
 // unit testing.
 //
