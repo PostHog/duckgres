@@ -45,6 +45,12 @@ func (e *Executor) setupHoglake(ctx context.Context, step core.Step) error {
 			return fmt.Errorf("properties representation must be json or variant")
 		}
 		args = append(args, "--properties-representation", representation)
+		if variantSource := stringFromWith(step, "properties_variant_source", ""); variantSource != "" {
+			if representation != "variant" {
+				return fmt.Errorf("properties_variant_source requires the variant representation")
+			}
+			args = append(args, "--properties-variant-source", variantSource)
+		}
 	}
 	// Optional: how long the importer waits for its registered files'
 	// stats to hydrate before failing (the script's default otherwise).
