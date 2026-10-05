@@ -146,6 +146,7 @@ Key CLI flags for control-plane mode:
   - AWS / STS: `--aws-region`
   - Compute-usage billing needs no config: metering is always on for the remote backend and billing PULLS usage over the internal-secret-authed HTTP API (`GET /api/v1/billing/usage` + `POST /api/v1/billing/ack`). See `docs/design/billing-pull-api.md` and "Compute-Usage Billing" below.
   - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `config_resolution.go`.
+  - `DUCKGRES_PROVISIONER_ENABLED=false` (env-only, default on) stops the provisioning controller loop — Duckling CR lifecycle, warehouse state, and the Trino projection writes — while the rest of the wiring (admin Trino views, OPA bundle route) stays registered. It exists for the hand-over to hogtower, which takes over those writes; never run two writers. With it off, also turn off `DUCKGRES_TRINO_POOL_OPERATOR_ENABLED` / `DUCKGRES_TRINO_POOL_CATALOG_WRITER_ENABLED` and unset `DUCKGRES_TRINO_DEFAULT_CELL`.
 
 Key CLI flags for duckdb-service mode:
 - `--duckdb-listen` (e.g., `unix:///...` or `:8816`)
