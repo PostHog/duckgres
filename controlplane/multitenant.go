@@ -226,6 +226,11 @@ func SetupMultiTenant(
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
+	// Before any Trino or provisioning wiring reads its gates: a recorded
+	// hand-over turns duckgres' writers of that state off for this process.
+	if err := applyControlHandover(store.DB()); err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
 	// Identity info-metric for dashboards (org ↔ team ↔ duckling). Reads the
 	// snapshot at scrape time — registered here where the concrete store is
 	// in hand (the interface returned upward deliberately hides Snapshot).
