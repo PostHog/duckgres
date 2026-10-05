@@ -30,7 +30,9 @@ func Catalog() core.Catalog {
 			} else {
 				sql = fmt.Sprintf("SELECT event, COUNT(*) AS event_count FROM %s WHERE %s = 'Chrome' GROUP BY event ORDER BY event_count DESC, event ASC NULLS LAST LIMIT 20", relation, expr)
 			}
-			q := core.Query{QueryID: "properties_" + intent + "_v1__" + rep, IntentID: "properties." + intent + ".v1", Representation: rep, Targets: qt, PGWireSQL: sql}
+			// v2: the fixture became a contiguous multi-day range (about 40x the
+			// v1 single day), so v1 latencies and baselines are not comparable.
+			q := core.Query{QueryID: "properties_" + intent + "_v2__" + rep, IntentID: "properties." + intent + ".v2", Representation: rep, Targets: qt, PGWireSQL: sql}
 			if rep == "variant" {
 				q.SkipReason = "Hoglake does not support the VARIANT representation"
 			}

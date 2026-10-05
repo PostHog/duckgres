@@ -2,6 +2,7 @@ package properties
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/posthog/duckgres/tests/perf/core"
@@ -34,5 +35,15 @@ func TestCachedTrinoJSONHasItsOwnRunLabel(t *testing.T) {
 	}
 	if got, want := core.ProtocolTrinoCached.RunLabel("variant"), "trino (cache+variant)"; got != want {
 		t.Fatalf("RunLabel = %q, want %q", got, want)
+	}
+}
+
+func TestIntentIDsMarkTheMultiDayFixture(t *testing.T) {
+	// The fixture changed size at v2; reusing v1 IDs would divide new latencies
+	// by old fixed baselines on the perf dashboard.
+	for _, q := range Catalog().Queries {
+		if !strings.HasSuffix(q.IntentID, ".v2") || !strings.Contains(q.QueryID, "_v2__") {
+			t.Fatalf("query %s intent %s, want v2 identifiers", q.QueryID, q.IntentID)
+		}
 	}
 }

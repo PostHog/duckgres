@@ -9,14 +9,25 @@ the properties phase; original benchmark artifacts remain available.
 
 ## Select the fixture
 
-Generate an immutable Parquet fixture for a modest full UTC day before enabling
-the comparison. Every representation must contain the same events and property
-semantics. Select a day using source row counts and property sizes; validate its
-runtime before adopting it as the benchmark. Do not use the large earlier
-fixture as the default or assume a timestamp filter will prune mixed-day files.
-The benchmark scans the entire supplied prefix; it does not generate data,
-select dates, or enforce a row-count limit. Keep dates, source locations, and
-fixture-derived statistics in private generation notes, outside this repository.
+Generate an immutable Parquet fixture covering a contiguous range of full UTC
+days before enabling the comparison, sized so the properties queries take
+roughly 10–30 s. Every representation must contain the same events and property
+semantics. The frozen source samples isolated days, so a contiguous range may be
+built from real sampled days whose event times are re-stamped by whole days onto
+consecutive dates; payloads stay unchanged. Store each target day under its own
+subdirectory of the selected prefix, one day per Parquet file, so a future date
+filter prunes whole files. Discovery is recursive on every reader (Duckgres,
+Hoglake and Athena): the selected prefix must contain only the reader-supported
+Parquet files, never a run root that also holds canonical VARIANT copies.
+Validate runtime before adopting a fixture as the benchmark. The benchmark scans
+the entire supplied prefix; it does not generate data, select dates, or enforce
+a row-count limit. Keep dates, source locations, and fixture-derived statistics
+in private generation notes, outside this repository.
+
+Changing the fixture's size is a history break: bump the properties intent IDs
+(`tests/perf/properties/catalog.go`) so dashboards with fixed per-intent
+baselines never divide new latencies by old medians, then refresh those
+baselines from the first run on the new fixture.
 
 ## Prepare and run
 
@@ -24,7 +35,7 @@ fixture-derived statistics in private generation notes, outside this repository.
 # Original and properties benchmarks using the configured fixture:
 just scenario-frozen-perf
 
-# After the replacement single-day fixture has been generated:
+# After a replacement fixture has been generated:
 export DUCKGRES_SCENARIO_PROPERTIES_S3_URI="<generated-parquet-prefix>"
 just scenario-frozen-perf
 ```
