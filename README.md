@@ -77,6 +77,9 @@ Existing Trino clients retain their DuckLake backend. New Trino clients use
 Hoglake automatically; there is no backend chooser or DuckLake fallback for new
 onboarding. Hoglake requires `DUCKGRES_TRINO_MANAGED_HOGLAKE_URI` and a dedicated
 `DUCKGRES_TRINO_HOGLAKE_DATA_PATH`; the namespace defaults to `main`.
+`DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED` (default false) enables the
+Trino filesystem cache for new Hoglake catalogs only. New DuckLake catalogs follow
+`DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED` (default false).
 Disable/re-enable preserves the stored backend. This creates a separate catalog
 and does not migrate DuckLake data. Manual migration is outside this rollout.
 See the [managed Hoglake provisioning runbook](docs/runbooks/trino-hoglake-provisioning.md).

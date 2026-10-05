@@ -51,9 +51,16 @@ const (
 	// pool bound. Empty or unparseable == the provisioner default.
 	envTrinoS3MaxConnections = "DUCKGRES_TRINO_S3_MAX_CONNECTIONS"
 
-	// envTrinoFilesystemCacheEnabled enables caching for newly created catalogs.
-	// Empty defaults to false; Trino nodes also need a configured cache manager.
+	// envTrinoFilesystemCacheEnabled enables caching for newly created DuckLake
+	// catalogs. Empty defaults to false; Trino nodes also need a configured
+	// cache manager.
 	envTrinoFilesystemCacheEnabled = "DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED"
+
+	// envTrinoHoglakeFilesystemCacheEnabled enables caching for newly created
+	// managed Hoglake catalogs only, independent of envTrinoFilesystemCacheEnabled.
+	// Empty defaults to false. Every pool coordinator and worker must load an
+	// Alluxio cache manager before this is enabled.
+	envTrinoHoglakeFilesystemCacheEnabled = "DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED"
 
 	envTrinoManagedHoglakeURI = "DUCKGRES_TRINO_MANAGED_HOGLAKE_URI"
 	envTrinoHoglakeDataPath   = "DUCKGRES_TRINO_HOGLAKE_DATA_PATH"
@@ -141,6 +148,10 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 	if err != nil {
 		return nil, err
 	}
+	hoglakeFilesystemCacheEnabled, err := trinoHoglakeFilesystemCacheEnabled()
+	if err != nil {
+		return nil, err
+	}
 
 	managedHoglake, err := trinoManagedHoglakeConfig()
 	if err != nil {
@@ -177,23 +188,24 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 	bundleStore := &opa.BundleStore{}
 
 	trinoProv, err := provisioner.NewTrinoProvisioner(provisioner.TrinoProvisionerOpts{
-		Store:                  store,
-		BootstrapSentinel:      store,
-		Warehouses:             store,
-		Ducklings:              ducklings,
-		HoglakeDucklings:       storageResolver,
-		Kubernetes:             kc,
-		Namespace:              cell.Namespace,
-		CellID:                 cell.ID,
-		TenantSecretMountPath:  strings.TrimSpace(os.Getenv(envTrinoTenantSecretMountPath)),
-		Catalog:                catalogClient,
-		BundleStore:            bundleStore,
-		BundleBuilder:          opa.NewBuilder(),
-		AWSRegion:              strings.TrimSpace(os.Getenv(envTrinoAWSRegion)),
-		S3MaxConnections:       envInt(envTrinoS3MaxConnections),
-		FilesystemCacheEnabled: filesystemCacheEnabled,
-		ManagedHoglake:         managedHoglake,
-		HoglakeStorageCheck:    storageCheck,
+		Store:                         store,
+		BootstrapSentinel:             store,
+		Warehouses:                    store,
+		Ducklings:                     ducklings,
+		HoglakeDucklings:              storageResolver,
+		Kubernetes:                    kc,
+		Namespace:                     cell.Namespace,
+		CellID:                        cell.ID,
+		TenantSecretMountPath:         strings.TrimSpace(os.Getenv(envTrinoTenantSecretMountPath)),
+		Catalog:                       catalogClient,
+		BundleStore:                   bundleStore,
+		BundleBuilder:                 opa.NewBuilder(),
+		AWSRegion:                     strings.TrimSpace(os.Getenv(envTrinoAWSRegion)),
+		S3MaxConnections:              envInt(envTrinoS3MaxConnections),
+		FilesystemCacheEnabled:        filesystemCacheEnabled,
+		HoglakeFilesystemCacheEnabled: hoglakeFilesystemCacheEnabled,
+		ManagedHoglake:                managedHoglake,
+		HoglakeStorageCheck:           storageCheck,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Trino provisioner: %w", err)
@@ -281,13 +293,25 @@ func envInt(name string) int {
 // trinoFilesystemCacheEnabled rejects invalid settings rather than silently
 // benchmarking a different cache mode than the operator requested.
 func trinoFilesystemCacheEnabled() (bool, error) {
-	value := strings.TrimSpace(os.Getenv(envTrinoFilesystemCacheEnabled))
+	return parseEnvBool(envTrinoFilesystemCacheEnabled)
+}
+
+// trinoHoglakeFilesystemCacheEnabled is the managed Hoglake counterpart of
+// trinoFilesystemCacheEnabled, with the same strict parsing.
+func trinoHoglakeFilesystemCacheEnabled() (bool, error) {
+	return parseEnvBool(envTrinoHoglakeFilesystemCacheEnabled)
+}
+
+// parseEnvBool reads an optional boolean env var. Unset or blank is false;
+// unlike envInt, an unparseable value is an error naming the variable.
+func parseEnvBool(name string) (bool, error) {
+	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
 		return false, nil
 	}
 	enabled, err := strconv.ParseBool(value)
 	if err != nil {
-		return false, fmt.Errorf("%s must be a boolean", envTrinoFilesystemCacheEnabled)
+		return false, fmt.Errorf("%s must be a boolean", name)
 	}
 	return enabled, nil
 }

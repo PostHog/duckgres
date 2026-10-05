@@ -144,6 +144,21 @@ must_fail() { # principal password sql pattern
   printf %s "$out" | grep -Eqi "$4" || fail "query failed for wrong reason: $out"
 }
 
+# BEGIN managed catalog cache assertion
+# run.sh sets DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED=true for this
+# lane. Check the published row that pool coordinators load, not the setting.
+assert_catalog_cache_enabled() { # catalog
+  store_pw="$("$KUBECTL" -n "$NS" get secret duckgres-config-store-credentials -o go-template='{{index .data "password"}}' | base64 -d)"
+  [ -n "$store_pw" ] || fail "config-store credentials are missing"
+  cache="$(printf '%s\n' "SELECT count(*), coalesce(min(properties::jsonb ->> 'fs.cache.enabled'), '') FROM trino_catalogs WHERE cell_id = :'cell' AND catalog_name = :'catalog';" \
+    | PGPASSWORD="$store_pw" psql -h "duckgres-config-store.$NS.svc" -U duckgres -d duckgres \
+      -XAt -F '|' -v ON_ERROR_STOP=1 -v cell="ci-pr-$PR" -v catalog="$1")" \
+    || fail "cannot read catalog $1 from the catalog store"
+  unset store_pw
+  [ "$cache" = '1|true' ] || fail "catalog $1 rows|fs.cache.enabled = '$cache', want one row with true"
+}
+# END managed catalog cache assertion
+
 # BEGIN concurrent bootstrap helpers
 bootstrap_scope() {
   case "$PR" in ''|*[!0-9]*) fail "bootstrap requires a numeric fixture identity" ;; esac
@@ -258,6 +273,9 @@ pw_a="$(provision "$ORG_A" "$DB_A" "$TEAM_A" | jq -r .password)"
 [ -n "$pw_a" ] && [ "$pw_a" != null ] || fail "tenant A provision returned no password"
 wait_warehouse "$ORG_A"
 wait_trino "$ORG_A" "$DB_A" "$CAT_A"
+log "managed Hoglake catalog has fs.cache.enabled=true"
+# The DDL/DML below then proves that the cached catalog serves queries.
+assert_catalog_cache_enabled "$CAT_A"
 
 log "TLS/password auth, discovery, and DDL/DML"
 [ "$(scalar "$DB_A" "$pw_a" 'SELECT 1')" = 1 ] || fail "Trino SELECT 1 failed"

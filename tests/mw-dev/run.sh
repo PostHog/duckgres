@@ -570,7 +570,11 @@ cmd_deploy() {
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-hoglake --timeout=300s
     # Fresh tenants use managed Hoglake admission in every Trino lane.
     # Frozen fixture catalogs are imported separately and keep read-only identity.
-    patch="$(jq -cn --arg uri "http://duckgres-hoglake.$NS.svc:8080" --arg path "$HOGLAKE_DATA_PATH" '{spec:{template:{spec:{containers:[{name:"controlplane",env:[{name:"DUCKGRES_TRINO_MANAGED_HOGLAKE_URI",value:$uri},{name:"DUCKGRES_TRINO_HOGLAKE_DATA_PATH",value:$path},{name:"DUCKGRES_TRINO_HOGLAKE_NAMESPACE",value:"main"}]}]}}}}')"
+    # The per-PR lane caches new Hoglake catalogs; trino.sh asserts it. Frozen
+    # perf leaves the setting unset: its runner requires an uncached tenant catalog.
+    hoglake_cache=true
+    if hoglake_perf_enabled; then hoglake_cache=false; fi
+    patch="$(jq -cn --arg uri "http://duckgres-hoglake.$NS.svc:8080" --arg path "$HOGLAKE_DATA_PATH" --argjson cache "$hoglake_cache" '{spec:{template:{spec:{containers:[{name:"controlplane",env:([{name:"DUCKGRES_TRINO_MANAGED_HOGLAKE_URI",value:$uri},{name:"DUCKGRES_TRINO_HOGLAKE_DATA_PATH",value:$path},{name:"DUCKGRES_TRINO_HOGLAKE_NAMESPACE",value:"main"}] + if $cache then [{name:"DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED",value:"true"}] else [] end)}]}}}}')"
     "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p "$patch"
     "${KUBECTL[@]}" -n "$NS" exec deploy/duckgres-config-store -- \
       psql -U duckgres -d duckgres -v ON_ERROR_STOP=1 -c 'CREATE SCHEMA IF NOT EXISTS gateway_rollout_test' >/dev/null

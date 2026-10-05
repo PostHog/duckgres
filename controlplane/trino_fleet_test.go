@@ -73,6 +73,7 @@ func TestTrinoPoolBootstrapHasNoLegacyDependency(t *testing.T) {
 	}
 	t.Setenv(envTrinoCellsFile, path)
 	t.Setenv(envTrinoFilesystemCacheEnabled, "false")
+	t.Setenv(envTrinoHoglakeFilesystemCacheEnabled, "false")
 	store := &poolObserverWiringStore{fleetBootstrapStore: &fleetBootstrapStore{initialized: map[string]bool{}}}
 	kc := kubefake.NewClientset()
 	fleet, _, err := buildTrinoFleetWiring(store, kc, func(context.Context, string) (*provisioner.DucklingStatus, error) { return nil, nil })
@@ -186,6 +187,7 @@ func (s *fleetBootstrapStore) MarkTrinoClusterBootstrapped(_ context.Context, na
 
 func TestTrinoFleetBootstrapSeparatesBundleTokensAndLegacyPath(t *testing.T) {
 	t.Setenv(envTrinoFilesystemCacheEnabled, "false")
+	t.Setenv(envTrinoHoglakeFilesystemCacheEnabled, "false")
 	store := &poolObserverWiringStore{fleetBootstrapStore: &fleetBootstrapStore{initialized: map[string]bool{}}}
 	kc := kubefake.NewClientset()
 	registered, err := parseTrinoCellRegistry([]byte(testTrinoPoolRegistryJSON))

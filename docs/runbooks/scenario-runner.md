@@ -11,9 +11,14 @@ Trino Hoglake tables, and Athena external tables over the same immutable S3 file
 `posthog_frozen_perf` runs `trino` with `fs.cache.enabled=false` and
 `trino_cached` with it set to `true`, using two clusters in one throwaway namespace.
 Dataset setup runs once; all five targets execute sequentially into one result set.
-The pinned Hoglake connector currently ignores that flag; enabling actual cache
-support is deferred. Both modes run the full seven-query corpus, with one warmup
-and four measured iterations.
+By default the scenario runs the newest PostHog/trino master build, whose Hoglake
+connector honors that flag (PostHog/trino#43). An older `trino_image` override
+may ignore it, so its `trino_cached` results measure an uncached cluster; see
+`tests/perf/README.md` for the affected result history. The runner requires the
+managed tenant catalog to stay uncached, so leave
+`DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED` unset (false) for this
+scenario. Both modes run the full seven-query corpus, with one warmup and four
+measured iterations.
 
 The scenario deployment creates a namespace-local Hoglake server and metadata
 PostgreSQL database. Setup registers the frozen `events` and `persons` Parquet

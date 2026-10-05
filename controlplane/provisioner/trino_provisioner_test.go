@@ -1710,6 +1710,44 @@ func TestCatalogFilesystemCacheSetting(t *testing.T) {
 	}
 }
 
+// The two cache settings are independent: DuckLake catalogs follow only
+// FilesystemCacheEnabled and managed Hoglake catalogs follow only
+// HoglakeFilesystemCacheEnabled, so enabling the cache for Hoglake never
+// changes the DuckLake catalogs new organizations can still receive.
+func TestCatalogFilesystemCacheSettingsAreIndependent(t *testing.T) {
+	for _, ducklake := range []bool{false, true} {
+		for _, hoglake := range []bool{false, true} {
+			t.Run("ducklake="+strconv.FormatBool(ducklake)+",hoglake="+strconv.FormatBool(hoglake), func(t *testing.T) {
+				opts := baseTestOpts()
+				opts.FilesystemCacheEnabled = ducklake
+				opts.HoglakeFilesystemCacheEnabled = hoglake
+				opts.ManagedHoglake = &TrinoManagedHoglakeConfig{URI: "http://hoglake.example", DataPath: "s3://example-bucket/trino/", Namespace: "main"}
+				p, err := NewTrinoProvisioner(opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				duckProps := p.buildCatalogProperties("42", readyWarehouse("42"), readyDuckling("42"))
+				if duckProps["connector.name"] != "ducklake" {
+					t.Fatalf("expected a DuckLake catalog: %v", duckProps)
+				}
+				if got, want := duckProps["fs.cache.enabled"], strconv.FormatBool(ducklake); got != want {
+					t.Errorf("DuckLake fs.cache.enabled = %q, want %q", got, want)
+				}
+				hogProps, err := p.managedHoglakeProperties("42", readyDuckling("42"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if hogProps["connector.name"] != "hoglake" {
+					t.Fatalf("expected a Hoglake catalog: %v", hogProps)
+				}
+				if got, want := hogProps["fs.cache.enabled"], strconv.FormatBool(hoglake); got != want {
+					t.Errorf("Hoglake fs.cache.enabled = %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
 // --- per-user logins ---
 
 func teamID(id int64) *int64 { return &id }
