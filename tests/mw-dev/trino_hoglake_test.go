@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -157,11 +158,19 @@ func TestTrinoHarnessAssertsCachedManagedHoglakeCatalog(t *testing.T) {
 	if start < 0 || end <= start {
 		t.Fatal("managed catalog cache assertion missing")
 	}
-	ready := strings.Index(script, `wait_trino "$ORG_A" "$DB_A" "$CAT_A"`)
-	call := strings.Index(script, `assert_catalog_cache_enabled "$CAT_A"`)
-	firstQuery := strings.Index(script, "CREATE TABLE $CAT_A.")
-	if ready < 0 || call <= ready || firstQuery <= call {
-		t.Fatal("tenant A's cache mode must be asserted after readiness and before its first catalog query")
+	// Every Trino query goes through trino_query or its scalar and must_fail
+	// wrappers, so the earliest of those calls that names $CAT_A is the first
+	// query against tenant A's catalog. Joining continued lines keeps a query
+	// split over several lines in view.
+	flow := strings.ReplaceAll(script, "\\\n", " ")
+	ready := strings.Index(flow, `wait_trino "$ORG_A" "$DB_A" "$CAT_A"`)
+	call := strings.Index(flow, `assert_catalog_cache_enabled "$CAT_A"`)
+	firstQuery := regexp.MustCompile(`\b(trino_query|scalar|must_fail) [^\n]*\$\{?CAT_A\b`).FindStringIndex(flow)
+	if firstQuery == nil {
+		t.Fatal("found no query against tenant A's catalog")
+	}
+	if ready < 0 || call <= ready || firstQuery[0] <= call {
+		t.Fatalf("tenant A's cache mode must be asserted after readiness and before its first catalog query, %q", flow[firstQuery[0]:firstQuery[1]])
 	}
 
 	for _, tc := range []struct {

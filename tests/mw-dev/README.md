@@ -885,8 +885,10 @@ lane sets `DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED=true`. It checks that
 the tenant's published catalog row has `fs.cache.enabled=true`, then queries
 that catalog. Frozen perf leaves the variable unset and requires the uncached
 baseline: its runner rejects a cached managed tenant catalog. Both fixtures load
-an Alluxio cache manager by construction. Production pool blueprints are
-verified outside this repository.
+an Alluxio cache manager by construction. Their Trino pods select only
+`kubernetes.io/arch: arm64` with no NodePool toleration, so the cache emptyDir
+sits on the node's EBS root volume, not instance-store NVMe. Production pool
+blueprints are verified outside this repository.
 See `tests/perf/README.md` for cache budgets and result-history caveats.
 
 If setup or readiness fails, preserve artifacts and inspect logs for

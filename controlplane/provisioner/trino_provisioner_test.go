@@ -1712,8 +1712,10 @@ func TestCatalogFilesystemCacheSetting(t *testing.T) {
 
 // The two cache settings are independent: DuckLake catalogs follow only
 // FilesystemCacheEnabled and managed Hoglake catalogs follow only
-// HoglakeFilesystemCacheEnabled, so enabling the cache for Hoglake never
-// changes the DuckLake catalogs new organizations can still receive.
+// HoglakeFilesystemCacheEnabled. Where managed Hoglake is configured, new
+// clients receive Hoglake, but existing DuckLake clients keep DuckLake and a
+// re-enable creates their catalog again. Enabling the cache for Hoglake must
+// not change those DuckLake catalogs.
 func TestCatalogFilesystemCacheSettingsAreIndependent(t *testing.T) {
 	for _, ducklake := range []bool{false, true} {
 		for _, hoglake := range []bool{false, true} {
