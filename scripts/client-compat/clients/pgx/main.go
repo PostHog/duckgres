@@ -386,6 +386,41 @@ func testBatch(ctx context.Context, r *reporter) {
 	}
 }
 
+// testBinaryNumeric forces binary result format for a UBIGINT column, which
+// duckgres advertises as NUMERIC. psql and other text-format clients never hit
+// this path, so a UBIGINT that encoded as text bytes inside a binary numeric
+// field broke every binary-format client (pgAdmin, DuckDB's Postgres
+// extension, JDBC) with "Postgres numeric NA/Inf". This selects the maximum
+// UBIGINT (2^64 - 1) in binary and checks the round-trip.
+func testBinaryNumeric(ctx context.Context, r *reporter) {
+	fmt.Println("\n=== Binary numeric encoding ===")
+	suite := "binary_numeric"
+
+	conn, err := connect(ctx)
+	if err != nil {
+		r.report(suite, "connect", "fail", err.Error())
+		return
+	}
+	defer conn.Close(ctx)
+
+	const want = "18446744073709551615" // 2^64 - 1
+	var got string
+	err = conn.QueryRow(
+		ctx,
+		"SELECT 18446744073709551615::UBIGINT AS v",
+		pgx.QueryResultFormats{pgx.BinaryFormatCode},
+	).Scan(&got)
+	if err != nil {
+		r.report(suite, "ubigint_binary_format", "fail", err.Error())
+		return
+	}
+	if got == want {
+		r.report(suite, "ubigint_binary_format", "pass", got)
+	} else {
+		r.report(suite, "ubigint_binary_format", "fail", fmt.Sprintf("expected %s, got %s", want, got))
+	}
+}
+
 func main() {
 	ctx := context.Background()
 
@@ -403,6 +438,7 @@ func main() {
 	testSharedQueries(ctx, r)
 	testDDLDML(ctx, r)
 	testBatch(ctx, r)
+	testBinaryNumeric(ctx, r)
 
 	fmt.Printf("\n%s\n", "==================================================")
 	fmt.Printf("Results: %d passed, %d failed\n", r.passed, r.failed)

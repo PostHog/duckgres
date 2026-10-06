@@ -1103,6 +1103,55 @@ func TestEncodeDecodeUBIGINTMax(t *testing.T) {
 	}
 }
 
+func TestEncodeNumericFromGoIntegers(t *testing.T) {
+	// A worker can return a UBIGINT column as a native Go uint64 rather than a
+	// duckdb.Decimal. The catalog advertises UBIGINT and HUGEINT columns as
+	// NUMERIC, so encodeNumeric must turn every Go integer kind into a valid
+	// binary numeric. Before the fix these values fell through to text bytes
+	// inside a binary field, which clients read as "Postgres numeric NA/Inf".
+	tests := []struct {
+		name  string
+		input any
+		want  string
+	}{
+		{"uint64 max", uint64(18446744073709551615), "18446744073709551615"},
+		{"uint64 mid", uint64(1234567890123), "1234567890123"},
+		{"uint64 zero", uint64(0), "0"},
+		{"uint32", uint32(4294967295), "4294967295"},
+		{"uint16", uint16(65535), "65535"},
+		{"uint8", uint8(255), "255"},
+		{"uint", uint(42), "42"},
+		{"int64 positive", int64(9223372036854775807), "9223372036854775807"},
+		{"int64 negative", int64(-9223372036854775808), "-9223372036854775808"},
+		{"int", int(-7), "-7"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := encodeNumeric(tt.input)
+			if encoded == nil {
+				t.Fatalf("encodeNumeric(%v) returned nil", tt.input)
+			}
+			decoded, err := decodeNumeric(encoded)
+			if err != nil {
+				t.Fatalf("decodeNumeric failed: %v", err)
+			}
+			if decoded != tt.want {
+				t.Errorf("roundtrip %s = %q, want %q", tt.name, decoded, tt.want)
+			}
+		})
+	}
+}
+
+func TestEncodeNumericUnsupportedTypeReturnsNil(t *testing.T) {
+	// An unencodable value on a NUMERIC column must not emit text bytes into a
+	// binary field. encodeNumeric returns nil so the caller can fail the row
+	// with a clean error instead of shipping a corrupt numeric.
+	if got := encodeNumeric(true); got != nil {
+		t.Errorf("encodeNumeric(bool) = %v, want nil", got)
+	}
+}
+
 func TestDecodeNumericRaw(t *testing.T) {
 	// Test decoding a manually constructed binary numeric: 99.99
 	// ndigits=2, weight=0, sign=0x0000, dscale=2, digits=[99, 9900]
