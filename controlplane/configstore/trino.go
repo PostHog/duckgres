@@ -21,7 +21,10 @@ type TrinoSettings struct {
 	// DefaultCellID is a validated deployment default, never a client-supplied choice.
 	// It only fills an empty assignment in the enable transaction.
 	DefaultCellID string
-	// Tier is the resource-group tier label. Empty == default tier.
+	// Tier is the resource-group tier label: free, growth or scale (see
+	// ValidTrinoTier). Empty preserves the org's current tier, so a re-enable
+	// that does not mention the tier cannot reset it; a new row starts on the
+	// default tier (free).
 	Tier string
 	// Backend may only confirm the existing selection or, for a new client,
 	// the new-client backend. Empty preserves a pinned selection and otherwise
@@ -35,8 +38,9 @@ type TrinoSettings struct {
 }
 
 // EnableTrino marks the org as Trino-enabled and stores the per-org Trino
-// settings. Idempotent: re-enabling updates Tier without flipping Enabled
-// back through a disabled state. Safe to call as part of the
+// settings. Idempotent: re-enabling updates a given Tier without flipping
+// Enabled back through a disabled state, and keeps the current tier when none
+// is given. Safe to call as part of the
 // `POST /orgs/:id/provision` path or the standalone
 // `POST /orgs/:id/trino` endpoint.
 //
@@ -67,6 +71,21 @@ func EffectiveTrinoBackend(backend TrinoBackend) TrinoBackend {
 
 func (backend TrinoBackend) Valid() bool {
 	return backend == TrinoBackendDuckLake || backend == TrinoBackendHoglake
+}
+
+// ErrInvalidTrinoTier rejects a tier the resource-group generator does not
+// know. Unknown names are not stored: the generator would quietly place the
+// org on the free tier, so a typo like "Scale" would cap it at free limits.
+var ErrInvalidTrinoTier = errors.New("tier must be free, growth or scale")
+
+// ValidTrinoTier reports whether tier may be stored. Empty is valid and means
+// "keep the current tier" (EnableTrinoInTransaction).
+func ValidTrinoTier(tier string) bool {
+	switch tier {
+	case "", "free", "growth", "scale":
+		return true
+	}
+	return false
 }
 
 var ErrTrinoBackendSelectionConflict = errors.New("existing Trino backends cannot change; new clients must use the deployment's new-client backend")
@@ -106,6 +125,9 @@ func EnableTrinoInTransaction(db *gorm.DB, orgID string, settings TrinoSettings)
 	if settings.Backend != "" && !settings.Backend.Valid() {
 		return errors.New("invalid Trino backend")
 	}
+	if !ValidTrinoTier(settings.Tier) {
+		return ErrInvalidTrinoTier
+	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
 			return err
@@ -130,10 +152,16 @@ func EnableTrinoInTransaction(db *gorm.DB, orgID string, settings TrinoSettings)
 		if cellID == "" {
 			cellID = settings.DefaultCellID
 		}
-		return tx.Model(&ManagedWarehouseTrino{}).Where("org_id = ?", orgID).Updates(map[string]any{
+		updates := map[string]any{
 			"trino_cell_id": cellID,
-			"enabled":       true, "tier": settings.Tier, "backend": backend, "backend_selected": true, "updated_at": time.Now().UTC(),
-		}).Error
+			"enabled":       true, "backend": backend, "backend_selected": true, "updated_at": time.Now().UTC(),
+		}
+		// An omitted tier keeps the current one. Writing it unconditionally
+		// reset every org a caller re-enabled without a tier to free.
+		if settings.Tier != "" {
+			updates["tier"] = settings.Tier
+		}
+		return tx.Model(&ManagedWarehouseTrino{}).Where("org_id = ?", orgID).Updates(updates).Error
 	})
 }
 

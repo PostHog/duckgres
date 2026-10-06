@@ -509,6 +509,10 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "backend must be ducklake or hoglake"})
 		return
 	}
+	if req.Trino != nil && !configstore.ValidTrinoTier(req.Trino.Tier) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": configstore.ErrInvalidTrinoTier.Error()})
+		return
+	}
 	if req.Trino != nil && req.Trino.Enabled {
 		if !h.admitTrino(c, orgID) {
 			return
@@ -623,6 +627,10 @@ func (h *handler) enableTrino(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "enabled must be true; use DELETE to disable"})
 		return
 	}
+	if !configstore.ValidTrinoTier(req.Tier) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": configstore.ErrInvalidTrinoTier.Error()})
+		return
+	}
 
 	// Preflight: the FK on ManagedWarehouseTrino requires the Org row
 	// to exist. Without this check, EnableTrino's INSERT hits a
@@ -656,11 +664,16 @@ func (h *handler) enableTrino(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{
+	response := gin.H{
 		"status": "trino enable queued",
 		"org":    orgID,
-		"tier":   req.Tier,
-	})
+	}
+	// An omitted tier keeps the stored one, so echoing the empty request value
+	// would report a tier the org does not have.
+	if req.Tier != "" {
+		response["tier"] = req.Tier
+	}
+	c.JSON(http.StatusAccepted, response)
 }
 
 // disableTrino handles DELETE /orgs/:id/trino — opting the org out of

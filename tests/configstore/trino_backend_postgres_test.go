@@ -33,10 +33,10 @@ func TestTrinoBackendSelectionSurvivesDisablePostgres(t *testing.T) {
 	if row := trinoRow(t, store, "tenant"); row.Enabled {
 		t.Fatal("conflicting enable changed row")
 	}
-	if err := store.EnableTrino("tenant", configstore.TrinoSettings{Tier: "premium"}); err != nil {
+	if err := store.EnableTrino("tenant", configstore.TrinoSettings{Tier: "growth"}); err != nil {
 		t.Fatal(err)
 	}
-	if row := trinoRow(t, store, "tenant"); row.Backend != configstore.TrinoBackendHoglake || !row.BackendSelected || row.Tier != "premium" {
+	if row := trinoRow(t, store, "tenant"); row.Backend != configstore.TrinoBackendHoglake || !row.BackendSelected || row.Tier != "growth" {
 		t.Fatalf("lost selection: %+v", row)
 	}
 	rows, err := store.ListTrinoEnabledOrgs()

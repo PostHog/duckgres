@@ -223,7 +223,9 @@ Moving an existing tenant requires a separate maintenance/drain workflow.
 The Trino section has separate **Select cell**, **Enable Trino**, and
 **Disable Trino** actions. These do not submit the other org configuration
 fields. The UI requires a saved assignment before enabling and preserves the
-stored resource-group tier when re-enabling. Selection alone never enables
+stored resource-group tier when re-enabling. The API keeps the stored tier
+for any caller that omits it, and refuses tiers other than `free`, `growth` and
+`scale` with a 400. Selection alone never enables
 Trino; disabling retains the assignment and is not a maintenance barrier.
 Viewers can read the configuration but cannot change it. The lower Trino card
 continues to show provisioning status and live query counts.

@@ -316,10 +316,18 @@ func (s *fakeStore) EnableTrino(orgID string, settings configstore.TrinoSettings
 	if err != nil {
 		return err
 	}
+	if !configstore.ValidTrinoTier(settings.Tier) {
+		return configstore.ErrInvalidTrinoTier
+	}
+	// Mirror EnableTrinoInTransaction: an omitted tier keeps the current one.
+	tier := settings.Tier
+	if existing := s.trino[orgID]; tier == "" && existing != nil {
+		tier = existing.Tier
+	}
 	s.trino[orgID] = &configstore.ManagedWarehouseTrino{
 		OrgID:           orgID,
 		Enabled:         true,
-		Tier:            settings.Tier,
+		Tier:            tier,
 		Backend:         backend,
 		BackendSelected: true,
 	}
@@ -1107,6 +1115,71 @@ func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
 	row := store.trino["ben-ducklake-cnpg"]
 	if row == nil || !row.Enabled || row.Tier != "growth" {
 		t.Fatalf("expected trino row enabled with tier growth; got %+v", row)
+	}
+}
+
+// A re-enable that does not mention the tier must keep it. Writing the empty
+// value reset every org a caller re-enabled without a tier to the free
+// resource group, which is how a scale tenant ended up capped at three
+// concurrent queries.
+func TestEnableTrinoKeepsTierWhenOmitted(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Backend: configstore.TrinoBackendDuckLake, BackendSelected: true, Enabled: true, Tier: "scale"}
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/trino", bytes.NewReader([]byte(`{"enabled": true}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if got := store.trino["analytics"].Tier; got != "scale" {
+		t.Fatalf("tier = %q after a re-enable without a tier, want scale", got)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if tier, ok := body["tier"]; ok {
+		t.Fatalf("response reports tier %v for a request that named none; the stored tier is scale", tier)
+	}
+}
+
+// An unknown tier is refused rather than stored: the resource-group generator
+// would quietly treat it as free.
+func TestTrinoTierIsValidatedOnBothEnablePaths(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Backend: configstore.TrinoBackendDuckLake, BackendSelected: true, Enabled: true, Tier: "growth"}
+	store.orgs["42"] = &configstore.Org{Name: "42"}
+	router := newTestRouter(store)
+
+	for _, tc := range []struct{ path, body string }{
+		{"/api/v1/orgs/analytics/trino", `{"enabled": true, "tier": "Scale"}`},
+		// The body TestProvisionEnablesTrinoWhenRequested accepts, with an unknown tier.
+		{"/api/v1/orgs/42/provision", `{
+			"database_name": "team-42-db",
+			"metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true},
+			"trino": {"enabled": true, "tier": "premium"}
+		}`},
+	} {
+		req := httptest.NewRequest(http.MethodPost, tc.path, bytes.NewReader([]byte(tc.body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		// The message proves the tier check refused it, not some other field.
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), configstore.ErrInvalidTrinoTier.Error()) {
+			t.Errorf("%s: status = %d, body %s; want 400 naming the tier", tc.path, rec.Code, rec.Body.String())
+		}
+	}
+	if got := store.trino["analytics"].Tier; got != "growth" {
+		t.Fatalf("tier = %q after rejected requests, want growth unchanged", got)
+	}
+	if _, ok := store.trino["42"]; ok {
+		t.Fatal("a provision with an unknown tier must not enable Trino")
 	}
 }
 
