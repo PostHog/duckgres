@@ -226,6 +226,11 @@ func SetupMultiTenant(
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
+	// Before any Trino or provisioning wiring reads its gates: a recorded
+	// hand-over turns duckgres' writers of that state off for this process.
+	if err := applyControlHandover(store.DB()); err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
 	// Identity info-metric for dashboards (org ↔ team ↔ duckling). Reads the
 	// snapshot at scrape time — registered here where the concrete store is
 	// in hand (the interface returned upward deliberately hides Snapshot).
@@ -595,7 +600,14 @@ func SetupMultiTenant(
 		//
 		// Only the reconcile loop stops here; the pgwire drain is untouched.
 		provCtx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		go provCtrl.Run(provCtx)
+		if provisionerControllerEnabled() {
+			go provCtrl.Run(provCtx)
+		} else {
+			// The wiring above still runs, so the admin console's Trino views
+			// and the OPA bundle route stay registered; only the loop that
+			// WRITES (Duckling CRs, warehouse state, Trino projections) is off.
+			slog.Warn("Provisioning controller disabled (" + envProvisionerEnabled + "=false): Duckling lifecycle and Trino projections are owned by another control plane.")
+		}
 	}
 
 	// Reshard operations execute in DEDICATED per-op pods, never inside a CP
