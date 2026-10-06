@@ -509,6 +509,10 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "backend must be ducklake or hoglake"})
 		return
 	}
+	if req.Trino != nil && !configstore.ValidTrinoTier(req.Trino.Tier) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": configstore.ErrInvalidTrinoTier.Error()})
+		return
+	}
 	if req.Trino != nil && req.Trino.Enabled {
 		if !h.admitTrino(c, orgID) {
 			return
@@ -621,6 +625,10 @@ func (h *handler) enableTrino(c *gin.Context) {
 
 	if !req.Enabled {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "enabled must be true; use DELETE to disable"})
+		return
+	}
+	if !configstore.ValidTrinoTier(req.Tier) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": configstore.ErrInvalidTrinoTier.Error()})
 		return
 	}
 

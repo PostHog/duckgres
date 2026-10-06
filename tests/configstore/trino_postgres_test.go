@@ -82,6 +82,21 @@ func TestEnableTrinoIsIdempotentAndPreservesReconcileState(t *testing.T) {
 	if row.Tier != "growth" {
 		t.Errorf("tier = %q, want growth", row.Tier)
 	}
+	// A re-enable that names no tier keeps the current one.
+	if err := store.EnableTrino("acme", configstore.TrinoSettings{}); err != nil {
+		t.Fatalf("EnableTrino (re-enable without a tier): %v", err)
+	}
+	if got := trinoRow(t, store, "acme").Tier; got != "growth" {
+		t.Errorf("tier = %q after a re-enable without a tier, want growth kept", got)
+	}
+	// An unknown tier is refused and changes nothing.
+	if err := store.EnableTrino("acme", configstore.TrinoSettings{Tier: "Scale"}); !errors.Is(err, configstore.ErrInvalidTrinoTier) {
+		t.Errorf("EnableTrino(tier=Scale) = %v, want ErrInvalidTrinoTier", err)
+	}
+	if got := trinoRow(t, store, "acme").Tier; got != "growth" {
+		t.Errorf("tier = %q after a rejected tier, want growth kept", got)
+	}
+	row = trinoRow(t, store, "acme")
 	if row.State != configstore.ManagedWarehouseStateReady {
 		t.Errorf("state = %q, want the reconcile loop's ready to survive a re-enable", row.State)
 	}

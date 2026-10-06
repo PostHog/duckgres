@@ -534,5 +534,19 @@ log "reenable preserves the Hoglake catalog and data"
 api -X POST -H 'Content-Type: application/json' -d '{"enabled":true,"tier":"free"}' "$API/api/v1/orgs/$ORG_B/trino" >/dev/null
 wait_trino "$ORG_B" "$DB_B" "$CAT_B"
 [ "$(scalar "$DB_B" "$pw_b" "SELECT count(*) FROM $CAT_B.main.$foreign_table")" = 1 ] || fail "reenabled tenant lost data"
+
+# A re-enable that omits the tier keeps the stored one. Writing the empty
+# value used to drop every such org into the free resource group (3
+# concurrent queries), which is how a scale tenant got capped in prod.
+log "re-enable without a tier keeps the stored resource-group tier"
+tier_of() { api "$API/api/v1/orgs/$1/trino" | jq -r '.status.tier // ""'; }
+api -X POST -H 'Content-Type: application/json' -d '{"enabled":true,"tier":"growth"}' "$API/api/v1/orgs/$ORG_B/trino" >/dev/null
+[ "$(tier_of "$ORG_B")" = growth ] || fail "tier after an explicit growth re-enable = '$(tier_of "$ORG_B")', want growth"
+api -X POST -H 'Content-Type: application/json' -d '{"enabled":true}' "$API/api/v1/orgs/$ORG_B/trino" >/dev/null
+[ "$(tier_of "$ORG_B")" = growth ] || fail "re-enable without a tier reset it to '$(tier_of "$ORG_B")', want growth kept"
+code="$(curl --connect-timeout 5 --max-time 60 -sS -o /dev/null -w '%{http_code}' -H "$H" -X POST -H 'Content-Type: application/json' \
+  -d '{"enabled":true,"tier":"Scale"}' "$API/api/v1/orgs/$ORG_B/trino")"
+[ "$code" = 400 ] || fail "unknown tier 'Scale' returned HTTP $code, want 400"
+[ "$(tier_of "$ORG_B")" = growth ] || fail "a rejected tier changed the stored tier to '$(tier_of "$ORG_B")'"
 # Namespace teardown removes fixture metadata; the runner removes only its S3 prefixes.
 log "PASS: isolated Trino provisioning + verified auth + per-user logins + DDL/DML + OPA isolation/batching + hot-add + admin + rotation + restart + disable"
