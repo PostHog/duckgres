@@ -34,6 +34,17 @@ The control plane requires these environment variables:
 | `DUCKGRES_TRINO_HOGLAKE_DATA_PATH` | empty | Reserved `s3://bucket/prefix/` base, with a trailing slash |
 | `DUCKGRES_TRINO_HOGLAKE_NAMESPACE` | `main` | Namespace to create and verify |
 
+Optional `DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED` (default false)
+creates new Trino catalogs for Hoglake clients with `fs.cache.enabled=true`.
+Existing catalogs keep their property; a catalog created again later, such as on
+re-enable after disable, receives the current setting. It is independent of
+`DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED`, which applies only to DuckLake
+catalogs. Before enabling it, every pool coordinator and worker must load an
+Alluxio cache manager; otherwise the new catalogs fail to initialize.
+Turning the setting off does not uncache existing catalogs. While any catalog
+has `fs.cache.enabled=true`, keep the Alluxio manager and writable,
+capacity-limited `fs.cache.directories` on every coordinator and worker.
+
 New-client onboarding is rejected before database mutations if managed
 Hoglake is unavailable; existing DuckLake clients can still re-enable. Reserve
 the configured S3 prefix exclusively for this service. Do not reuse DuckLake roots or immutable performance fixtures.

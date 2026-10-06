@@ -204,6 +204,7 @@ type poolObserverWiringStore struct {
 // and for usage metering alike; a fixed cell keeps its coordinator client.
 func TestPooledCellWiresThePoolObserver(t *testing.T) {
 	t.Setenv(envTrinoFilesystemCacheEnabled, "false")
+	t.Setenv(envTrinoHoglakeFilesystemCacheEnabled, "false")
 	store := &poolObserverWiringStore{fleetBootstrapStore: &fleetBootstrapStore{initialized: map[string]bool{}}}
 	kc := kubefake.NewClientset()
 	ducklings := func(context.Context, string) (*provisioner.DucklingStatus, error) { return nil, nil }

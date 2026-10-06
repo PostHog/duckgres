@@ -342,8 +342,15 @@ type TrinoProvisionerOpts struct {
 	S3MaxConnections int
 
 	// FilesystemCacheEnabled enables the node-local filesystem cache for new
-	// catalogs. Defaults to false. Trino nodes must configure a cache manager.
+	// DuckLake catalogs. Defaults to false. Trino nodes must configure a cache
+	// manager.
 	FilesystemCacheEnabled bool
+
+	// HoglakeFilesystemCacheEnabled enables the node-local filesystem cache for
+	// new managed Hoglake catalogs, independent of FilesystemCacheEnabled.
+	// Defaults to false. Every pool coordinator and worker must load an
+	// Alluxio cache manager.
+	HoglakeFilesystemCacheEnabled bool
 
 	ManagedHoglake      *TrinoManagedHoglakeConfig
 	HoglakeStorageCheck TrinoHoglakeStorageCheck
@@ -429,13 +436,14 @@ type TrinoProvisioner struct {
 	// projectionFence builds and accepts the projection in one transaction,
 	// returning the revision that acceptance allocated. Nil for every cell that
 	// does not fence its projection, where these writes are unchanged.
-	projectionFence        TrinoProjectionFence
-	tenantSecretMountPath  string
-	awsRegion              string
-	s3MaxConnections       int
-	filesystemCacheEnabled bool
-	managedHoglake         *TrinoManagedHoglakeConfig
-	hoglakeStorageCheck    TrinoHoglakeStorageCheck
+	projectionFence               TrinoProjectionFence
+	tenantSecretMountPath         string
+	awsRegion                     string
+	s3MaxConnections              int
+	filesystemCacheEnabled        bool
+	hoglakeFilesystemCacheEnabled bool
+	managedHoglake                *TrinoManagedHoglakeConfig
+	hoglakeStorageCheck           TrinoHoglakeStorageCheck
 
 	// adminPasswordHash is cached on each Reconcile from the
 	// trino-auth K8s Secret and prepended to password.db on projection.
@@ -535,24 +543,25 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		maxConns = defaultTrinoS3MaxConnections
 	}
 	result := &TrinoProvisioner{
-		store:                  opts.Store,
-		bootstrapSentinel:      opts.BootstrapSentinel,
-		warehouses:             opts.Warehouses,
-		ducklings:              opts.Ducklings,
-		hoglakeDucklings:       opts.HoglakeDucklings,
-		kubernetes:             opts.Kubernetes,
-		namespace:              ns,
-		cellID:                 cell,
-		catalog:                opts.Catalog,
-		catalogTimeout:         30 * time.Second,
-		bundleStore:            opts.BundleStore,
-		bundleBuilder:          opts.BundleBuilder,
-		tenantSecretMountPath:  strings.TrimRight(mountPath, "/"),
-		awsRegion:              opts.AWSRegion,
-		s3MaxConnections:       maxConns,
-		filesystemCacheEnabled: opts.FilesystemCacheEnabled,
-		managedHoglake:         opts.ManagedHoglake,
-		hoglakeStorageCheck:    opts.HoglakeStorageCheck,
+		store:                         opts.Store,
+		bootstrapSentinel:             opts.BootstrapSentinel,
+		warehouses:                    opts.Warehouses,
+		ducklings:                     opts.Ducklings,
+		hoglakeDucklings:              opts.HoglakeDucklings,
+		kubernetes:                    opts.Kubernetes,
+		namespace:                     ns,
+		cellID:                        cell,
+		catalog:                       opts.Catalog,
+		catalogTimeout:                30 * time.Second,
+		bundleStore:                   opts.BundleStore,
+		bundleBuilder:                 opts.BundleBuilder,
+		tenantSecretMountPath:         strings.TrimRight(mountPath, "/"),
+		awsRegion:                     opts.AWSRegion,
+		s3MaxConnections:              maxConns,
+		filesystemCacheEnabled:        opts.FilesystemCacheEnabled,
+		hoglakeFilesystemCacheEnabled: opts.HoglakeFilesystemCacheEnabled,
+		managedHoglake:                opts.ManagedHoglake,
+		hoglakeStorageCheck:           opts.HoglakeStorageCheck,
 	}
 	return result, nil
 }
@@ -560,6 +569,17 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 // CellID reports the Trino cell this provisioner owns. Exposed for
 // startup logging and tests.
 func (p *TrinoProvisioner) CellID() string { return p.cellID }
+
+// FilesystemCacheSettings reports the fs.cache.enabled value this provisioner
+// writes into new DuckLake and new managed Hoglake catalogs respectively.
+//
+// It is exported for the startup wiring's own test. The two values come from
+// separate settings, and a wiring that crossed, merged or dropped one would
+// still build and reconcile normally, creating catalogs in the wrong cache
+// mode. Test these settings at the pool wiring boundary.
+func (p *TrinoProvisioner) FilesystemCacheSettings() (ducklake, hoglake bool) {
+	return p.filesystemCacheEnabled, p.hoglakeFilesystemCacheEnabled
+}
 
 // SetCatalogClient replaces the catalog write path at runtime.
 //

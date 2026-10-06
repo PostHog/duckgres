@@ -658,8 +658,9 @@ and existing data. There are no static slot deployments or migration switches.
 All lanes generate a random config-store password in `DUCKGRES_CI_SECRET_DIR`
 and reuse it for that run. PostgreSQL, the control plane, and benchmark Jobs
 read Kubernetes Secret references; Trino receives the same password through
-its catalog-store Secret. Credentials never appear as literal pod environment
-values. GitHub Actions masks the generated password before deployment.
+its catalog-store Secret. The Trino harness reads the Secret to check published
+catalog rows. Credentials never appear as literal pod environment values.
+GitHub Actions masks the generated password before deployment.
 
 Run `just test-mw-fixtures` for local rendering and cleanup guard tests. The
 real acceptance gate is the PR's Trino E2E workflow. A rendered fixture is not
@@ -874,9 +875,21 @@ setup at a shared dev/prod catalog store or coordinator. A `perf_queries` step m
 select both Trino targets; `with.targets` can select a subset for focused local
 runs, while the checked-in scenario runs all five.
 
-The current pinned Hoglake connector ignores `fs.cache.enabled`; the two labels
-currently distinguish requested configuration, not verified caching behavior.
-See `tests/perf/README.md` for cache budgets and this existing connector limitation.
+By default the workflow uses the newest PostHog/trino master build, whose Hoglake
+connector honors `fs.cache.enabled`. An older Trino image override may ignore the
+property; its two labels then distinguish requested configuration, not verified
+caching behavior.
+
+Each lane asserts one cache mode for managed Hoglake catalogs. The per-PR Trino
+lane sets `DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED=true`. It checks that
+the tenant's published catalog row has `fs.cache.enabled=true`, then queries
+that catalog. Frozen perf leaves the variable unset and requires the uncached
+baseline: its runner rejects a cached managed tenant catalog. Both fixtures load
+an Alluxio cache manager by construction. Their Trino pods select only
+`kubernetes.io/arch: arm64` with no NodePool toleration, so the cache emptyDir
+sits on the node's EBS root volume, not instance-store NVMe. Production pool
+blueprints are verified outside this repository.
+See `tests/perf/README.md` for cache budgets and result-history caveats.
 
 If setup or readiness fails, preserve artifacts and inspect logs for
 `duckgres-trino`, `duckgres-trino-perf`, and `duckgres-trino-cached` deployments. Check catalog-store cell
@@ -1034,8 +1047,9 @@ or external secret is required.
 ## Regular Trino + Hoglake prerequisites
 
 Normal managed onboarding creates each tenant’s Hoglake catalog and namespace.
-The lane verifies CREATE/INSERT/CTAS, wide decimals through real compaction,
-tenant isolation, disable/re-enable persistence, and deprovision protection.
+The lane verifies `fs.cache.enabled=true` on the published catalog,
+CREATE/INSERT/CTAS, wide decimals through real compaction, tenant isolation,
+disable/re-enable persistence, and deprovision protection.
 
 The regular lane uses isolated Hoglake PostgreSQL and server deployments, plus
 three Trino workers. Apply [the CI-only Hoglake storage identity and CI deployer](https://github.com/PostHog/posthog-cloud-infra/pull/10521)

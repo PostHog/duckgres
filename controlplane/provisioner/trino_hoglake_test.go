@@ -193,7 +193,7 @@ func TestTrinoHoglakeManagedReconcile(t *testing.T) {
 				t.Fatal("Hoglake projected a DuckLake metadata password")
 			}
 			props := h.catalog.created[name]
-			if props["s3.auth-type"] != "IAM_ROLE" || props["s3.iam-role"] != h.ducklings[org.OrgID].IAMRoleARN || props["s3.region"] == "" || props["hoglake.catalog"] != org.OrgID || props[trinoDuckLakePasswordFileProperty] != "" {
+			if props["s3.auth-type"] != "IAM_ROLE" || props["s3.iam-role"] != h.ducklings[org.OrgID].IAMRoleARN || props["s3.region"] == "" || props["hoglake.catalog"] != org.OrgID || props[trinoDuckLakePasswordFileProperty] != "" || props["fs.cache.enabled"] != "false" {
 				t.Fatalf("incorrect Hoglake properties %v", props)
 			}
 			projection, e := h.provisioner.reconcileTenantSecrets(context.Background(), []configstore.TrinoEnabledOrg{org})

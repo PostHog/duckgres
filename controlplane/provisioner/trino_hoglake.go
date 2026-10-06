@@ -221,7 +221,7 @@ func (p *TrinoProvisioner) managedHoglakeProperties(orgID string, d *DucklingSta
 	if region == "" {
 		return nil, errors.New("waiting for the tenant storage region")
 	}
-	return map[string]string{"connector.name": "hoglake", "fs.s3.enabled": "true", "hoglake.uri": p.managedHoglake.URI, "hoglake.catalog": orgID, "s3.region": region, "s3.auth-type": "IAM_ROLE", "s3.iam-role": d.IAMRoleARN, "s3.max-connections": strconv.Itoa(p.s3MaxConnections), "fs.cache.enabled": strconv.FormatBool(p.filesystemCacheEnabled)}, nil
+	return map[string]string{"connector.name": "hoglake", "fs.s3.enabled": "true", "hoglake.uri": p.managedHoglake.URI, "hoglake.catalog": orgID, "s3.region": region, "s3.auth-type": "IAM_ROLE", "s3.iam-role": d.IAMRoleARN, "s3.max-connections": strconv.Itoa(p.s3MaxConnections), "fs.cache.enabled": strconv.FormatBool(p.hoglakeFilesystemCacheEnabled)}, nil
 }
 
 // Optional inventory keeps existing catalog-client implementations compatible.
