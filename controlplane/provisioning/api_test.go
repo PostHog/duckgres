@@ -1139,6 +1139,13 @@ func TestEnableTrinoKeepsTierWhenOmitted(t *testing.T) {
 	if got := store.trino["analytics"].Tier; got != "scale" {
 		t.Fatalf("tier = %q after a re-enable without a tier, want scale", got)
 	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if tier, ok := body["tier"]; ok {
+		t.Fatalf("response reports tier %v for a request that named none; the stored tier is scale", tier)
+	}
 }
 
 // An unknown tier is refused rather than stored: the resource-group generator

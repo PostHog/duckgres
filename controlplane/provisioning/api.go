@@ -664,11 +664,16 @@ func (h *handler) enableTrino(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{
+	response := gin.H{
 		"status": "trino enable queued",
 		"org":    orgID,
-		"tier":   req.Tier,
-	})
+	}
+	// An omitted tier keeps the stored one, so echoing the empty request value
+	// would report a tier the org does not have.
+	if req.Tier != "" {
+		response["tier"] = req.Tier
+	}
+	c.JSON(http.StatusAccepted, response)
 }
 
 // disableTrino handles DELETE /orgs/:id/trino — opting the org out of
