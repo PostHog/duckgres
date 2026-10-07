@@ -228,7 +228,8 @@ func SetupMultiTenant(
 	}
 	// Before any Trino or provisioning wiring reads its gates: a recorded
 	// hand-over turns duckgres' writers of that state off for this process.
-	if err := applyControlHandover(store.DB()); err != nil {
+	handoverOwner, err := applyControlHandover(store.DB())
+	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
 	// Identity info-metric for dashboards (org ↔ team ↔ duckling). Reads the
@@ -766,10 +767,14 @@ func SetupMultiTenant(
 	// require admin).
 	// RoleGate blocks viewer mutations (method-based); the audit-log read
 	// self-gates via RequireAdmin at its route (no brittle path coupling here).
+	// The management write gate then answers 409 to management writes once
+	// provisioning is handed over (see management_read_only.go); it sits
+	// after the audit middleware so refused attempts are still recorded.
 	api := engine.Group("/api/v1",
 		admin.AuthMiddleware(adminTokens, resolve, ssoVerifier),
 		admin.AuditMiddleware(auditStore),
 		admin.RoleGate(),
+		newManagementWriteGate(store.DB(), handoverOwner).Middleware(),
 	)
 	admin.RegisterAPI(api, store, adpt, liveFetcher, cfg.K8s.AWSRegion)
 	// gormStore implements both provisioning.Store (HTTP-shape operations) and

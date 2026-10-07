@@ -159,6 +159,39 @@ assert_catalog_cache_enabled() { # catalog
 }
 # END managed catalog cache assertion
 
+# BEGIN management read-only hand-over
+# hogtower records the hand-over in duckgres_control_handover (same DDL as
+# hogtower's EnsureHandover). The CP re-reads the marker at most every 10s and
+# then refuses management writes with 409; the DB itself stays writable.
+handover_sql() { # sql
+  store_pw="$("$KUBECTL" -n "$NS" get secret duckgres-config-store-credentials -o go-template='{{index .data "password"}}' | base64 -d)" || return 1
+  [ -n "$store_pw" ] || return 1
+  printf '%s\n' "$1" | PGPASSWORD="$store_pw" psql -h "duckgres-config-store.$NS.svc" -U duckgres -d duckgres -XAtq -v ON_ERROR_STOP=1 || return 1
+  unset store_pw
+}
+record_handover() {
+  handover_sql "CREATE TABLE IF NOT EXISTS duckgres_control_handover (component text PRIMARY KEY, owner text NOT NULL, handed_over_at timestamptz NOT NULL DEFAULT now()); INSERT INTO duckgres_control_handover (component, owner) VALUES ('provisioning', 'hogtower') ON CONFLICT (component) DO UPDATE SET owner = EXCLUDED.owner;"
+}
+clear_handover() {
+  handover_sql "DELETE FROM duckgres_control_handover WHERE component = 'provisioning';"
+}
+# An invalid team upsert: 400 while writable, 409 once read-only. It never
+# mutates anything, so the probe is safe in both states.
+management_write_status() {
+  curl --connect-timeout 5 --max-time 60 -sS -o /tmp/management_write_body -w '%{http_code}' -H "$H" \
+    -X POST -H 'Content-Type: application/json' -d '{}' "$API/api/v1/orgs/$ORG_B/teams"
+}
+wait_management_write_status() { # status
+  i=0
+  while [ "$i" -lt 15 ]; do
+    status="$(management_write_status || true)"
+    [ "$status" = "$1" ] && return 0
+    sleep 2; i=$((i + 1))
+  done
+  fail "management write returned $status, want $1: $(cat /tmp/management_write_body 2>/dev/null || true)"
+}
+# END management read-only hand-over
+
 # BEGIN concurrent bootstrap helpers
 bootstrap_scope() {
   case "$PR" in ''|*[!0-9]*) fail "bootstrap requires a numeric fixture identity" ;; esac
@@ -548,5 +581,22 @@ code="$(curl --connect-timeout 5 --max-time 60 -sS -o /dev/null -w '%{http_code}
   -d '{"enabled":true,"tier":"Scale"}' "$API/api/v1/orgs/$ORG_B/trino")"
 [ "$code" = 400 ] || fail "unknown tier 'Scale' returned HTTP $code, want 400"
 [ "$(tier_of "$ORG_B")" = growth ] || fail "a rejected tier changed the stored tier to '$(tier_of "$ORG_B")'"
+
+log "hand-over marker makes the management API read-only; reads and Trino keep working"
+wait_management_write_status 400
+trap 'rc=$?; clear_handover >/dev/null 2>&1 || true; [ "$rc" = 0 ] || echo "TRINO HARNESS EXIT rc=$rc" >&2' EXIT
+record_handover || fail "cannot record the hand-over marker"
+wait_management_write_status 409
+jq -e '.managed_by == "hogtower" and (.error | startswith("managed by hogtower:"))' /tmp/management_write_body >/dev/null \
+  || fail "read-only refusal must name hogtower: $(cat /tmp/management_write_body)"
+api "$API/api/v1/orgs/$ORG_B/teams" | jq -e --argjson team "$TEAM_B" 'any(.teams[]; .team_id == $team)' >/dev/null \
+  || fail "team reads must keep working after the hand-over"
+[ "$(api "$API/api/v1/orgs/$ORG_A/warehouse/status" | jq -r .state)" = ready ] \
+  || fail "warehouse status must keep working after the hand-over"
+[ "$(scalar "$DB_A" "$pw_a" "SELECT label FROM $CAT_A.$schema.$table")" = two ] \
+  || fail "Trino queries must keep working after the hand-over"
+clear_handover || fail "cannot clear the hand-over marker"
+wait_management_write_status 400
+trap 'rc=$?; [ "$rc" = 0 ] || echo "TRINO HARNESS EXIT rc=$rc" >&2' EXIT
 # Namespace teardown removes fixture metadata; the runner removes only its S3 prefixes.
-log "PASS: isolated Trino provisioning + verified auth + per-user logins + DDL/DML + OPA isolation/batching + hot-add + admin + rotation + restart + disable"
+log "PASS: isolated Trino provisioning + verified auth + per-user logins + DDL/DML + OPA isolation/batching + hot-add + admin + rotation + restart + disable + read-only hand-over"

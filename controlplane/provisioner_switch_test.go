@@ -64,7 +64,7 @@ func TestApplyControlHandoverReadsTheStore(t *testing.T) {
 
 	t.Setenv(envTrinoPoolOperatorEnabled, "true")
 	t.Setenv(envTrinoDefaultCell, "cell-001")
-	if err := applyControlHandover(scoped); err != nil {
+	if _, err := applyControlHandover(scoped); err != nil {
 		t.Fatalf("a missing table is no hand-over: %v", err)
 	}
 	if controlHandedOver || os.Getenv(envTrinoPoolOperatorEnabled) != "true" {
@@ -74,14 +74,18 @@ func TestApplyControlHandoverReadsTheStore(t *testing.T) {
 	if err := scoped.Exec("CREATE TABLE " + controlHandoverTable + " (component text PRIMARY KEY, owner text NOT NULL)").Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := applyControlHandover(scoped); err != nil || controlHandedOver {
+	if _, err := applyControlHandover(scoped); err != nil || controlHandedOver {
 		t.Fatalf("an empty table is no hand-over: %v %v", err, controlHandedOver)
 	}
 	if err := scoped.Exec("INSERT INTO " + controlHandoverTable + " VALUES ('provisioning', 'hogtower')").Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := applyControlHandover(scoped); err != nil {
+	owner, err := applyControlHandover(scoped)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if owner != "hogtower" {
+		t.Fatalf("owner = %q, want hogtower", owner)
 	}
 	if !controlHandedOver || provisionerControllerEnabled() || trinoPoolOperatorEnabled() {
 		t.Fatal("a recorded hand-over must switch the controller and the pool operator off")
