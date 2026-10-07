@@ -774,6 +774,9 @@ export interface TrinoQuery {
   source: string;
   resource_group: string;
   query: string;
+  // instance is the shared-pool instance whose coordinator holds the query.
+  // Absent on a cell with a single coordinator.
+  instance?: string;
   created?: string;
   elapsed_ms: number;
   queued_ms: number;

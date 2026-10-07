@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { TrinoQuery, TrinoStatus } from "@/types/api";
@@ -103,13 +103,16 @@ describe("TrinoQueries page", () => {
           query({ query_id: "a", state: "RUNNING", elapsed_ms: 30_000, physical_input_bytes: 1024 }),
           query({ query_id: "b", state: "RUNNING", fully_blocked: true, elapsed_ms: 90_000 }),
           query({ query_id: "c", state: "QUEUED", elapsed_ms: 5_000 }),
+          // Past the resource-group queue but not yet executing: this is the
+          // state a saturated cell parks work in, and it used to count as 0.
+          query({ query_id: "d", state: "WAITING_FOR_RESOURCES", elapsed_ms: 5_000 }),
         ],
       }),
     );
     renderPage();
 
     expect(statValue("Running")).toBe("2");
-    expect(statValue("Queued")).toBe("1");
+    expect(statValue("Waiting")).toBe("2");
     // Blocked is counted separately from running: it means every driver is
     // waiting on the metadata store or S3, which is a cell problem.
     expect(statValue("Blocked")).toBe("1");
@@ -160,7 +163,7 @@ describe("TrinoQueries page", () => {
       }),
     );
     renderPage();
-    expect(screen.getByText("duckgres-provisioner")).toBeInTheDocument();
+    expect(within(screen.getByTestId("query-q1")).getByText("duckgres-provisioner")).toBeInTheDocument();
   });
 
   it("explains an unconfigured deployment differently from an outage", () => {
@@ -202,5 +205,113 @@ describe("TrinoQueries page", () => {
     );
     renderPage();
     expect(screen.getByRole("button", { name: "Kill" })).toBeDisabled();
+  });
+
+  function withQueries(queries: TrinoQuery[]) {
+    hooks.useTrinoQueries.mockReturnValue(ok({ cell: status().cell, available: true, queries }));
+  }
+  const rowIds = () =>
+    screen.getAllByTestId(/^query-/).map((row) => row.getAttribute("data-testid")!.slice("query-".length));
+
+  it("leads each row with the statement and its target, not the client's comment", () => {
+    withQueries([
+      query({ query: '/* SQLMESH_PLAN: abc */ INSERT INTO "org_p"."sqlmesh_trino"."events__1" SELECT 1' }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("query-q1");
+    expect(within(row).getByText("INSERT INTO")).toBeInTheDocument();
+    expect(within(row).getByText("org_p.sqlmesh_trino.events__1")).toBeInTheDocument();
+  });
+
+  it("expands a row to the full SQL and its execution detail", () => {
+    withQueries([query({ query: "SELECT * FROM events", total_drivers: 8, completed_drivers: 3 })]);
+    renderPage();
+    expect(screen.queryByText("Query id")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("query-q1"));
+    expect(screen.getByText("Query id")).toBeInTheDocument();
+    expect(screen.getByText(/3\/8 done/)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("query-q1"));
+    expect(screen.queryByText("Query id")).not.toBeInTheDocument();
+  });
+
+  it("sorts by elapsed by default and re-sorts by a clicked column", () => {
+    withQueries([
+      query({ query_id: "short", elapsed_ms: 1_000, cpu_ms: 900 }),
+      query({ query_id: "long", elapsed_ms: 60_000, cpu_ms: 10 }),
+    ]);
+    renderPage();
+    expect(rowIds()).toEqual(["long", "short"]);
+    fireEvent.click(screen.getByRole("button", { name: "CPU" }));
+    expect(rowIds()).toEqual(["short", "long"]);
+    fireEvent.click(screen.getByRole("button", { name: "CPU" }));
+    expect(rowIds()).toEqual(["long", "short"]);
+  });
+
+  it("filters by state bucket while the headline keeps describing the cell", () => {
+    withQueries([
+      query({ query_id: "run", state: "RUNNING" }),
+      query({ query_id: "wait", state: "WAITING_FOR_RESOURCES" }),
+      query({ query_id: "plan", state: "PLANNING" }),
+    ]);
+    renderPage();
+    const chips = screen.getByRole("group", { name: "State filter" });
+    fireEvent.click(within(chips).getByRole("button", { name: /Waiting/ }));
+    expect(rowIds().sort()).toEqual(["plan", "wait"]);
+    expect(statValue("Running")).toBe("1");
+  });
+
+  it("breaks load down by org and narrows the list to a clicked org", () => {
+    hooks.useOrgLabels.mockReturnValue(new Map([["org-a-id", "alpha"], ["org-b-id", "beta"]]));
+    withQueries([
+      query({ query_id: "a1", org: "org-a-id" }),
+      query({ query_id: "b1", org: "org-b-id" }),
+      query({ query_id: "b2", org: "org-b-id", state: "QUEUED" }),
+    ]);
+    renderPage();
+    // Busiest org first.
+    const groups = screen.getAllByTestId(/^group-/).map((g) => g.getAttribute("data-testid"));
+    expect(groups).toEqual(["group-org-b-id", "group-org-a-id"]);
+    fireEvent.click(screen.getByTestId("group-org-b-id"));
+    expect(rowIds().sort()).toEqual(["b1", "b2"]);
+    fireEvent.click(screen.getByRole("button", { name: /Clear beta/ }));
+    expect(rowIds()).toHaveLength(3);
+  });
+
+  it("shows which pool instance holds each query when the cell is pooled", () => {
+    withQueries([
+      query({ query_id: "x", instance: "cell-0a1b2c3d" }),
+      query({ query_id: "y", instance: "cell-0a1b2c3d" }),
+      query({ query_id: "z", instance: "cell-ffee0011" }),
+    ]);
+    renderPage();
+    expect(screen.getByText("By pool instance")).toBeInTheDocument();
+    expect(within(screen.getByTestId("group-cell-0a1b2c3d")).getByText("2")).toBeInTheDocument();
+    expect(within(screen.getByTestId("query-z")).getByText("cell-ffee0011")).toBeInTheDocument();
+  });
+
+  it("omits the instance breakdown for a single-coordinator cell", () => {
+    withQueries([query()]);
+    renderPage();
+    expect(screen.queryByText("By pool instance")).not.toBeInTheDocument();
+  });
+
+  it("searches SQL text and query ids, not only orgs", () => {
+    withQueries([
+      query({ query_id: "20261007_a", query: "SELECT * FROM persons" }),
+      query({ query_id: "20261007_b", query: "SELECT * FROM events" }),
+    ]);
+    renderPage();
+    const search = screen.getByPlaceholderText(/Search org/);
+    fireEvent.change(search, { target: { value: "persons" } });
+    expect(rowIds()).toEqual(["20261007_a"]);
+    fireEvent.change(search, { target: { value: "_b" } });
+    expect(rowIds()).toEqual(["20261007_b"]);
+  });
+
+  it("does not expand the row when Kill is clicked", () => {
+    withQueries([query()]);
+    renderPage();
+    fireEvent.click(screen.getByRole("button", { name: "Kill" }));
+    expect(screen.queryByText("Query id")).not.toBeInTheDocument();
   });
 });

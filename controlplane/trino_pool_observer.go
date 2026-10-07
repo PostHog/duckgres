@@ -139,6 +139,9 @@ func (o *trinoPoolObserver) Queries(ctx context.Context) ([]admin.TrinoQuery, er
 			continue
 		}
 		succeeded++
+		for i := range queries {
+			queries[i].Instance = member.instanceID
+		}
 		all = append(all, queries...)
 	}
 	if succeeded == 0 {
@@ -158,6 +161,9 @@ func (o *trinoPoolObserver) Query(ctx context.Context, queryID string) (*admin.T
 	for _, member := range members {
 		query, err := member.client.Query(ctx, queryID)
 		if err == nil {
+			if query != nil {
+				query.Instance = member.instanceID
+			}
 			return query, nil
 		}
 		lastErr = err
