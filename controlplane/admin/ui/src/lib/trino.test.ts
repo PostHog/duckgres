@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  groupTrinoQueries,
+  isWaitingTrinoQuery,
+  sortTrinoQueries,
+  trinoSqlSummary,
+  trinoStateBucket,
   TRINO_DEGRADED_FAILURE_RATIO,
   TRINO_LONG_RUNNING_MS,
   isActiveTrinoQuery,
@@ -330,7 +335,8 @@ describe("trinoStateVariant", () => {
   });
 
   it("falls back rather than throwing on a state it does not know", () => {
-    expect(trinoStateVariant("WAITING_FOR_RESOURCES")).toBe("outline");
+    expect(trinoStateVariant("SOME_FUTURE_STATE")).toBe("outline");
+    expect(trinoStateVariant("WAITING_FOR_RESOURCES")).toBe("warning");
   });
 });
 
@@ -431,5 +437,92 @@ describe("summarizeTrinoNodes from system.runtime.nodes", () => {
     expect(h.healthKnown).toBe(false);
     expect(h.failed).toBe(0);
     expect(h.degraded).toBe(0);
+  });
+});
+
+describe("waiting states", () => {
+  it("counts every pre-execution state as queued, not only QUEUED", () => {
+    const states = ["QUEUED", "WAITING_FOR_RESOURCES", "DISPATCHING", "PLANNING", "STARTING", "RUNNING", "FINISHING"];
+    const s = summarizeTrinoQueries(states.map((state, i) => query({ query_id: `q${i}`, state })));
+    expect(s.queued).toBe(5);
+    expect(s.running).toBe(2);
+  });
+  it("flags a query waiting for resources", () => {
+    expect(isWaitingTrinoQuery(query({ state: "WAITING_FOR_RESOURCES" }))).toBe(true);
+    expect(trinoQueryFlag(query({ state: "WAITING_FOR_RESOURCES" }))).toBe("queued");
+    expect(trinoStateBucket(query({ state: "PLANNING" }))).toBe("waiting");
+    expect(trinoStateBucket(query({ state: "FINISHING" }))).toBe("running");
+    expect(trinoStateBucket(query({ state: "FAILED" }))).toBe("failed");
+  });
+});
+
+describe("trinoSqlSummary", () => {
+  it("strips the SQLMesh plan comment and names the target", () => {
+    const s = trinoSqlSummary(
+      '/* SQLMESH_PLAN: 4b1d */ INSERT INTO "org_portola"."sqlmesh_trino"."events__123" ("a") SELECT 1',
+    );
+    expect(s).toMatchObject({
+      verb: "INSERT INTO",
+      target: "org_portola.sqlmesh_trino.events__123",
+      tag: "SQLMESH_PLAN: 4b1d",
+    });
+    expect(s.text.startsWith("INSERT INTO")).toBe(true);
+  });
+  it("reports DDL kind and skips IF NOT EXISTS", () => {
+    expect(trinoSqlSummary("CREATE TABLE IF NOT EXISTS a.b AS SELECT 1")).toMatchObject({
+      verb: "CREATE TABLE",
+      target: "a.b",
+    });
+    expect(trinoSqlSummary("create or replace view x.y as select 1")).toMatchObject({
+      verb: "CREATE VIEW",
+      target: "x.y",
+    });
+    expect(trinoSqlSummary("DROP TABLE IF EXISTS s.t")).toMatchObject({ verb: "DROP TABLE", target: "s.t" });
+  });
+  it("treats WITH as a read and finds its first relation", () => {
+    expect(trinoSqlSummary("-- note\nWITH c AS (SELECT * FROM s.events) SELECT * FROM c")).toMatchObject({
+      verb: "SELECT",
+      target: "s.events",
+      tag: "note",
+    });
+  });
+  it("handles empty and unknown text", () => {
+    expect(trinoSqlSummary("")).toMatchObject({ verb: "", target: "", tag: "" });
+    expect(trinoSqlSummary("SHOW CATALOGS")).toMatchObject({ verb: "SHOW", target: "" });
+  });
+});
+
+describe("groupTrinoQueries", () => {
+  it("rolls up per key, busiest first", () => {
+    const groups = groupTrinoQueries(
+      [
+        query({ query_id: "1", org: "a", cpu_ms: 10 }),
+        query({ query_id: "2", org: "b", state: "QUEUED" }),
+        query({ query_id: "3", org: "b", cpu_ms: 5, physical_input_bytes: 7 }),
+        query({ query_id: "4", org: "b", state: "FINISHED", elapsed_ms: 99_999 }),
+      ],
+      (q) => q.org,
+    );
+    expect(groups.map((g) => g.key)).toEqual(["b", "a"]);
+    expect(groups[0]).toMatchObject({ total: 3, running: 1, queued: 1, cpuMs: 5, scannedBytes: 7, longestMs: 1_000 });
+  });
+});
+
+describe("sortTrinoQueries", () => {
+  const rows = [
+    query({ query_id: "a", elapsed_ms: 5, cpu_ms: 3, state: "QUEUED" }),
+    query({ query_id: "b", elapsed_ms: 9, cpu_ms: 1 }),
+    query({ query_id: "c", elapsed_ms: 1, cpu_ms: 2, progress_percentage: 50 }),
+  ];
+  it("sorts by a numeric key in both directions without mutating", () => {
+    expect(sortTrinoQueries(rows, "cpu", "desc").map((q) => q.query_id)).toEqual(["a", "c", "b"]);
+    expect(sortTrinoQueries(rows, "cpu", "asc").map((q) => q.query_id)).toEqual(["b", "c", "a"]);
+    expect(rows.map((q) => q.query_id)).toEqual(["a", "b", "c"]);
+  });
+  it("puts running before waiting and breaks ties by elapsed", () => {
+    expect(sortTrinoQueries(rows, "state", "asc").map((q) => q.query_id)).toEqual(["b", "c", "a"]);
+  });
+  it("sorts unknown progress below zero", () => {
+    expect(sortTrinoQueries(rows, "progress", "desc")[0].query_id).toBe("c");
   });
 });

@@ -115,6 +115,14 @@ func TestTrinoPoolObserverUnionsLiveMembers(t *testing.T) {
 	if lister.poolIDs[0] != "registered:cell-001" {
 		t.Fatalf("listed pool %q, want the stored pool id", lister.poolIDs[0])
 	}
+	// Each query names the instance whose coordinator holds it, so the
+	// console can show one instance saturated while the others idle.
+	for _, q := range queries {
+		want := map[string]string{"qa": "cell-a", "qb": "cell-b"}[q.QueryID]
+		if q.Instance != want {
+			t.Fatalf("query %s instance = %q, want %q", q.QueryID, q.Instance, want)
+		}
+	}
 }
 
 // One unreachable member must not hide the rest; only a pool where every
@@ -172,6 +180,24 @@ func TestTrinoPoolObserverKillsOnOwningMember(t *testing.T) {
 	}
 	if err := o.KillQuery(context.Background(), "missing", "x"); err == nil {
 		t.Fatal("KillQuery of an unknown query succeeded")
+	}
+}
+
+func TestTrinoPoolObserverQueryDetailNamesItsInstance(t *testing.T) {
+	members := map[string]*fakePoolMember{
+		"cell-a": {queries: []admin.TrinoQuery{{QueryID: "qa"}}},
+		"cell-b": {queries: []admin.TrinoQuery{{QueryID: "qb"}}},
+	}
+	o, _, _ := poolObserverFixture([]configstore.TrinoPoolInstance{
+		instance("cell-a", trinopool.PhaseServing),
+		instance("cell-b", trinopool.PhaseServing),
+	}, members)
+	q, err := o.Query(context.Background(), "qb")
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if q.Instance != "cell-b" {
+		t.Fatalf("Query(qb).Instance = %q, want cell-b", q.Instance)
 	}
 }
 

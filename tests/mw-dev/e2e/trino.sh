@@ -410,6 +410,15 @@ done
 api "$API/api/v1/trino/queries/$query_id?cell=pool-test" | jq -e --arg q "$query_id" --arg org "$ORG_A" \
   '.query_id == $q and .org == $org' >/dev/null \
   || fail "admin Trino query detail did not identify tenant A query $query_id"
+# A pooled cell names the instance whose coordinator holds each query (the
+# console's per-instance breakdown). It must be one of the pool's own
+# instances, in both the list and the detail.
+pool_instances="$(api "$API/api/v1/trino/instances?cell=pool-test" | jq -c '[.instances[].instance_id]')"
+for view in "$(api "$API/api/v1/trino/queries?cell=pool-test&org=$ORG_A&active=1" | jq -c --arg q "$query_id" '.queries[] | select(.query_id == $q)')" \
+            "$(api "$API/api/v1/trino/queries/$query_id?cell=pool-test")"; do
+  printf %s "$view" | jq -e --argjson ids "$pool_instances" '(.instance // "") as $i | $i != "" and ($ids | index($i)) != null' >/dev/null \
+    || fail "pooled Trino query $query_id does not name a pool instance (instances $pool_instances): $view"
+done
 code="$(curl --cacert "$CA" -sS -o /tmp/trino-cross-query -w '%{http_code}' \
   --user "$DB_B:$pw_b" -H "X-Trino-User: $DB_B" "$TRINO/v1/query/$query_id")"
 [ "$code" = 403 ] || fail "tenant B query detail for tenant A returned HTTP $code, want 403: $(cat /tmp/trino-cross-query)"

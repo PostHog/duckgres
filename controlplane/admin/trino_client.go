@@ -104,6 +104,10 @@ type TrinoQuery struct {
 	ResourceGroup string `json:"resource_group"`
 	// Query is the redacted SQL text.
 	Query string `json:"query"`
+	// Instance is the shared-pool instance whose coordinator runs the query,
+	// set by the pool observer. Empty for a cell with a single coordinator.
+	// It is what shows one instance saturated while the others are idle.
+	Instance string `json:"instance,omitempty"`
 
 	Created   time.Time `json:"created,omitempty"`
 	ElapsedMS int64     `json:"elapsed_ms"`
