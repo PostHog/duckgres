@@ -57,35 +57,47 @@ var handoverOverrides = map[string]string{
 	envTrinoPoolNodeDisruptionEnabled: "false",
 }
 
-// applyControlHandover checks the config store for a provisioning hand-over
-// and, when one is recorded, turns every duckgres writer of Duckling and
-// Trino pool state off for this process. It is read once at startup:
-// toggling it takes a restart, which is also what keeps a running replica
-// from flipping mid-reconcile. A read error fails startup rather than
-// guessing, because guessing wrong means two writers.
-func applyControlHandover(db *gorm.DB) error {
+// readControlHandoverOwner returns the control plane recorded as the owner of
+// provisioning, or "" when there is none. A missing table means no hand-over.
+func readControlHandoverOwner(db *gorm.DB) (string, error) {
 	var owners []string
 	err := db.Raw("SELECT owner FROM " + controlHandoverTable + " WHERE component = 'provisioning'").Scan(&owners).Error
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "42P01" { // undefined_table
-			return nil
+			return "", nil
 		}
-		return fmt.Errorf("read control hand-over: %w", err)
+		return "", fmt.Errorf("read control hand-over: %w", err)
 	}
 	if len(owners) == 0 {
-		return nil
+		return "", nil
+	}
+	return owners[0], nil
+}
+
+// applyControlHandover checks the config store for a provisioning hand-over
+// and, when one is recorded, turns every duckgres writer of Duckling and
+// Trino pool state off for this process. It is read once at startup:
+// toggling it takes a restart, which is also what keeps a running replica
+// from flipping mid-reconcile. A read error fails startup rather than
+// guessing, because guessing wrong means two writers. It returns the
+// recorded owner ("" when there is no hand-over) so the management API's
+// read-only gate starts from the same answer (see management_read_only.go).
+func applyControlHandover(db *gorm.DB) (string, error) {
+	owner, err := readControlHandoverOwner(db)
+	if err != nil || owner == "" {
+		return "", err
 	}
 	controlHandedOver = true
 	for key, value := range handoverOverrides {
 		if err := os.Setenv(key, value); err != nil {
-			return err
+			return "", err
 		}
 	}
 	if err := os.Unsetenv(envTrinoDefaultCell); err != nil {
-		return err
+		return "", err
 	}
 	slog.Warn("Provisioning is handed over to another control plane; Duckling lifecycle, Trino projections and the Trino pool operator are off in this process.",
-		"owner", owners[0], "table", controlHandoverTable)
-	return nil
+		"owner", owner, "table", controlHandoverTable)
+	return owner, nil
 }
