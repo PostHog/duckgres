@@ -1,14 +1,18 @@
 import type { ReactNode } from "react";
+import { DeprecationBanner } from "@/components/DeprecationBanner";
 import { Sidebar } from "@/components/Sidebar";
 import { Topbar } from "@/components/Topbar";
 
 export function AppShell({ children }: { children: ReactNode }) {
   return (
-    <div className="flex h-screen overflow-hidden">
-      <Sidebar />
-      <div className="flex min-w-0 flex-1 flex-col">
-        <Topbar />
-        <main className="flex-1 overflow-y-auto">{children}</main>
+    <div className="flex h-screen flex-col overflow-hidden">
+      <DeprecationBanner />
+      <div className="flex min-h-0 flex-1">
+        <Sidebar />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <Topbar />
+          <main className="flex-1 overflow-y-auto">{children}</main>
+        </div>
       </div>
     </div>
   );
