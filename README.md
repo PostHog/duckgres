@@ -1,5 +1,16 @@
 # Duckgres
 
+## ⚠️ PostHog has discontinued work on duckgres
+
+**As of October 8, 2026, PostHog is no longer developing duckgres.**
+
+This repository will receive no new features, and issues and pull requests will
+not be reviewed. The code remains available under the MIT license for anyone
+who wants to read, fork or build on it.
+
+Thank you to everyone who used duckgres, filed issues and contributed along the
+way.
+
 > [!WARNING]
 > **Deprecated: the Duckgres management plane has been replaced by hogtower.**
 > The provisioning/admin API and the admin console are deprecated and will be
