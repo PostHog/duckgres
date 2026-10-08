@@ -1,5 +1,11 @@
 # Duckgres
 
+> [!WARNING]
+> **Deprecated: the Duckgres management plane has been replaced by hogtower.**
+> The provisioning/admin API and the admin console are deprecated and will be
+> removed. Use hogtower to manage warehouses. PostgreSQL wire protocol (pgwire)
+> and DuckDB query serving are unaffected.
+
 Trino operators: see [cell registration and placement](docs/trino-cells.md) for
 the shared-pool registry, initial placement, and retirement prerequisites.
 
