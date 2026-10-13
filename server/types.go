@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/big"
 	"strings"
@@ -691,6 +692,38 @@ func encodeNumeric(v interface{}) []byte {
 		// HUGEINT comes from the Go driver as *big.Int (scale 0)
 		val = new(big.Int).Set(x)
 		dscale = 0
+	case uint64:
+		// UBIGINT can arrive as a native Go uint64 (scale 0). uint64 exceeds
+		// int64, so build the big.Int from the unsigned value directly.
+		val = new(big.Int).SetUint64(x)
+		dscale = 0
+	case uint:
+		val = new(big.Int).SetUint64(uint64(x))
+		dscale = 0
+	case uint8:
+		val = big.NewInt(int64(x))
+		dscale = 0
+	case uint16:
+		val = big.NewInt(int64(x))
+		dscale = 0
+	case uint32:
+		val = big.NewInt(int64(x))
+		dscale = 0
+	case int:
+		val = big.NewInt(int64(x))
+		dscale = 0
+	case int8:
+		val = big.NewInt(int64(x))
+		dscale = 0
+	case int16:
+		val = big.NewInt(int64(x))
+		dscale = 0
+	case int32:
+		val = big.NewInt(int64(x))
+		dscale = 0
+	case int64:
+		val = big.NewInt(x)
+		dscale = 0
 	case string:
 		// Arrow Flight returns decimals with non-zero scale as strings like "123.45".
 		// Parse the string back into unscaled big.Int + scale.
@@ -712,8 +745,12 @@ func encodeNumeric(v interface{}) []byte {
 			val.Neg(val)
 		}
 	default:
-		// Fallback: try to format as text and let the caller handle it
-		return encodeText(v)
+		// A NUMERIC column reached the wire with a Go type we cannot encode as
+		// binary numeric. Emitting text bytes here would corrupt the field for
+		// any client that requested binary results, so refuse loudly and let
+		// the caller surface a clean error instead.
+		slog.Error("encodeNumeric: unsupported Go type for binary numeric encoding", "go_type", fmt.Sprintf("%T", v))
+		return nil
 	}
 
 	// Handle sign
