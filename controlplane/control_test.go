@@ -327,21 +327,24 @@ func TestUseExploratoryTierExclusions(t *testing.T) {
 		cfg:             ControlPlaneConfig{K8s: K8sConfig{AllowClientWorkerProfile: true}},
 	}
 
-	if !remote.useExploratoryTier(profile, false, nil) {
+	if !remote.useExploratoryTier(profile, false, false, nil) {
 		t.Fatal("a plain remote-backend connection must use the exploratory tier")
 	}
-	if remote.useExploratoryTier(profile, true, nil) {
+	if remote.useExploratoryTier(profile, true, false, nil) {
 		t.Fatal("passthrough users must be excluded from the exploratory tier")
 	}
-	if remote.useExploratoryTier(nil, false, nil) {
+	if remote.useExploratoryTier(profile, false, true, nil) {
+		t.Fatal("a session-affinity request must bypass the exploratory tier")
+	}
+	if remote.useExploratoryTier(nil, false, false, nil) {
 		t.Fatal("a nil exploratory profile (tier off/half-configured) must degrade to today's behavior")
 	}
-	if remote.useExploratoryTier(profile, false, map[string]string{"duckgres.worker_cpu": "4"}) {
+	if remote.useExploratoryTier(profile, false, false, map[string]string{"duckgres.worker_cpu": "4"}) {
 		t.Fatal("a client-supplied worker shape must bypass the exploratory tier")
 	}
 
 	local := &ControlPlane{isRemoteBackend: false, cfg: remote.cfg}
-	if local.useExploratoryTier(profile, false, nil) {
+	if local.useExploratoryTier(profile, false, false, nil) {
 		t.Fatal("non-remote backends have no worker pods to size")
 	}
 }
