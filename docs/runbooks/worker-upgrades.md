@@ -41,7 +41,7 @@ Worker images are produced by [`.github/workflows/container-image-worker-cd.yml`
 | `ghcr.io/posthog/duckgres-worker:latest`         | Default DuckDB version, latest `main`       |
 | `ghcr.io/posthog/duckgres-worker:<sha>-duckdb<X.Y.Z>` | Specific DuckDB version, this commit   |
 
-The same tags exist mirrored in ECR at `795637471508.dkr.ecr.us-east-1.amazonaws.com/duckgres-worker:...`.
+The same tags exist mirrored in ECR at `520209747622.dkr.ecr.us-east-1.amazonaws.com/duckgres-worker:...`.
 
 To list what's currently available:
 
@@ -50,7 +50,7 @@ To list what's currently available:
 gh api /users/posthog/packages/container/duckgres-worker/versions --jq '.[].metadata.container.tags[]' | sort -u
 
 # ECR (requires AWS auth)
-aws ecr list-images --repository-name duckgres-worker --region us-east-1 \
+aws ecr list-images --registry-id 520209747622 --repository-name duckgres-worker --region us-east-1 \
   --query 'imageIds[].imageTag' --output text | tr '\t' '\n' | sort -u
 ```
 

@@ -28,9 +28,9 @@
 #   after approval, or force an approval click on every maintainer push.)
 #
 # Required repo configuration (one-time, see tests/mw-dev/README.md):
-#   vars:    TS_WIF_CLIENT_ID_MW_DEV, TS_WIF_AUDIENCE_MW_DEV
-#   secrets: AWS_ECR_PUBLISH_IAM_ROLE (already exists, used by CD),
-#            MW_DEV_ACCOUNT_ID (mw-dev AWS account id; ARNs built from it),
+#   vars:    TS_WIF_CLIENT_ID_MW_DEV, TS_WIF_AUDIENCE_MW_DEV,
+#            AWS_ECR_SHARED_SERVICES_PRS_PUBLISH_IAM_ROLE (duckgres-prs push)
+#   secrets: MW_DEV_ACCOUNT_ID (mw-dev AWS account id; ARNs built from it),
 #            MW_DEV_TRINO_POD_IDENTITY_ROLE (full ARN; kept out of public git)
 #   IAM:     github-duckgres-e2e role in the mw-dev account (posthog-cloud-infra)
 #            — stripped down, NOT the account-admin terraform-infra role.
@@ -96,7 +96,7 @@ jobs:
         DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
         POSTGRES_SCANNER_TAG=v1.5.5-a3516c0
     secrets:
-      ecr-role: ${{ vars.AWS_ECR_PRS_PUBLISH_IAM_ROLE }}
+      ecr-role: ${{ vars.AWS_ECR_SHARED_SERVICES_PRS_PUBLISH_IAM_ROLE }}
 
   e2e_lanes:
     needs: [build]
