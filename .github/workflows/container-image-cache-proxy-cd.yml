@@ -10,7 +10,7 @@ on:
     workflow_dispatch:
 
 env:
-    ECR_REGISTRY: 795637471508.dkr.ecr.us-east-1.amazonaws.com
+    ECR_REGISTRY: 520209747622.dkr.ecr.us-east-1.amazonaws.com
     GHCR_REGISTRY: ghcr.io
     IMAGE_NAME: duckgres-cache-proxy
 
@@ -34,7 +34,7 @@ jobs:
             - name: Configure AWS credentials
               uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
               with:
-                  role-to-assume: ${{ vars.AWS_ECR_PUBLISH_IAM_ROLE }}
+                  role-to-assume: ${{ vars.AWS_ECR_SHARED_SERVICES_PUBLISH_IAM_ROLE }}
                   aws-region: us-east-1
 
             - name: Login to Amazon ECR
