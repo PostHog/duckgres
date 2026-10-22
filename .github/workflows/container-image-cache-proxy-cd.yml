@@ -10,6 +10,7 @@ on:
     workflow_dispatch:
 
 env:
+    ECR_REGISTRY: 520209747622.dkr.ecr.us-east-1.amazonaws.com
     GHCR_REGISTRY: ghcr.io
     IMAGE_NAME: duckgres-cache-proxy
 
@@ -33,8 +34,6 @@ jobs:
             - name: Configure AWS credentials
               uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
               with:
-                  # Shared-services ECR publish role. The registry comes from the
-                  # ecr-login output, so it follows the role's account.
                   role-to-assume: ${{ vars.AWS_ECR_SHARED_SERVICES_PUBLISH_IAM_ROLE }}
                   aws-region: us-east-1
 
@@ -58,7 +57,7 @@ jobs:
                   push: true
                   platforms: linux/arm64
                   tags: |
-                      ${{ steps.aws-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+                      ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
                       ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:${{ github.sha }}
                       ${{ env.GHCR_REGISTRY }}/posthog/${{ env.IMAGE_NAME }}:latest
                   build-args: |
@@ -70,7 +69,7 @@ jobs:
             - name: Get image digest
               id: digest
               run: |
-                  digest=$(docker buildx imagetools inspect --raw ${{ steps.aws-ecr.outputs.registry }}/${{ env.IMAGE_NAME }}:${{ github.sha }} | sha256sum | awk '{print "sha256:"$1}')
+                  digest=$(docker buildx imagetools inspect --raw ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} | sha256sum | awk '{print "sha256:"$1}')
                   echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
             - name: Get deployer token
