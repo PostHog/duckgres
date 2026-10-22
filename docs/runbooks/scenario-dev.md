@@ -39,12 +39,12 @@ execute inside Kubernetes.
 
 Configure these repository secrets:
 
-- `AWS_ECR_PUBLISH_IAM_ROLE`
 - `MW_DEV_ACCOUNT_ID`
 - `MW_DEV_TRINO_POD_IDENTITY_ROLE`
 
 Configure these repository variables:
 
+- `AWS_ECR_SHARED_SERVICES_PRS_PUBLISH_IAM_ROLE`
 - `TS_WIF_CLIENT_ID_MW_DEV`
 - `TS_WIF_AUDIENCE_MW_DEV`
 - `MW_DEV_SCENARIO_PERF_SECRET_ID`

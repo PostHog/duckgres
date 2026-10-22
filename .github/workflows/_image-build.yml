@@ -49,7 +49,7 @@ on:
         value: ${{ jobs.build.outputs.image }}
 
 env:
-  ECR_REGISTRY: 795637471508.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REGISTRY: 520209747622.dkr.ecr.us-east-1.amazonaws.com
 
 jobs:
   build:

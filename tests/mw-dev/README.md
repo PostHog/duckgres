@@ -691,7 +691,7 @@ finalizers are still running.
 | var | `TS_WIF_AUDIENCE_MW_DEV` | Tailscale WIF audience |
 | secret | `MW_DEV_ACCOUNT_ID` | mw-dev AWS account id (kept out of committed code; ARNs are built from it) |
 | secret | `MW_DEV_TRINO_POD_IDENTITY_ROLE` | full ARN of the dedicated mw-dev Trino Pod Identity role (consumed only by the Trino lane) |
-| secret | `AWS_ECR_PUBLISH_IAM_ROLE` | ECR push (already exists; used by CD) |
+| var | `AWS_ECR_SHARED_SERVICES_PRS_PUBLISH_IAM_ROLE` | ECR push to `duckgres-prs` (shared-services `github-duckgres-prs-publish-role`) |
 | (role) | `github-duckgres-e2e` | dedicated stripped role in the mw-dev account (posthog-cloud-infra) — `eks:DescribeCluster` + Pod Identity association calls + `iam:PassRole`/`iam:GetRole` on the CP and dedicated Trino roles + an EKS access entry for kubectl. The workflow assumes `arn:aws:iam::<MW_DEV_ACCOUNT_ID>:role/github-duckgres-e2e`. |
 | repo setting | "Require approval for all outside collaborators" | the access gate (see below) |
 
