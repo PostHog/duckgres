@@ -1,0 +1,52 @@
+name: Renovate
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      dryRun:
+        description: 'Log the updates without opening PRs?'
+        type: choice
+        default: 'false'
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+
+jobs:
+  renovate:
+    name: Renovate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Get token
+        id: get_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.GH_APP_POSTHOG_RENOVATE_APP_ID }}
+          private-key: ${{ secrets.GH_APP_POSTHOG_RENOVATE_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: renovatebot/github-action@1cd96b855fee0da6f230617e89dbff0e06ea393a # v46.3.5
+        with:
+          configurationFile: .github/renovate.json5
+          token: ${{ steps.get_token.outputs.token }}
+          renovate-version: 42.74.2
+        env:
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          # The configuration file above holds all the rules, so the repository needs no config of its own.
+          RENOVATE_REQUIRE_CONFIG: 'ignored'
+          # The commits go through the GitHub API, so GitHub signs them.
+          RENOVATE_PLATFORM_COMMIT: 'enabled'
+          RENOVATE_DRY_RUN: ${{ github.event.inputs.dryRun == 'true' && 'full' || 'null' }}
