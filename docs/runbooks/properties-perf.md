@@ -80,18 +80,26 @@ fixture catalogs and metadata without deleting source S3 files.
 | duckgres (cache) | On | JSON |
 | trino (vanilla) | Off | JSON |
 | trino (cache) | On | JSON |
-| trino (cache+variant) | On | VARIANT — explicitly skipped |
+| trino (variant) | Off | VARIANT (shredded) |
+| trino (cache+variant) | On | VARIANT (shredded) |
 | Athena | — | STRUCT |
 
 There are two intents: browser counts and event counts filtered to Chrome.
 Supported engines must return identical complete ordered results; Athena runs
 only STRUCT, validated against the shared Duckgres/Trino JSON baseline for each
 intent. Measurements use one warmup and four measured
-iterations. Hoglake does not support VARIANT, so its comparisons emit `skipped`
-results with `unsupported_representation`, iteration zero, and no timing. They
-are excluded from measured/warmup counts and never enter the correctness gate.
-Enable them only after native support and fixture registration are available;
-do not substitute JSON under a VARIANT label.
+iterations. Trino also reads the native VARIANT column, shredded on `$browser`,
+on both cache settings: Hoglake registers `properties_perf.events_variant` from
+the fixture's canonical copy and pushes the `['$browser']` subscript down to the
+shredded sub-column. Its results enter the same correctness gate as Athena's.
+The supported copy (the Athena table location) omits VARIANT because Athena
+cannot read it, so the canonical prefix is recorded on the same Glue table as
+the `duckgres.properties_variant_location` parameter (override with
+`DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI`). Set it when generating a
+fixture: a table without it fails the properties phase rather than silently
+dropping VARIANT. Only Parquet files directly or recursively under that prefix
+are registered, so point it at a tree holding only canonical data files and
+manifests. Never substitute JSON under a VARIANT label.
 
 ## Results and recovery
 

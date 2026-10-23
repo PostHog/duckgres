@@ -373,10 +373,13 @@ The properties catalog measures JSON with `duckgres (vanilla)`, `duckgres (cache
 `trino (vanilla)` and `trino (cache)`, plus STRUCT with Athena, so every engine
 covers every properties intent. Athena executes only STRUCT;
 its complete ordered results must match the shared Duckgres/Trino JSON baseline
-for each intent before properties measurements start. `trino (cache+variant)` is explicitly
-unsupported until Hoglake supports VARIANT: its two comparisons emit `skipped`
-rows with a reason and no timings. Skipped rows use iteration zero and are
-excluded from measured/warmup query counts.
+for each intent before properties measurements start. Trino additionally reads
+the native VARIANT column, shredded on `$browser`, as `trino (variant)` and
+`trino (cache+variant)`; those results pass the same JSON-baseline gate. The
+VARIANT table is registered from the fixture's canonical copy, located through
+the Glue table's `duckgres.properties_variant_location` parameter (see the
+runbook). A query with a `skip_reason` still emits `skipped` rows with iteration
+zero, excluded from measured/warmup query counts.
 
 Both suites of one nightly publish under the same dataset version
 (`posthog-file-views-v1`, shared through a YAML anchor in the scenario), with

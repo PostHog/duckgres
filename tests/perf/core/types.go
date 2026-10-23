@@ -29,6 +29,8 @@ func (p Protocol) RunLabel(representation string) string {
 		return "trino (vanilla)"
 	case p == ProtocolTrinoCached && representation == "json":
 		return "trino (cache)"
+	case p == ProtocolTrino && representation == "variant":
+		return "trino (variant)"
 	case p == ProtocolTrinoCached && representation == "variant":
 		return "trino (cache+variant)"
 	default:
