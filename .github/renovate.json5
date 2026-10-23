@@ -1,0 +1,49 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-global-schema.json",
+
+  // config:best-practices pins every image to a digest, so a rebuilt upstream tag shows up as an update.
+  "globalExtends": ["config:best-practices"],
+
+  "enabledManagers": ["dockerfile", "gomod"],
+  // The client-compat and test images do not ship.
+  "ignorePaths": ["**/node_modules/**", "**/vendor/**", "**/tests/**", "scripts/client-compat/**"],
+  "postUpdateOptions": ["gomodTidy"],
+
+  // Routine updates wait for one weekly window. Security fixes skip it.
+  "schedule": ["before 9am on monday"],
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "addLabels": ["security"],
+    "groupName": "security fixes"
+  },
+
+  "packageRules": [
+    {
+      // One PR moves every image to the newest digest of its tag. A Go patch release or a Debian refresh changes the digest.
+      "matchManagers": ["dockerfile"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
+      "groupName": "base image digests"
+    },
+    {
+      // Renovate skips indirect modules by default, but they carry most security fixes, for example golang.org/x/net.
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["indirect"],
+      "enabled": true
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "go modules",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      // The go line sets the GODEBUG defaults, so it moves only by a deliberate change.
+      "matchDatasources": ["golang-version"],
+      "enabled": false
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
