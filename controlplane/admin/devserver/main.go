@@ -106,17 +106,16 @@ func main() {
 		log.Fatalf("static dir %q has no models.html (run from repo root, or pass --static): %v", absStatic, err)
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	baseDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		baseDirector(req)
-		req.Host = targetURL.Host
-		// Inject the service-to-service secret server-side; never trust or
-		// forward a browser cookie/credential through the dev proxy.
-		req.Header.Del("Cookie")
-		if secretStr != "" {
-			req.Header.Set("X-Duckgres-Internal-Secret", secretStr)
-		}
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(targetURL)
+			// Inject the service-to-service secret server-side; never trust or
+			// forward a browser cookie/credential through the dev proxy.
+			r.Out.Header.Del("Cookie")
+			if secretStr != "" {
+				r.Out.Header.Set("X-Duckgres-Internal-Secret", secretStr)
+			}
+		},
 	}
 
 	mux := http.NewServeMux()
