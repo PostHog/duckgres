@@ -10,8 +10,12 @@ github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5 h1:TngWCqHvy9oXAN6lEV
 github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5/go.mod h1:lmUJ/7eu/Q8D7ML55dXQrVaamCz2vxCfdQBasLZfHKk=
 github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.3 h1:imLksCd041JuUbdg4FUx2/VgUfLXpXlHmiIUkiLmRUM=
 github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.3/go.mod h1:si4fhkU5nVX82UqieuHih5FkAIzbHQaJCxJ6BITL4U8=
+github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.4 h1:Uz948v1Q/7uVA33AnFdb24pWHF/a9qw+k7Vx1+4AWw0=
+github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.4/go.mod h1:si4fhkU5nVX82UqieuHih5FkAIzbHQaJCxJ6BITL4U8=
 github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.3 h1:F/IIs7AU5iR/qe2pjRVVXIYLywkAPDgjogxs9RkZ3MI=
 github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.3/go.mod h1:MSpni+1dJdPoTQjbn+H702kD1iVveoQ6qWDdshBn140=
+github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.4 h1:OEhdfJKvz1Drki8ap7dE20t2+DIHPSnEU1RtFu+3aE4=
+github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.4/go.mod h1:MSpni+1dJdPoTQjbn+H702kD1iVveoQ6qWDdshBn140=
 github.com/agnivade/levenshtein v1.2.1 h1:EHBY3UOn1gwdy/VbFwgo4cxecRznFk7fKWN1KOX7eoM=
 github.com/agnivade/levenshtein v1.2.1/go.mod h1:QVVI16kDrtSuwcpd0p1+xMC6Z/VfhtCyDIjcwga4/DU=
 github.com/ahmetb/dlog v0.0.0-20170105205344-4fb5f8204f26 h1:3YVZUqkoev4mL+aCwVOSWV4M7pN+NURHL38Z2zq5JKA=
