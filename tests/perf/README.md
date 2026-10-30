@@ -374,15 +374,15 @@ The properties catalog measures JSON with `duckgres (vanilla)`, `duckgres (cache
 covers every properties intent. Athena executes only STRUCT;
 its complete ordered results must match the shared Duckgres/Trino JSON baseline
 for each intent before properties measurements start. Trino additionally reads
-the native VARIANT column, shredded on `$browser`, as `trino (variant)` and
-`trino (cache+variant)`, and the unshredded column as `trino (variant
-unshredded)` and `trino (cache+variant unshredded)`; those results pass the same
-JSON-baseline gate. A third intent counts `$lib_version`, a key the shredded
-copy does not shred, on Trino only (JSON and both VARIANT forms). The shredded
-two VARIANT tables are registered from the `shredded/` and `unshredded/`
-prefixes of one pyhoglake fixture, given by the dispatch inputs
-`properties_variant_s3_uri` and `properties_variant_unshredded_s3_uri` (see the
-runbook). A query with a `skip_reason` still emits `skipped` rows with iteration
+the native VARIANT column, shredded on the production `properties_sv`
+declaration, as `trino (variant)` and `trino (cache+variant)`, and unshredded
+as `trino (variant unshredded)` and `trino (cache+variant unshredded)`; those
+results pass the same JSON-baseline gate. A third intent counts `$lib_version`,
+a key the shredded copy does not shred, on Trino only (JSON and both VARIANT
+forms). The two VARIANT tables are registered from the `shredded/` and
+`unshredded/` prefixes of one finished pyhoglake fixture, given by the dispatch
+inputs `properties_variant_s3_uri` and `properties_variant_unshredded_s3_uri`
+(see the runbook). A query with a `skip_reason` still emits `skipped` rows with iteration
 zero, excluded from measured/warmup query counts.
 
 Both suites of one nightly publish under the same dataset version

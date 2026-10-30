@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
 	scenariodbt "github.com/posthog/duckgres/tests/mw-dev/scenario/dbt"
 	scenarioperf "github.com/posthog/duckgres/tests/mw-dev/scenario/perf"
@@ -1139,6 +1142,30 @@ func TestVariantSourcesAreBothFormsOfOneFixture(t *testing.T) {
 		if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
 			t.Fatalf("%+v: want error %q, got %v", tc, tc.wantErr, err)
 		}
+	}
+}
+
+type completionListing struct{ keys []string }
+
+func (c completionListing) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	out := &s3.ListObjectsV2Output{}
+	for _, key := range c.keys {
+		if strings.HasPrefix(key, aws.ToString(in.Prefix)) {
+			out.Contents = append(out.Contents, s3types.Object{Key: aws.String(key)})
+		}
+	}
+	return out, nil
+}
+
+func TestVariantFixtureMustBeComplete(t *testing.T) {
+	const shredded = "s3://b/r/variant-pyhoglake/v1/shredded/"
+	done := completionListing{[]string{"r/variant-pyhoglake/v1/complete.json", "r/variant-pyhoglake/v1/shredded/d/part-000000.parquet"}}
+	if err := requireCompleteFixture(context.Background(), done, shredded); err != nil {
+		t.Fatal(err)
+	}
+	partial := completionListing{[]string{"r/variant-pyhoglake/v1/shredded/d/part-000000.parquet", "r/variant-pyhoglake/v1/complete.json.partial"}}
+	if err := requireCompleteFixture(context.Background(), partial, shredded); err == nil || !strings.Contains(err.Error(), "unfinished") {
+		t.Fatalf("a fixture without complete.json must be refused, got %v", err)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,8 +79,8 @@ func (e dispatchExecutor) runPropertiesComparison(ctx context.Context, step core
 type preparedPropertiesComparison struct {
 	directory string
 	dataset   *properties.Dataset
-	// variant is the canonical copy with the native, shredded VARIANT column
-	// that Trino reads; dataset (the supported copy) omits it for Athena.
+	// variant is the pyhoglake copy with the native VARIANT column shredded on
+	// properties_sv; dataset (the supported copy) omits VARIANT for Athena.
 	variant *properties.Dataset
 	// unshredded is the pyhoglake copy whose VARIANT column has no typed_value.
 	unshredded *properties.Dataset
@@ -108,6 +109,25 @@ func variantSources() (string, string, error) {
 		return "", "", fmt.Errorf("properties_variant_s3_uri and properties_variant_unshredded_s3_uri must be the shredded/ and unshredded/ prefixes of one fixture root")
 	}
 	return shredded, unshredded, nil
+}
+
+// requireCompleteFixture refuses a VARIANT fixture whose writer has not yet
+// written <root>/complete.json, the last object of a finished, validated run:
+// a partial tree would register, hydrate and only then fail the gate.
+func requireCompleteFixture(ctx context.Context, client properties.S3Client, shredded string) error {
+	u, err := url.Parse(strings.TrimSuffix(strings.TrimSuffix(shredded, "/"), "/shredded"))
+	if err != nil || u.Scheme != "s3" || u.Host == "" {
+		return fmt.Errorf("properties_variant_s3_uri is not an s3:// prefix")
+	}
+	key := strings.TrimPrefix(u.Path, "/") + "/complete.json"
+	out, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(u.Host), Prefix: aws.String(key), MaxKeys: aws.Int32(1)})
+	if err != nil {
+		return fmt.Errorf("check VARIANT fixture completion: %w", err)
+	}
+	if len(out.Contents) == 0 || aws.ToString(out.Contents[0].Key) != key {
+		return fmt.Errorf("VARIANT fixture has no complete.json beside shredded/ and unshredded/; it is unfinished")
+	}
+	return nil
 }
 
 func preparePropertiesComparison(ctx context.Context, source string, step core.Step) (*preparedPropertiesComparison, error) {
@@ -142,6 +162,9 @@ func preparePropertiesComparison(ctx context.Context, source string, step core.S
 	}
 	variantSource, unshreddedSource, err := variantSources()
 	if err != nil {
+		return nil, err
+	}
+	if err := requireCompleteFixture(ctx, s3.NewFromConfig(cfg), variantSource); err != nil {
 		return nil, err
 	}
 	variant, err := properties.Discover(ctx, s3.NewFromConfig(cfg), variantSource)

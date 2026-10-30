@@ -93,30 +93,28 @@ only (JSON and both VARIANT forms) and has no STRUCT.
 Supported engines must return identical complete ordered results; Athena runs
 only STRUCT, validated against the shared Duckgres/Trino JSON baseline for each
 intent. Measurements use one warmup and four measured
-iterations. Trino also reads the native VARIANT column, shredded on `$browser`,
-on both cache settings: Hoglake registers `properties_perf.events_variant` from
-the fixture's canonical copy and pushes the `['$browser']` subscript down to the
-shredded sub-column. Its results enter the same correctness gate as Athena's.
-The supported copy (the Athena table location) omits VARIANT because Athena
-cannot read it, so the canonical prefix is recorded on the same Glue table as
-the `duckgres.properties_variant_location` parameter (override with
-`DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI`). Set it when generating a
-fixture: a table without it fails the properties phase rather than silently
-dropping VARIANT. Only Parquet files directly or recursively under that prefix
-are registered, so point it at a tree holding only canonical data files and
-manifests. Never substitute JSON under a VARIANT label.
+iterations. Trino also reads the native VARIANT column on both cache settings,
+in two layouts. `properties_perf.events_variant` is a pyhoglake copy shredded
+on the production `properties_sv` declaration (16 string keys, `$browser`
+among them): Hoglake pushes the `['$browser']` subscript down to its
+sub-column, and `$lib_version` is looked up in the residual.
+`properties_perf.events_variant_unshredded` is a pyhoglake copy with no
+`typed_value`, read whole and looked up row by row. Their results enter the
+same correctness gate as Athena's. The supported copy (the Athena table
+location) omits VARIANT because Athena cannot read it. Never substitute JSON
+under a VARIANT label.
 
-The unshredded series reads `properties_perf.events_variant_unshredded`, a
-pyhoglake copy whose VARIANT column has no `typed_value` and so is read whole
-and looked up row by row. On this branch both VARIANT series read one
-pyhoglake fixture, so they differ only in layout: dispatch with
+Both VARIANT series read one pyhoglake fixture, so they differ only in layout:
+dispatch with
 `properties_variant_s3_uri` = `<root>/shredded/` and
 `properties_variant_unshredded_s3_uri` = `<root>/unshredded/` (the Job's
 `DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI` and
 `DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI`). A missing input, or
-two prefixes that are not siblings under one root, fails the properties phase;
-the Glue parameter's canonical copy is not used. `fixture_version` hashes all
-three copies.
+two prefixes that are not siblings under one root, or a root without the
+writer's final `complete.json`, fails the properties phase; the Glue
+`duckgres.properties_variant_location` parameter (the DuckDB-written canonical
+copy) is not used on this branch. Only `.parquet` objects under each prefix
+register. `fixture_version` hashes all three copies.
 
 ## Results and recovery
 
