@@ -2,6 +2,11 @@ module github.com/posthog/duckgres
 
 go 1.25.4
 
+// Keep server listeners on plain TCP. Since Go 1.24 net.Listen opens IPPROTO_MPTCP
+// sockets when the kernel supports MPTCP; see internal/netlisten for the CVE-2026-98432
+// rationale. Remove only with a replacement that pins the same behaviour.
+godebug multipathtcp=0
+
 require (
 	github.com/apache/arrow-go/v18 v18.5.1
 	github.com/aws/aws-sdk-go-v2 v1.45.1

@@ -28,6 +28,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/posthog/duckgres/internal/netlisten"
 )
 
 // stampedHandler emits log records in the order: time, level, pod, node,
@@ -286,22 +288,41 @@ func main() {
 	healthMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	healthServer := &http.Server{Addr: healthAddr, Handler: healthMux}
 
+	// Bind before serving: the listener carries the socket options, so every port
+	// has to come from netlisten rather than http.Server.ListenAndServe (see
+	// internal/netlisten for why, and go.mod's godebug directive for the default).
+	s3Listener, err := netlisten.Listen("tcp", listenAddr)
+	if err != nil {
+		slog.Error("Failed to bind forward HTTP proxy.", "addr", listenAddr, "error", err)
+		os.Exit(1)
+	}
+	peerListener, err := netlisten.Listen("tcp", peerAddr)
+	if err != nil {
+		slog.Error("Failed to bind peer API.", "addr", peerAddr, "error", err)
+		os.Exit(1)
+	}
+	healthListener, err := netlisten.Listen("tcp", healthAddr)
+	if err != nil {
+		slog.Error("Failed to bind health/metrics.", "addr", healthAddr, "error", err)
+		os.Exit(1)
+	}
+
 	// Start servers
 	go func() {
 		slog.Info("Forward HTTP proxy listening.", "addr", listenAddr)
-		if err := s3Server.ListenAndServe(); err != http.ErrServerClosed {
+		if err := s3Server.Serve(s3Listener); err != http.ErrServerClosed {
 			slog.Error("Forward HTTP proxy error.", "error", err)
 		}
 	}()
 	go func() {
 		slog.Info("Peer API listening.", "addr", peerAddr)
-		if err := peerServer.ListenAndServe(); err != http.ErrServerClosed {
+		if err := peerServer.Serve(peerListener); err != http.ErrServerClosed {
 			slog.Error("Peer API error.", "error", err)
 		}
 	}()
 	go func() {
 		slog.Info("Health/metrics listening.", "addr", healthAddr)
-		if err := healthServer.ListenAndServe(); err != http.ErrServerClosed {
+		if err := healthServer.Serve(healthListener); err != http.ErrServerClosed {
 			slog.Error("Health server error.", "error", err)
 		}
 	}()

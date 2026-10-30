@@ -4,13 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
+
+	"github.com/posthog/duckgres/internal/netlisten"
 )
 
 // ACMEManager wraps autocert.Manager to provide Let's Encrypt TLS certificates.
@@ -49,7 +50,7 @@ func NewACMEManager(domain, email, cacheDir, httpAddr string) (*ACMEManager, err
 	// Start HTTP listener for ACME HTTP-01 challenges.
 	// Use mgr.HTTPHandler with a 404 fallback instead of nil to avoid
 	// creating an open HTTP-to-HTTPS redirector on port 80.
-	ln, err := net.Listen("tcp", httpAddr)
+	ln, err := netlisten.Listen("tcp", httpAddr)
 	if err != nil {
 		return nil, err
 	}

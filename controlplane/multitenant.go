@@ -900,13 +900,18 @@ func SetupMultiTenant(
 	}
 
 	apiServer := &http.Server{
-		Addr:    ":8080",
 		Handler: engine,
+	}
+	apiListenAddr := ":8080"
+	apiListener, err := netlisten.Listen("tcp", apiListenAddr)
+	if err != nil {
+		slog.Error("Failed to bind API server.", "addr", apiListenAddr, "error", err)
+		os.Exit(1)
 	}
 	apiServer.RegisterOnShutdown(trinoPoolMetrics.configurePools(poolOperators))
 	go func() {
-		slog.Info("Starting API server.", "addr", apiServer.Addr)
-		if err := apiServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		slog.Info("Starting API server.", "addr", apiListenAddr)
+		if err := apiServer.Serve(apiListener); err != nil && err != http.ErrServerClosed {
 			slog.Warn("API server error.", "error", err)
 		}
 	}()

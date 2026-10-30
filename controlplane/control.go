@@ -24,6 +24,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/internal/netkeepalive"
+	"github.com/posthog/duckgres/internal/netlisten"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/flightclient"
@@ -357,6 +358,13 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// protocol (SCM_RIGHTS, JSON messages, handover socket).
 	upg, err := tableflip.New(tableflip.Options{
 		UpgradeTimeout: 30 * time.Second,
+		// tableflip binds the client-facing PG listener, so the socket options
+		// have to come from here. Without this the listener is an IPPROTO_MPTCP
+		// socket on any node whose kernel has MPTCP enabled; see
+		// internal/netlisten for why that is not wanted (CVE-2026-98432). This
+		// applies when tableflip binds a fresh socket: a listener inherited from
+		// the parent process keeps the protocol it was created with.
+		ListenConfig: netlisten.Config(),
 	})
 	if err != nil {
 		slog.Error("Failed to create tableflip upgrader.", "error", err)
@@ -2882,11 +2890,18 @@ func (cp *ControlPlane) recoverMetricsAfterFailedReload() {
 	addr := cp.cfg.MetricsServer.Addr
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	// Addr is informational only now that Serve takes a listener, but the recovery
+	// path rebinds from it, so it has to stay populated.
 	newSrv := &http.Server{Addr: addr, Handler: mux}
 	cp.cfg.MetricsServer = newSrv
 	go func() {
+		ln, err := netlisten.Listen("tcp", addr)
+		if err != nil {
+			slog.Warn("Recovered metrics listener error.", "addr", addr, "error", err)
+			return
+		}
 		slog.Info("Recovered metrics server after reload failure.", "addr", addr)
-		if err := newSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := newSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			slog.Warn("Recovered metrics server error.", "error", err)
 		}
 	}()

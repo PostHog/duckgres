@@ -36,6 +36,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/posthog/duckgres/internal/netlisten"
 )
 
 func main() {
@@ -137,7 +139,12 @@ func main() {
 
 	log.Printf("duckgres admin UI dev server: http://%s  →  proxying /api,/login,/health to %s", *listen, targetURL)
 	log.Printf("serving static assets from %s (edit + refresh, no rebuild)", absStatic)
-	if err := http.ListenAndServe(*listen, mux); err != nil {
+	ln, err := netlisten.Listen("tcp", *listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	if err := srv.Serve(ln); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -170,7 +177,7 @@ func startPortForward(kubeContext, ns, deploy string, localPort, remotePort int)
 
 // freeLocalPort returns an unused localhost TCP port.
 func freeLocalPort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := netlisten.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, err
 	}

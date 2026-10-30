@@ -26,6 +26,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/internal/cliboot"
+	"github.com/posthog/duckgres/internal/netlisten"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/observe"
@@ -571,7 +572,7 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 }
 
 func startCacheProxyRouter(cacheAddr string) (*cacheProxyRouter, net.Listener, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := netlisten.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -946,7 +947,7 @@ func Run(cfg ServiceConfig) {
 			_ = os.Remove(addr)
 		}
 
-		listener, err = net.Listen(network, addr)
+		listener, err = netlisten.Listen(network, addr)
 		if err != nil {
 			slog.Error("Failed to listen", "network", network, "addr", addr, "error", err)
 			os.Exit(1)

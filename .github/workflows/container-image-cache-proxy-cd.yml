@@ -6,6 +6,12 @@ on:
             - main
         paths:
             - "cmd/cache-proxy/**"
+            # The proxy is a standalone binary in the root module and its three
+            # http.Server listeners inherit the module's GODEBUG defaults
+            # (godebug multipathtcp=0 in go.mod), so a dependency or GOFLAGS-style
+            # change in go.mod must rebuild this image too.
+            - "go.mod"
+            - "go.sum"
             - ".github/workflows/container-image-cache-proxy-cd.yml"
     workflow_dispatch:
 
