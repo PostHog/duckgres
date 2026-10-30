@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -33,6 +34,10 @@ func (p Protocol) RunLabel(representation string) string {
 		return "trino (variant)"
 	case p == ProtocolTrinoCached && representation == "variant":
 		return "trino (cache+variant)"
+	case p == ProtocolTrino && representation == "variant_unshredded":
+		return "trino (variant unshredded)"
+	case p == ProtocolTrinoCached && representation == "variant_unshredded":
+		return "trino (cache+variant unshredded)"
 	default:
 		return string(p)
 	}
@@ -190,6 +195,10 @@ type RunSummary struct {
 	WarmupQueries int       `json:"warmup_queries"`
 }
 
+// dollarKeyJSONPath matches a quoted dollar-prefixed key in a JSON path
+// literal, such as '$."$browser"'.
+var dollarKeyJSONPath = regexp.MustCompile(`'\$\."(\$[^"']+)"'`)
+
 // SQLFor preserves canonical SQL except for the JSON scalar extractor in the
 // explicitly labeled properties workload. The browser key keeps the same
 // semantics while using each engine's supported JSON path syntax.
@@ -197,9 +206,9 @@ func (q Query) SQLFor(protocol Protocol) (string, error) {
 	sql := q.CanonicalSQL()
 	if q.Representation != "" && (protocol == ProtocolTrino || protocol == ProtocolTrinoCached || protocol == ProtocolAthena) {
 		sql = strings.ReplaceAll(sql, "json_extract_string(", "json_extract_scalar(")
-		// Trino/Athena require bracket notation for the dollar-prefixed key.
-		// Match the complete literal used by the generated properties catalog.
-		sql = strings.ReplaceAll(sql, `'$."$browser"'`, `'$["$browser"]'`)
+		// Trino/Athena require bracket notation for the dollar-prefixed keys.
+		// Match the complete literals used by the generated properties catalog.
+		sql = dollarKeyJSONPath.ReplaceAllString(sql, `'$$["${1}"]'`)
 	}
 	if q.Representation != "" && protocol == ProtocolAthena {
 		// Athena uses the run-specific Glue database, with a flat external table.

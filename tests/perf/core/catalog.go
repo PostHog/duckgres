@@ -456,7 +456,7 @@ func validateCatalog(c Catalog) error {
 		if q.PGWireSQL == "" {
 			return fmt.Errorf("query %s missing pgwire_sql", q.QueryID)
 		}
-		if q.Representation != "" && q.Representation != "json" && q.Representation != "struct" && q.Representation != "variant" {
+		if q.Representation != "" && q.Representation != "json" && q.Representation != "struct" && q.Representation != "variant" && q.Representation != "variant_unshredded" {
 			return fmt.Errorf("query %s has unsupported representation %q", q.QueryID, q.Representation)
 		}
 		if q.ValidationOnly && q.Representation == "" {
@@ -472,7 +472,7 @@ func validateCatalog(c Catalog) error {
 				return fmt.Errorf("query %s has invalid or duplicate target %q", q.QueryID, target)
 			}
 			seenQueryTargets[target] = true
-			if q.Representation == "variant" && target == ProtocolAthena {
+			if (q.Representation == "variant" || q.Representation == "variant_unshredded") && target == ProtocolAthena {
 				return fmt.Errorf("query %s variant is not supported for Athena", q.QueryID)
 			}
 		}

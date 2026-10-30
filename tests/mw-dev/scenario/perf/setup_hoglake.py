@@ -198,15 +198,16 @@ def run(store, api, source, catalog):
 
 
 
-def run_properties(store, api, source, catalog, representation, variant_source=None):
+def run_properties(store, api, source, catalog, representation, variant_sources=()):
     """Register properties in the existing fixture catalog, under its own namespace.
 
     events_supported always comes from ``source`` (the reader-supported copy every
-    engine's JSON queries read). With representation "variant", events_variant
-    comes from ``variant_source`` (default ``source``): the canonical copy that
-    keeps the native, shredded VARIANT column. Column types stay authoritative:
-    a column that is not a native VARIANT group fails before any write, without
-    coercion or omitted columns.
+    engine's JSON queries read). With representation "variant", each (table,
+    prefix) of ``variant_sources`` registers that table from that prefix, a copy
+    that keeps the native VARIANT column (shredded or not); events_variant
+    defaults to ``source`` when no pair names it. Column types stay
+    authoritative: a column that is not a native VARIANT group fails before any
+    write, without coercion or omitted columns.
     """
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,62}", catalog):
         raise ValueError("invalid catalog identifier")
@@ -221,13 +222,17 @@ def run_properties(store, api, source, catalog, representation, variant_source=N
     objects = parquet_objects(source)
     if not objects:
         raise ValueError("no properties Parquet files in source")
-    variant_objects = objects
-    if representation == "variant" and variant_source:
-        if location(variant_source)[0] != bucket:
-            raise ValueError("properties variant source must share the fixture bucket")
-        variant_objects = parquet_objects(variant_source)
-        if not variant_objects:
-            raise ValueError("no properties Parquet files in variant source")
+    variants = {}
+    if representation == "variant":
+        variants["events_variant"] = objects
+        for table, variant_source in variant_sources:
+            if table not in ("events_variant", "events_variant_unshredded"):
+                raise ValueError(f"unknown properties VARIANT table {table!r}")
+            if location(variant_source)[0] != bucket:
+                raise ValueError("properties variant source must share the fixture bucket")
+            variants[table] = parquet_objects(variant_source)
+            if not variants[table]:
+                raise ValueError(f"no properties Parquet files in the {table} source")
     metadata = {}
 
     def read_footer(obj):
@@ -237,8 +242,8 @@ def run_properties(store, api, source, catalog, representation, variant_source=N
 
     plans = {}
     projections = [("events_supported", objects, ["event", "timestamp", "properties"])]
-    if representation == "variant":
-        projections.append(("events_variant", variant_objects, ["event", "timestamp", "properties", "properties_variant"]))
+    for table, table_objects in variants.items():
+        projections.append((table, table_objects, ["event", "timestamp", "properties", "properties_variant"]))
     for table, table_objects, selected in projections:
         columns, files = inspect_table(table_objects, read_footer, selected)
         expected_types = {"event": "string", "timestamp": "timestamptz", "properties": "string", "properties_variant": "variant"}
@@ -250,7 +255,7 @@ def run_properties(store, api, source, catalog, representation, variant_source=N
     root = "/v1/catalogs/" + catalog
     info = api.get(root)
     data_bucket, data_prefix = location(info["data_path"])
-    if bucket != data_bucket or any(not obj["key"].startswith(data_prefix) for obj in objects + variant_objects):
+    if bucket != data_bucket or any(not obj["key"].startswith(data_prefix) for obj in objects + [obj for table_objects in variants.values() for obj in table_objects]):
         raise ValueError("properties files must be inside the existing fixture catalog data_path")
     api.post(root + "/namespaces", {"name": "properties_perf"})
     registrations = []
@@ -428,7 +433,9 @@ def main():
     inputs.add_argument("--source")
     inputs.add_argument("--properties-source")
     parser.add_argument("--properties-representation", choices=("json", "variant"), default="variant")
-    parser.add_argument("--properties-variant-source", help="canonical Parquet prefix holding the native VARIANT column")
+    parser.add_argument("--properties-variant-source", help="Parquet prefix of events_variant (native, shredded VARIANT)")
+    parser.add_argument("--properties-variant-unshredded-source",
+                        help="Parquet prefix of events_variant_unshredded (native, unshredded VARIANT)")
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--uri", required=True)
     parser.add_argument(
@@ -440,8 +447,11 @@ def main():
     args = parser.parse_args()
     store, api = S3Store(boto3.client("s3")), RestAPI(args.uri)
     if args.properties_source:
+        pairs = [(table, prefix) for table, prefix in (
+            ("events_variant", args.properties_variant_source),
+            ("events_variant_unshredded", args.properties_variant_unshredded_source)) if prefix]
         result = run_properties(store, api, args.properties_source, args.catalog,
-                                args.properties_representation, args.properties_variant_source)
+                                args.properties_representation, pairs)
     else:
         result = run(store, api, args.source, args.catalog)
     print(f"Registered frozen fixtures at snapshot {result['snapshot_id']}")

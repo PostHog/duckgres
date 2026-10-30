@@ -4,6 +4,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
 )
 
 // wait_for_stats must fail, never return, when a fixture file's stats
@@ -45,10 +47,11 @@ func TestSetupHoglakeWaitFailsWithoutHydratedStats(t *testing.T) {
 	}
 }
 
-// run_properties registers events_supported from the supported copy and
-// events_variant from the canonical copy, typing the column "variant" only
-// when the footer carries the native VARIANT annotation (pyarrow reports a
-// plain struct). pyarrow is stubbed; footers are fakes.
+// run_properties registers events_supported from the supported copy,
+// events_variant from the canonical copy and, when given its prefix,
+// events_variant_unshredded from the unshredded copy, typing the column
+// "variant" only when the footer carries the native VARIANT annotation
+// (pyarrow reports a plain struct). pyarrow is stubbed; footers are fakes.
 const runPropertiesHarness = `
 import importlib.util, json, sys, types
 sys.dont_write_bytecode = True
@@ -76,12 +79,16 @@ annotated = "  optional group field_id=-1 properties_variant (Variant(1)) {\n   
 nested = "  optional group field_id=-1 outer {\n    optional group field_id=-1 properties_variant (Variant(1)) {\n    }\n  }"
 variant_text = {"annotated": annotated, "plain_struct": "  optional group field_id=-1 properties_variant {\n  }", "nested_only": nested}[sys.argv[1]]
 variant_bucket = sys.argv[2] if len(sys.argv) > 2 else "b"
+unshredded = sys.argv[3] if len(sys.argv) > 3 else ""
+unshredded_text = "  optional group field_id=4 properties_variant (Variant(1)) {\n    required binary field_id=-1 metadata;\n    required binary field_id=-1 value;\n  }"
 class Store:
     def objects(self, uri):
         if "/supported/" in uri: return [{"key": "fx/supported/d1/a.parquet", "size": 1, "etag": "e"}]
+        if "/unshredded/" in uri: return [{"key": "fx/v1/unshredded/d1/a.parquet", "size": 1, "etag": "e"}, {"key": "fx/v1/records/d1/a.json", "size": 1, "etag": "e"}]
         return [{"key": "fx/canonical/d1/data/a.parquet", "size": 1, "etag": "e"}, {"key": "fx/canonical/d1/complete.json", "size": 1, "etag": "e"}]
     def footer(self, bucket, obj):
         if "/supported/" in obj["key"]: return Footer(base + [Field("properties_typed", "struct")], "")
+        if "/unshredded/" in obj["key"]: return Footer(base + [Field("properties_variant", "struct")], unshredded_text)
         return Footer(base + [Field("properties_variant", "struct")], variant_text)
 class API:
     posts = []
@@ -92,10 +99,12 @@ class API:
         return {"snapshot_id": 1}
 try:
     api = API()
-    m.run_properties(Store(), api, "s3://b/fx/supported/", "c", "variant", "s3://" + variant_bucket + "/fx/canonical/")
+    pairs = [("events_variant", "s3://" + variant_bucket + "/fx/canonical/")]
+    if unshredded: pairs.append(("events_variant_unshredded", unshredded))
+    m.run_properties(Store(), api, "s3://b/fx/supported/", "c", "variant", pairs)
     commit = [b for p, b in api.posts if p.endswith("/commit")][0]
     print(json.dumps({a["table"]: [f["path"] for f in a["files"]] for a in commit["appends"]}, sort_keys=True))
-    print(json.dumps([c for p, b in api.posts if p.endswith("/tables") and b["name"] == "events_variant" for c in b["columns"] if c["name"] == "properties_variant"]))
+    print(json.dumps([c for p, b in api.posts if p.endswith("/tables") and b["name"].startswith("events_variant") for c in b["columns"] if c["name"] == "properties_variant"]))
 except Exception as e:
     print(type(e).__name__, e)
 `
@@ -118,6 +127,13 @@ func TestSetupHoglakeRegistersShreddedVariantFromCanonicalCopy(t *testing.T) {
 		"plain_struct": {[]string{"plain_struct"}, []string{"ValueError properties fixture logical column type mismatch"}},
 		"nested_only":  {[]string{"nested_only"}, []string{"ValueError properties fixture logical column type mismatch"}},
 		"cross_bucket": {[]string{"annotated", "other"}, []string{"ValueError properties variant source must share the fixture bucket"}},
+		// The unshredded copy is a third table from its own prefix; only its
+		// .parquet objects register (records are .json).
+		"unshredded": {[]string{"annotated", "b", "s3://b/fx/v1/unshredded/"}, []string{
+			`{"events_supported": ["s3://b/fx/supported/d1/a.parquet"], "events_variant": ["s3://b/fx/canonical/d1/data/a.parquet"], "events_variant_unshredded": ["s3://b/fx/v1/unshredded/d1/a.parquet"]}`,
+			`[{"name": "properties_variant", "nullable": true, "type": "variant"}, {"name": "properties_variant", "nullable": true, "type": "variant"}]`,
+		}},
+		"unshredded_cross_bucket": {[]string{"annotated", "b", "s3://other/fx/v1/unshredded/"}, []string{"ValueError properties variant source must share the fixture bucket"}},
 	} {
 		out, err := exec.Command(python, append([]string{"-c", runPropertiesHarness}, tc.args...)...).CombinedOutput()
 		for _, want := range tc.want {
@@ -125,5 +141,27 @@ func TestSetupHoglakeRegistersShreddedVariantFromCanonicalCopy(t *testing.T) {
 				t.Errorf("%s: want %q, got err=%v\n%s", name, want, err, out)
 			}
 		}
+	}
+}
+
+func TestSetupHoglakeArgsPassEachVariantPrefix(t *testing.T) {
+	with := map[string]any{
+		"org_id": "o", "uri": "http://h", "file": "setup_hoglake.py", "properties_source": "s3://b/supported/",
+		"representation": "variant", "properties_variant_source": "s3://b/shredded/",
+		"properties_variant_unshredded_source": "s3://b/unshredded/",
+	}
+	args, err := setupHoglakeArgs(core.Step{With: with})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(args, " ")
+	for _, want := range []string{"--properties-variant-source s3://b/shredded/", "--properties-variant-unshredded-source s3://b/unshredded/"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("args %q missing %q", got, want)
+		}
+	}
+	with["representation"] = "json"
+	if _, err := setupHoglakeArgs(core.Step{With: with}); err == nil || !strings.Contains(err.Error(), "requires the variant representation") {
+		t.Fatalf("a VARIANT prefix with the json representation must fail, got %v", err)
 	}
 }

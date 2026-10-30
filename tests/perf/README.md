@@ -375,10 +375,14 @@ covers every properties intent. Athena executes only STRUCT;
 its complete ordered results must match the shared Duckgres/Trino JSON baseline
 for each intent before properties measurements start. Trino additionally reads
 the native VARIANT column, shredded on `$browser`, as `trino (variant)` and
-`trino (cache+variant)`; those results pass the same JSON-baseline gate. The
+`trino (cache+variant)`, and the unshredded column as `trino (variant
+unshredded)` and `trino (cache+variant unshredded)`; those results pass the same
+JSON-baseline gate. A third intent counts `$lib_version`, a key the shredded
+copy does not shred, on Trino only (JSON and both VARIANT forms). The shredded
 VARIANT table is registered from the fixture's canonical copy, located through
-the Glue table's `duckgres.properties_variant_location` parameter (see the
-runbook). A query with a `skip_reason` still emits `skipped` rows with iteration
+the Glue table's `duckgres.properties_variant_location` parameter, and the
+unshredded one from the dispatch input `properties_variant_unshredded_s3_uri`
+(see the runbook). A query with a `skip_reason` still emits `skipped` rows with iteration
 zero, excluded from measured/warmup query counts.
 
 Both suites of one nightly publish under the same dataset version

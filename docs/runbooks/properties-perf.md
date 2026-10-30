@@ -82,9 +82,14 @@ fixture catalogs and metadata without deleting source S3 files.
 | trino (cache) | On | JSON |
 | trino (variant) | Off | VARIANT (shredded) |
 | trino (cache+variant) | On | VARIANT (shredded) |
+| trino (variant unshredded) | Off | VARIANT (unshredded) |
+| trino (cache+variant unshredded) | On | VARIANT (unshredded) |
 | Athena | — | STRUCT |
 
-There are two intents: browser counts and event counts filtered to Chrome.
+There are three intents: browser counts, event counts filtered to Chrome, and
+`$lib_version` counts. `$lib_version` is not in the shredded copy's shred list,
+so its VARIANT reads go through the residual lookup; that intent runs on Trino
+only (JSON and both VARIANT forms) and has no STRUCT.
 Supported engines must return identical complete ordered results; Athena runs
 only STRUCT, validated against the shared Duckgres/Trino JSON baseline for each
 intent. Measurements use one warmup and four measured
@@ -100,6 +105,14 @@ fixture: a table without it fails the properties phase rather than silently
 dropping VARIANT. Only Parquet files directly or recursively under that prefix
 are registered, so point it at a tree holding only canonical data files and
 manifests. Never substitute JSON under a VARIANT label.
+
+The unshredded series reads `properties_perf.events_variant_unshredded`, a
+pyhoglake copy whose VARIANT column has no `typed_value` and so is read whole
+and looked up row by row. Its prefix has no Glue parameter: dispatch with
+`properties_variant_unshredded_s3_uri` (the Job's
+`DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI`), or the properties
+phase fails. `properties_variant_s3_uri` likewise overrides the shredded
+copy's prefix. Point either at the `.parquet` tree of one form only.
 
 ## Results and recovery
 

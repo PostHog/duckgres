@@ -47,7 +47,8 @@ func (e dispatchExecutor) runPropertiesComparison(ctx context.Context, step core
 	hoglakeWith := map[string]any{
 		"org_id": orgID, "uri": step.With["hoglake_uri"], "file": step.With["hoglake_file"],
 		"properties_source": source, "representation": "variant",
-		"properties_variant_source": prepared.variant.Prefix, "hoglake_catalog": step.With["hoglake_catalog"],
+		"properties_variant_source":            prepared.variant.Prefix,
+		"properties_variant_unshredded_source": prepared.unshredded.Prefix, "hoglake_catalog": step.With["hoglake_catalog"],
 	}
 	if timeout, ok := step.With["hydration_timeout"]; ok {
 		hoglakeWith["hydration_timeout"] = timeout
@@ -77,6 +78,18 @@ type preparedPropertiesComparison struct {
 	// variant is the canonical copy with the native, shredded VARIANT column
 	// that Trino reads; dataset (the supported copy) omits it for Athena.
 	variant *properties.Dataset
+	// unshredded is the pyhoglake copy whose VARIANT column has no typed_value.
+	unshredded *properties.Dataset
+}
+
+// unshreddedVariantSource is the unshredded VARIANT copy's prefix. Unlike the
+// shredded copy it has no Glue parameter: only a dispatch input sets it.
+func unshreddedVariantSource() (string, error) {
+	source := os.Getenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI")
+	if source == "" {
+		return "", fmt.Errorf("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI is not set; dispatch with properties_variant_unshredded_s3_uri")
+	}
+	return source, nil
 }
 
 func preparePropertiesComparison(ctx context.Context, source string, step core.Step) (*preparedPropertiesComparison, error) {
@@ -119,6 +132,14 @@ func preparePropertiesComparison(ctx context.Context, source string, step core.S
 	if err != nil {
 		return nil, fmt.Errorf("discover VARIANT properties fixture: %w", err)
 	}
+	unshreddedSource, err := unshreddedVariantSource()
+	if err != nil {
+		return nil, err
+	}
+	unshredded, err := properties.Discover(ctx, s3.NewFromConfig(cfg), unshreddedSource)
+	if err != nil {
+		return nil, fmt.Errorf("discover unshredded VARIANT properties fixture: %w", err)
+	}
 	catalog, err := yaml.Marshal(properties.Catalog())
 	if err != nil {
 		return nil, err
@@ -133,6 +154,6 @@ func preparePropertiesComparison(ctx context.Context, source string, step core.S
 			return nil, err
 		}
 	}
-	fmt.Printf("Selected %d supported and %d VARIANT properties Parquet objects for the properties comparison.\n", len(dataset.Files), len(variant.Files))
-	return &preparedPropertiesComparison{directory: dir, dataset: dataset, variant: variant}, nil
+	fmt.Printf("Selected %d supported, %d shredded VARIANT and %d unshredded VARIANT properties Parquet objects for the properties comparison.\n", len(dataset.Files), len(variant.Files), len(unshredded.Files))
+	return &preparedPropertiesComparison{directory: dir, dataset: dataset, variant: variant, unshredded: unshredded}, nil
 }

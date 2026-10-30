@@ -1115,3 +1115,14 @@ func containsTemplate(value any) bool {
 	}
 	return false
 }
+
+func TestUnshreddedVariantSourceComesOnlyFromTheDispatchInput(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI", "")
+	if _, err := unshreddedVariantSource(); err == nil || !strings.Contains(err.Error(), "properties_variant_unshredded_s3_uri") {
+		t.Fatalf("an unset prefix must fail naming the dispatch input, got %v", err)
+	}
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI", "s3://b/v1/unshredded/")
+	if got, err := unshreddedVariantSource(); err != nil || got != "s3://b/v1/unshredded/" {
+		t.Fatalf("unshreddedVariantSource = %q, %v", got, err)
+	}
+}

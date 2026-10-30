@@ -19,6 +19,16 @@ on:
         required: false
         default: ""
         type: string
+      properties_variant_s3_uri:
+        description: Shredded VARIANT properties Parquet S3 prefix override; blank uses the Athena table's VARIANT parameter
+        required: false
+        default: ""
+        type: string
+      properties_variant_unshredded_s3_uri:
+        description: Unshredded VARIANT properties Parquet S3 prefix (required by posthog_frozen_perf on this branch)
+        required: false
+        default: ""
+        type: string
       duckgres_image:
         description: Existing Duckgres image to deploy instead of building this SHA
         required: false
@@ -200,16 +210,21 @@ jobs:
       - name: Load properties fixture override
         if: env.SCENARIO_NAME == 'posthog_frozen_perf'
         run: |
-          source=$(jq -r '.inputs.properties_s3_uri // ""' "$GITHUB_EVENT_PATH")
-          if [ -n "$source" ]; then
-            echo "::add-mask::$source"
-            if [[ "$source" =~ ^s3://[^[:space:]]+$ ]]; then
-              echo "DUCKGRES_SCENARIO_PROPERTIES_S3_URI=$source" >> "$GITHUB_ENV"
-            else
-              echo "::warning::Invalid properties prefix; the properties comparison will fail after original benchmarks complete."
-              echo "DUCKGRES_SCENARIO_PROPERTIES_S3_URI=invalid" >> "$GITHUB_ENV"
+          for pair in properties_s3_uri:DUCKGRES_SCENARIO_PROPERTIES_S3_URI \
+            properties_variant_s3_uri:DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI \
+            properties_variant_unshredded_s3_uri:DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI; do
+            input=${pair%%:*} variable=${pair#*:}
+            source=$(jq -r --arg input "$input" '.inputs[$input] // ""' "$GITHUB_EVENT_PATH")
+            if [ -n "$source" ]; then
+              echo "::add-mask::$source"
+              if [[ "$source" =~ ^s3://[^[:space:]]+$ ]]; then
+                echo "$variable=$source" >> "$GITHUB_ENV"
+              else
+                echo "::warning::Invalid $input prefix; the properties comparison will fail after original benchmarks complete."
+                echo "$variable=invalid" >> "$GITHUB_ENV"
+              fi
             fi
-          fi
+          done
 
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy

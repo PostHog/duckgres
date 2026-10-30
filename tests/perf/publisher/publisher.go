@@ -252,7 +252,7 @@ func parseResultRow(record []string) (resultRow, error) {
 	representation := ""
 	if len(record) >= len(expectedQueryResultsHeader)+1 {
 		representation = record[len(expectedQueryResultsHeader)]
-		if representation != "" && representation != "json" && representation != "struct" && representation != "variant" {
+		if representation != "" && representation != "json" && representation != "struct" && representation != "variant" && representation != "variant_unshredded" {
 			return resultRow{}, fmt.Errorf("invalid representation %q", representation)
 		}
 	}
