@@ -361,7 +361,9 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		// tableflip binds the client-facing PG listener, so the socket options
 		// have to come from here. Without this the listener is an IPPROTO_MPTCP
 		// socket on any node whose kernel has MPTCP enabled; see
-		// internal/netlisten for why that is not wanted (CVE-2026-98432).
+		// internal/netlisten for why that is not wanted (CVE-2026-98432). This
+		// applies when tableflip binds a fresh socket: a listener inherited from
+		// the parent process keeps the protocol it was created with.
 		ListenConfig: netlisten.Config(),
 	})
 	if err != nil {

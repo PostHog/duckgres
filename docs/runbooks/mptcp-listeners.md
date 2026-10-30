@@ -9,8 +9,8 @@ until the node kernels are updated.
 ## The bug
 
 `ipv4: free inet_opt and ireq_opt after an RCU grace period`
-(upstream `e3f33b0a1d89d738e2b913dab519226eaf76e15b`, backported to 6.1.190,
-6.12.113, 7.2.12 and later).
+([upstream commit e3f33b0a1d89](https://git.kernel.org/linus/e3f33b0a1d89d738e2b913dab519226eaf76e15b),
+backported to 6.1.190, 6.12.113, 7.2.12 and later).
 
 `tcp_v4_syn_recv_sock()` hands `ireq->ireq_opt` to the child socket without
 copying it. A retransmitted SYN processed on another CPU can still be building
@@ -59,11 +59,28 @@ reset or closed at the wrong moment instead.
      `internal/netlisten`, or if the tableflip upgrader is handed a listen config
      that does not come from it.
 
+## Rollout
+
+This is a property of the built binary, so it takes effect when the binary is
+rebuilt and deployed. The control-plane, worker and standalone images rebuild on
+every push to `main`; the cache-proxy image has its own path-filtered CD workflow,
+which now also triggers on `go.mod`/`go.sum` for this reason.
+
+The socket options are fixed when the listener is bound, not when the process
+starts. A pod replacement binds a fresh listener and gets plain TCP. An in-place
+tableflip upgrade is different: `SIGUSR1` makes the parent hand its listener file
+descriptor to the child and `tableflip`'s `listenerLocked` wraps it again with
+`net.FileListener`, so the socket keeps whatever options it was created with.
+That path is process-mode only (the `SIGUSR1` handler is gated on `!isK8s`), so a
+cluster rollout is unaffected. In process mode, restart the process rather than
+upgrading it in place if you need an existing listener switched over.
+
 ## What this does not do
 
 The kernel is the fix. The same race exists for plain TCP listeners, and for
-every other process sharing the node — the Envoy edge, the CNPG instances, the
-kubelet. Treat this as attack-surface reduction, not remediation.
+every other process sharing the node — CNPG, pgbouncer, the edge proxy, the
+kubelet. Treat this as attack-surface reduction, not remediation. For the rollout
+procedure itself see [control-plane-rollout.md](control-plane-rollout.md).
 
 Remaining follow-ups, in priority order:
 
@@ -71,29 +88,94 @@ Remaining follow-ups, in priority order:
   re-resolves the AMI per release, so a node-group or AMI version bump rolls the
   fleet. Confirm with `uname -r` on the nodes against 6.12.113 / 7.2.12+ (or
   6.1.190 for 6.1).
-- If a node cannot be updated, `net.mptcp.enabled=0` disables MPTCP node-wide and
-  covers non-Go listeners as well. Go falls back to plain TCP when the socket
-  creation fails with `ENOPROTOOPT`, so this is safe for us. It is a node-level
-  change, not a repository change.
-- The request-socket migration half of the CVE needs `net.ipv4.tcp_migrate_req=1`
-  or a `BPF_SK_REUSEPORT_SELECT_OR_MIGRATE` program. Linux defaults to 0; nothing
-  in these charts sets it. Confirm before spending time on that half.
+- If a node cannot be updated, `net.mptcp.enabled=0` turns MPTCP off in a
+  network namespace. Note what that means here: the sysctl is per-namespace, so
+  setting it on the node's root namespace covers host-network processes but
+  does nothing for a pod with its own netns, which is where this process runs.
+  For the pod, set it inside the pod network namespace. The fleet's generic app
+  chart already has a privileged `sysctls` init container that does this in a
+  pod's netns (it is what sets `net.ipv4.tcp_migrate_req: "1"` for the Django
+  apps), but Duckgres runs from its own chart, so that values key does not reach
+  these pods — covering them means a change to the Duckgres pod templates. Go falls back to plain TCP when socket creation
+  fails with `ENOPROTOOPT`, so this is safe for us. Either way it is a
+  deployment change, not a repository change.
+- Where the network path allows it, drop IPv4 TCP packets that carry IP options
+  (`ihl > 5`) before they reach a listener. `ireq_opt` only exists for those
+  packets, so dropping them removes the precondition for every process on the
+  node, not just this one. nftables has no IP-option match; iptables can express
+  it (`-p tcp --syn -m ipv4options --any -j DROP`), and it is worth checking
+  whether the NLB or the VPC security layer can do it more cheaply.
+- The request-socket migration half of the CVE needs
+  `net.ipv4.tcp_migrate_req=1` or a `BPF_SK_REUSEPORT_SELECT_OR_MIGRATE` program.
+  Linux defaults to 0 and the Duckgres charts do not set it, but do not assume
+  that fleet-wide: several other application charts in the same clusters do set
+  it to 1, which makes the migration half live for those pods even though the
+  MPTCP half is not (they are not Go processes). Worth passing to whoever owns
+  the CVE response, and worth checking per pod rather than per cluster.
 
 ## Verifying a running deployment
 
-MPTCP sockets are listed separately from TCP ones. An empty file means no MPTCP
-sockets in that network namespace:
+The build-time guarantee is the reliable one: `go test ./internal/netlisten/`
+asserts the module default and the helper, and `listener_hygiene_test.go` fails if
+a TCP listener stops going through `internal/netlisten`. Those checks do not care
+what kernel the pod runs on.
+
+At runtime, first establish that this pod's network namespace has MPTCP at all:
 
 ```sh
 # inside the control-plane container
-cat /proc/net/mptcp_net/mptcp          # want: no rows
-ls /proc/sys/net/mptcp/                # absent => kernel has no CONFIG_MPTCP
-cat /proc/sys/net/mptcp/enabled        # 0 => MPTCP off; 1 => MPTCP available
+ls /proc/sys/net/mptcp/          # absent => kernel built without CONFIG_MPTCP
+grep -E '^(MPTCP|MPTCPv6)' /proc/net/protocols   # absent => no MPTCP sockets registered
 ```
 
-A listener that appears in `/proc/net/tcp` and in `/proc/net/mptcp_net/mptcp` is
-an MPTCP listener. After a rollout with this change, the PG port must appear only
-in `/proc/net/tcp`.
+`net.mptcp.enabled` is per network namespace, not a node-wide switch: it is
+registered through `register_net_sysctl_sz` on each namespace and a fresh pod
+netns starts at `mptcp_enabled = 1` (`mptcp_pernet_set_defaults`). A node-level
+setting does not reach this process, so do not read the node's value as evidence
+about the pod's.
+
+Then look for the listeners themselves. There is no `/proc` file that lists MPTCP
+sockets — an early draft of this runbook said `/proc/net/mptcp_net/mptcp`, which
+does not exist in mainline Linux; MPTCP stats live in `/proc/net/netstat`
+(`MPTcpExt:`) and the sockets are only reachable through `sock_diag`.
+
+```sh
+ss -Mltnp   # MPTCP listeners; want: nothing on the PG port
+ss -ltnp    # plain TCP listeners; the PG port must be here
+```
+
+Four traps in reading that:
+
+- `-l` is required. Without it `ss -M` dumps only non-listening sockets, so an
+  empty result proves nothing about a listener.
+- `ss -M` needs `CONFIG_INET_MPTCP_DIAG` and a recent iproute2, and **it returns
+  success with no output when the diag support is missing or the netlink request
+  fails** (`mptcp_show` in iproute2 discards the error). An empty `ss -M` on its
+  own is not a pass. Prove the diagnostic path works with a positive control
+  first: bind an MPTCP listener yourself and confirm `ss -Mlnp` shows it.
+
+  ```sh
+  python3 - <<'EOF'
+  import socket
+  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0x106)  # IPPROTO_MPTCP
+  s.bind(("127.0.0.1", 0)); s.listen(1)
+  print("mptcp listener on", s.getsockname())  # now check ss -Mlnp in another shell
+  input()
+  EOF
+  ```
+
+  If `socket()` raises `EPROTONOSUPPORT`, the kernel has no MPTCP and the whole
+  question is moot for that pod.
+- `/proc/net/tcp` and `/proc/net/tcp6` do **not** distinguish the two.
+  `mptcp_listen()` calls `__inet_listen_sk()` on the subflow socket, so an MPTCP
+  listener has an ordinary TCP listening entry either way. A listener bound to
+  `:port` is usually `AF_INET6`, so it appears in `/proc/net/tcp6` regardless.
+- On 6.6 and 6.12 kernels the third column of the `MPTCP`/`MPTCPv6` rows in
+  `/proc/net/protocols` counts live **listener** sockets (`mptcp_listen()` and
+  `mptcp_stop_listen()` are the only callers of `sock_prot_inuse_add`), so it is
+  a usable listener count there; it is not a census of connected MPTCP sockets.
+  The 6.1 branch has no such accounting at all, so on 6.1 ignore that column and
+  rely on the `ss` positive control.
 
 ## Rollback
 

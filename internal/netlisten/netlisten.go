@@ -15,12 +15,15 @@
 // freed memory in ip_options_build().
 //
 // The MPTCP path is worse than the plain TCP one for a reason worth spelling
-// out: subflow_syn_recv_sock() can create the child and then dispose of it in
-// the same call (see its dispose_child label, reachable by a SYN carrying a
-// forged MP_JOIN option). That puts the child's destruction — and therefore the
-// kfree() of the ip_options — microseconds after the ownership transfer, fully
-// under a remote caller's control. Plain TCP needs a harder race to hit the
-// same window: the child has to be torn down while a SYNACK is being built.
+// out. A SYN carrying a forged MP_JOIN option allocates the request socket and
+// its ireq_opt (subflow_v4_conn_request); the completing ACK then runs
+// tcp_check_req -> subflow_syn_recv_sock, which creates the child through
+// tcp_v4_syn_recv_sock and jumps to its own dispose_child label when the join
+// fails, destroying the child inside that same call. That puts the child's
+// destruction — and therefore the kfree() of the ip_options — microseconds after
+// the ownership transfer, on a schedule a remote caller picks. Plain TCP needs a
+// harder race for the same window: the child has to be torn down while a SYNACK
+// is being built.
 //
 // So a listener we own should not be an MPTCP socket. Two things enforce that:
 //
@@ -29,7 +32,15 @@
 //     through helper code we do not own, such as http.ListenAndServe.
 //   - Config and Listen below set MultipathTCP(false) explicitly, which also
 //     survives a stray GODEBUG=multipathtcp=1 in a deployment environment.
-//     GODEBUG only sets the default; an explicit SetMultipathTCP call wins.
+//     GODEBUG only sets the default; an explicit SetMultipathTCP call wins. That
+//     is the division of labour: the directive covers listeners we do not build
+//     (http.ListenAndServe and friends), the helper covers the ones we do, and
+//     only the helper holds up if the environment overrides the default.
+//
+// These settings are applied when a socket is bound. A listener that arrives over
+// SCM_RIGHTS keeps the protocol it was created with, which is why tableflip's
+// inherited FD across an in-place upgrade (SIGUSR1, process mode) does not
+// re-run Config; see the runbook.
 //
 // Neither is a fix for the kernel bug. The fix is the kernel: the upstream
 // change frees both options structures with kfree_rcu() and is backported to
@@ -45,7 +56,8 @@ import (
 )
 
 // Config returns a listen config with Multipath TCP disabled, suitable for
-// net.ListenConfig.Listen and for tableflip.Options.ListenConfig.
+// net.ListenConfig.Listen and for tableflip.Options.ListenConfig. Networks that
+// are not TCP (unix, udp) ignore the setting.
 func Config() *net.ListenConfig {
 	lc := &net.ListenConfig{}
 	lc.SetMultipathTCP(false)

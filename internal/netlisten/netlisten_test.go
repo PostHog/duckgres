@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -33,23 +34,52 @@ func TestConfigDisablesMultipathTCP(t *testing.T) {
 
 // TestConfigDisablesMultipathTCPUnderGODEBUGOverride proves the explicit
 // SetMultipathTCP(false) survives a GODEBUG environment variable that would
-// otherwise re-enable MPTCP.
+// otherwise re-enable MPTCP on listeners.
 //
 // This runs in a child process because the net package reads GODEBUG once per
 // setting per process, so a t.Setenv in this process cannot influence a value
 // that earlier tests already forced.
+//
+// Two details make the difference between a real test and a green one:
+//
+//   - The child asserts the override took effect (a zero ListenConfig must
+//     report MultipathTCP()==true) before it checks Config(). Without that
+//     control the test passes when the override silently fails to apply, which
+//     is exactly what happens if an inherited GODEBUG entry shadows ours.
+//   - Inherited GODEBUG entries are dropped rather than appended to. The runtime
+//     reads the first GODEBUG= entry in the environment while os.Getenv returns
+//     the last, so appending ours would leave a CI-provided GODEBUG in force and
+//     the whole test inert.
+//
+// Both "1" (everywhere) and "2" (listeners only) enable MPTCP on listeners; see
+// mptcpStatusListen.get in net/dial.go.
 func TestConfigDisablesMultipathTCPUnderGODEBUGOverride(t *testing.T) {
 	if os.Getenv("NETLISTEN_GODEBUG_PROBE") == "1" {
-		if Config().MultipathTCP() {
-			t.Fatalf("GODEBUG=%s re-enabled MPTCP on a Config() listener; an explicit SetMultipathTCP(false) must win over GODEBUG", os.Getenv("GODEBUG"))
+		if !(&net.ListenConfig{}).MultipathTCP() {
+			t.Fatalf("GODEBUG=%q did not enable MPTCP on a zero net.ListenConfig, so this test cannot tell a working SetMultipathTCP(false) from a missing one", os.Getenv("GODEBUG"))
 		}
+		if Config().MultipathTCP() {
+			t.Fatalf("GODEBUG=%q re-enabled MPTCP on a Config() listener; an explicit SetMultipathTCP(false) must win over GODEBUG", os.Getenv("GODEBUG"))
+		}
+
 		return
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestConfigDisablesMultipathTCPUnderGODEBUGOverride$", "-test.v")
-	cmd.Env = append(os.Environ(), "NETLISTEN_GODEBUG_PROBE=1", "GODEBUG=multipathtcp=1")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("child process with GODEBUG=multipathtcp=1 failed: %v\n%s", err, out)
+	for _, mode := range []string{"1", "2"} {
+		t.Run("multipathtcp="+mode, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestConfigDisablesMultipathTCPUnderGODEBUGOverride$", "-test.v")
+			for _, kv := range os.Environ() {
+				if strings.HasPrefix(kv, "GODEBUG=") {
+					continue
+				}
+				cmd.Env = append(cmd.Env, kv)
+			}
+			cmd.Env = append(cmd.Env, "NETLISTEN_GODEBUG_PROBE=1", "GODEBUG=multipathtcp="+mode)
+
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("child process with GODEBUG=multipathtcp=%s failed: %v\n%s", mode, err, out)
+			}
+		})
 	}
 }

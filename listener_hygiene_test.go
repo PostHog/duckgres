@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,38 +17,33 @@ import (
 // therefore the ones that can silently become IPPROTO_MPTCP sockets on kernels
 // built with CONFIG_MPTCP.
 //
-// internal/netlisten.Config pins MultipathTCP off for exactly this reason. The
-// go.mod `godebug multipathtcp=0` directive covers the whole module already;
-// this test stops a future listener from depending on it, because the directive
-// is one deleted line away from being reverted and nothing else would notice.
+// internal/netlisten pins MultipathTCP off for exactly this reason. go.mod's
+// `godebug multipathtcp=0` covers the module default, but only until something
+// sets GODEBUG in the deployment environment: an explicit SetMultipathTCP(false)
+// survives that, a build-time default does not. That is why new listeners have to
+// go through the helper rather than rely on the directive.
 var tcpNetworks = map[string]bool{"tcp": true, "tcp4": true, "tcp6": true}
 
-// listenerAllowlist holds call sites that create TCP listeners without going
-// through internal/netlisten. Every entry needs a reason that the test itself
-// validates, so an entry cannot outlive the arrangement it describes.
-var listenerAllowlist = map[string]string{
-	// tableflip owns the client-facing PG listener's lifecycle (it inherits the
-	// FD across zero-downtime restarts), so the socket is bound by the
-	// *tableflip.Upgrader rather than by us. The MPTCP setting still applies:
-	// it travels in tableflip.Options.ListenConfig, which
-	// TestUpgraderReceivesNetlistenConfig checks below.
-	"controlplane/control.go": "binds the PG listener through tableflip.Options.ListenConfig",
-}
+// upgraderListenerFile is the one file where a TCP listener is bound by a
+// dependency rather than by us: tableflip owns the client-facing PG listener's
+// lifecycle (it inherits the FD across a zero-downtime restart), so the socket is
+// bound by the *tableflip.Upgrader. The MPTCP setting still applies, because it
+// travels in tableflip.Options.ListenConfig — TestUpgraderReceivesNetlistenConfig
+// checks that below. Only that one call is exempted: the rest of the file is
+// still scanned, so a new direct net.Listen there is caught.
+const upgraderListenerFile = "controlplane/control.go"
+
+// skippedDirs are not scanned: no first-party Go listeners live there, and
+// walking them is slow or unreliable.
+var skippedDirs = map[string]bool{".git": true, "vendor": true, "node_modules": true}
 
 func TestTCPListenersUseNetlisten(t *testing.T) {
-	tracked := trackedGoFiles(t)
 	var violations []string
 
-	for _, path := range tracked {
-		if strings.HasSuffix(path, "_test.go") || strings.HasPrefix(path, "internal/netlisten/") {
-			continue
-		}
+	for _, path := range goFiles(t) {
 		// Test harnesses bind loopback ports to stand up a fake upstream; they
 		// never serve a customer and are not part of a released binary.
-		if strings.HasPrefix(path, "tests/") {
-			continue
-		}
-		if _, allowed := listenerAllowlist[path]; allowed {
+		if strings.HasSuffix(path, "_test.go") || strings.HasPrefix(path, "internal/netlisten/") || strings.HasPrefix(path, "tests/") {
 			continue
 		}
 
@@ -62,13 +57,12 @@ func TestTCPListenersUseNetlisten(t *testing.T) {
 	}
 }
 
-// TestUpgraderReceivesNetlistenConfig validates the one allowlist entry above:
-// the tableflip upgrader must be handed a listen config that disables MPTCP,
+// TestUpgraderReceivesNetlistenConfig validates the exemption above: the
+// tableflip upgrader must be handed a listen config that disables MPTCP,
 // otherwise the client-facing PG listener binds an IPPROTO_MPTCP socket.
 func TestUpgraderReceivesNetlistenConfig(t *testing.T) {
-	const path = "controlplane/control.go"
-	src := readFile(t, path)
-	f := parseFile(t, path, src)
+	src := readFile(t, upgraderListenerFile)
+	f := parseFile(t, upgraderListenerFile, src)
 
 	found := false
 	ast.Inspect(f, func(n ast.Node) bool {
@@ -97,6 +91,7 @@ func TestUpgraderReceivesNetlistenConfig(t *testing.T) {
 			if got := exprText(src, kv.Value); !strings.Contains(got, "netlisten.Config()") {
 				t.Errorf("tableflip.Options.ListenConfig = %s, want netlisten.Config(): the PG listener would bind an MPTCP socket", got)
 			}
+
 			return true
 		}
 		t.Error("tableflip.Options does not set ListenConfig, so the PG listener falls back to the net package default and binds an IPPROTO_MPTCP socket on kernels with MPTCP")
@@ -105,7 +100,7 @@ func TestUpgraderReceivesNetlistenConfig(t *testing.T) {
 	})
 
 	if !found {
-		t.Fatalf("%s no longer builds a tableflip.Options literal; update listenerAllowlist and this test", path)
+		t.Fatalf("%s no longer builds a tableflip.Options literal; update upgraderListenerFile and this test", upgraderListenerFile)
 	}
 }
 
@@ -127,13 +122,24 @@ func tcpListenCalls(t *testing.T, path string) []string {
 		if !ok {
 			return true
 		}
-		if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "netlisten" {
+		if isNetlisten(sel.X) {
+			return true
+		}
+		if path == upgraderListenerFile && isUpgrader(sel.X) && sel.Sel.Name == "Listen" {
 			return true
 		}
 
 		var networkArgIdx int
 		switch sel.Sel.Name {
-		case "Listen", "ListenTCP", "ListenPacket":
+		case "Listen":
+			// net.Listen(network, addr) and upg.Listen(network, addr) take the
+			// network first; (*net.ListenConfig).Listen(ctx, network, addr)
+			// takes it second. net.ListenPacket is deliberately not matched:
+			// it cannot bind a TCP network, so flagging it is only noise.
+			if len(call.Args) == 3 {
+				networkArgIdx = 1
+			}
+		case "ListenTCP":
 			networkArgIdx = 0
 		default:
 			return true
@@ -155,6 +161,33 @@ func tcpListenCalls(t *testing.T, path string) []string {
 	})
 
 	return calls
+}
+
+// isNetlisten reports whether expr is internal/netlisten used either as a
+// package (netlisten.Listen) or as its config (netlisten.Config().Listen).
+func isNetlisten(expr ast.Expr) bool {
+	if pkg, ok := expr.(*ast.Ident); ok && pkg.Name == "netlisten" {
+		return true
+	}
+
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "Config" {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+
+	return ok && pkg.Name == "netlisten"
+}
+
+// isUpgrader reports whether expr is the tableflip upgrader variable.
+func isUpgrader(expr ast.Expr) bool {
+	ident, ok := expr.(*ast.Ident)
+
+	return ok && ident.Name == "upg"
 }
 
 func stringLiteral(args []ast.Expr, idx int) (string, bool) {
@@ -194,25 +227,6 @@ func readFile(t *testing.T, path string) []byte {
 	return src
 }
 
-func trackedGoFiles(t *testing.T) []string {
-	t.Helper()
-
-	out, err := exec.Command("git", "ls-files", "-z", "*.go").Output()
-	if err != nil {
-		t.Fatalf("list tracked files: %v", err)
-	}
-
-	var files []string
-	for _, file := range bytes.Split(out, []byte{0}) {
-		if len(file) == 0 {
-			continue
-		}
-		files = append(files, string(file))
-	}
-
-	return files
-}
-
 func parseFile(t *testing.T, path string, src []byte) *ast.File {
 	t.Helper()
 
@@ -222,4 +236,34 @@ func parseFile(t *testing.T, path string, src []byte) *ast.File {
 	}
 
 	return f
+}
+
+// goFiles walks the working tree rather than asking git: this test also runs in
+// build stages that have no .git directory, where shelling out to git fails.
+func goFiles(t *testing.T) []string {
+	t.Helper()
+
+	var files []string
+	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if skippedDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+
+			return nil
+		}
+		if strings.HasSuffix(path, ".go") {
+			files = append(files, filepath.ToSlash(path))
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk for go files: %v", err)
+	}
+
+	return files
 }
