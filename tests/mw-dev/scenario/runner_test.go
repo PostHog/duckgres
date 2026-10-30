@@ -17,6 +17,7 @@ import (
 	scenarioperf "github.com/posthog/duckgres/tests/mw-dev/scenario/perf"
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
+	"github.com/posthog/duckgres/tests/perf/properties"
 )
 
 var (
@@ -1116,13 +1117,38 @@ func containsTemplate(value any) bool {
 	return false
 }
 
-func TestUnshreddedVariantSourceComesOnlyFromTheDispatchInput(t *testing.T) {
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI", "")
-	if _, err := unshreddedVariantSource(); err == nil || !strings.Contains(err.Error(), "properties_variant_unshredded_s3_uri") {
-		t.Fatalf("an unset prefix must fail naming the dispatch input, got %v", err)
+// Both VARIANT series must read the two forms of one pyhoglake fixture, so
+// they differ only in layout; neither may fall back to another copy.
+func TestVariantSourcesAreBothFormsOfOneFixture(t *testing.T) {
+	for _, tc := range []struct {
+		shredded, unshredded, wantErr string
+	}{
+		{"s3://b/r/v1/shredded/", "s3://b/r/v1/unshredded/", ""},
+		{"s3://b/r/v1/shredded", "s3://b/r/v1/unshredded", ""},
+		{"", "s3://b/r/v1/unshredded/", "dispatch with both"},
+		{"s3://b/r/v1/shredded/", "", "dispatch with both"},
+		{"s3://b/canonical/", "s3://b/r/v1/unshredded/", "one fixture root"},
+		{"s3://b/r/v1/shredded/", "s3://b/r/v2/unshredded/", "one fixture root"},
+	} {
+		t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI", tc.shredded)
+		t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI", tc.unshredded)
+		shredded, unshredded, err := variantSources()
+		if tc.wantErr == "" && (err != nil || shredded != tc.shredded || unshredded != tc.unshredded) {
+			t.Fatalf("%+v: got %q, %q, %v", tc, shredded, unshredded, err)
+		}
+		if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+			t.Fatalf("%+v: want error %q, got %v", tc, tc.wantErr, err)
+		}
 	}
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI", "s3://b/v1/unshredded/")
-	if got, err := unshreddedVariantSource(); err != nil || got != "s3://b/v1/unshredded/" {
-		t.Fatalf("unshreddedVariantSource = %q, %v", got, err)
+}
+
+func TestFixtureVersionCoversEveryCopy(t *testing.T) {
+	base := preparedPropertiesComparison{
+		dataset: &properties.Dataset{SHA256: "a"}, variant: &properties.Dataset{SHA256: "b"}, unshredded: &properties.Dataset{SHA256: "c"},
+	}
+	other := base
+	other.unshredded = &properties.Dataset{SHA256: "d"}
+	if base.fixtureSHA256() == other.fixtureSHA256() {
+		t.Fatal("a different unshredded copy must change the fixture version")
 	}
 }

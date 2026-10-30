@@ -108,11 +108,15 @@ manifests. Never substitute JSON under a VARIANT label.
 
 The unshredded series reads `properties_perf.events_variant_unshredded`, a
 pyhoglake copy whose VARIANT column has no `typed_value` and so is read whole
-and looked up row by row. Its prefix has no Glue parameter: dispatch with
-`properties_variant_unshredded_s3_uri` (the Job's
-`DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI`), or the properties
-phase fails. `properties_variant_s3_uri` likewise overrides the shredded
-copy's prefix. Point either at the `.parquet` tree of one form only.
+and looked up row by row. On this branch both VARIANT series read one
+pyhoglake fixture, so they differ only in layout: dispatch with
+`properties_variant_s3_uri` = `<root>/shredded/` and
+`properties_variant_unshredded_s3_uri` = `<root>/unshredded/` (the Job's
+`DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI` and
+`DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI`). A missing input, or
+two prefixes that are not siblings under one root, fails the properties phase;
+the Glue parameter's canonical copy is not used. `fixture_version` hashes all
+three copies.
 
 ## Results and recovery
 

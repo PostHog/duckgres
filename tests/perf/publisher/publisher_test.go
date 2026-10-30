@@ -461,3 +461,20 @@ func writeMinimalCSVFile(t *testing.T, runDir string) {
 		t.Fatalf("WriteFile csv: %v", err)
 	}
 }
+
+func TestParseResultRowAcceptsEveryPropertiesRepresentation(t *testing.T) {
+	record := func(representation string) []string {
+		row := make([]string, len(expectedQueryResultsHeader)+1)
+		row[2], row[8], row[9] = "1", "1.5", "2026-10-30T00:00:00Z"
+		row[len(expectedQueryResultsHeader)] = representation
+		return row
+	}
+	for _, representation := range []string{"", "json", "struct", "variant", "variant_unshredded"} {
+		if row, err := parseResultRow(record(representation)); err != nil || row.Representation != representation {
+			t.Fatalf("representation %q: %+v, %v", representation, row, err)
+		}
+	}
+	if _, err := parseResultRow(record("variant_other")); err == nil {
+		t.Fatal("an unknown representation must be refused")
+	}
+}

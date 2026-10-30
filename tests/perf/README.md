@@ -248,7 +248,7 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 - `rows`
 - `duration_ms`
 - `started_at`
-- `representation` (empty for existing workloads; `json`, `struct`, or `variant` for properties)
+- `representation` (empty for existing workloads; `json`, `struct`, `variant`, or `variant_unshredded` for properties)
 - `run_label` (display name for the properties comparison; `protocol` retains its routing identifier)
 
 `measure_iteration` is the 1-based measured repetition within a run (`0` is reserved for non-measured warmup work and is not emitted to the CSV today).
@@ -379,10 +379,10 @@ the native VARIANT column, shredded on `$browser`, as `trino (variant)` and
 unshredded)` and `trino (cache+variant unshredded)`; those results pass the same
 JSON-baseline gate. A third intent counts `$lib_version`, a key the shredded
 copy does not shred, on Trino only (JSON and both VARIANT forms). The shredded
-VARIANT table is registered from the fixture's canonical copy, located through
-the Glue table's `duckgres.properties_variant_location` parameter, and the
-unshredded one from the dispatch input `properties_variant_unshredded_s3_uri`
-(see the runbook). A query with a `skip_reason` still emits `skipped` rows with iteration
+two VARIANT tables are registered from the `shredded/` and `unshredded/`
+prefixes of one pyhoglake fixture, given by the dispatch inputs
+`properties_variant_s3_uri` and `properties_variant_unshredded_s3_uri` (see the
+runbook). A query with a `skip_reason` still emits `skipped` rows with iteration
 zero, excluded from measured/warmup query counts.
 
 Both suites of one nightly publish under the same dataset version

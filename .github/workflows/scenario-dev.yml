@@ -20,12 +20,12 @@ on:
         default: ""
         type: string
       properties_variant_s3_uri:
-        description: Shredded VARIANT properties Parquet S3 prefix override; blank uses the Athena table's VARIANT parameter
+        description: Shredded VARIANT properties Parquet S3 prefix, <root>/shredded/ (required by posthog_frozen_perf on this branch)
         required: false
         default: ""
         type: string
       properties_variant_unshredded_s3_uri:
-        description: Unshredded VARIANT properties Parquet S3 prefix (required by posthog_frozen_perf on this branch)
+        description: Unshredded VARIANT properties Parquet S3 prefix, <root>/unshredded/ (required by posthog_frozen_perf on this branch)
         required: false
         default: ""
         type: string
@@ -217,7 +217,7 @@ jobs:
             source=$(jq -r --arg input "$input" '.inputs[$input] // ""' "$GITHUB_EVENT_PATH")
             if [ -n "$source" ]; then
               echo "::add-mask::$source"
-              if [[ "$source" =~ ^s3://[^[:space:]]+$ ]]; then
+              if [[ "$source" =~ ^s3://[A-Za-z0-9._~/=+-]+$ ]]; then
                 echo "$variable=$source" >> "$GITHUB_ENV"
               else
                 echo "::warning::Invalid $input prefix; the properties comparison will fail after original benchmarks complete."

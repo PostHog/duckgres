@@ -2,9 +2,12 @@ package scenario
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -63,7 +66,7 @@ func (e dispatchExecutor) runPropertiesComparison(ctx context.Context, step core
 	with["catalog_file"] = filepath.Join(prepared.directory, "catalog.yaml")
 	with["dataset_version"] = datasetVersion
 	with["suite"] = perfcore.SuiteProperties
-	with["fixture_version"] = "properties-sha256-" + prepared.dataset.SHA256
+	with["fixture_version"] = "properties-sha256-" + prepared.fixtureSHA256()
 	with["output_subdir"] = "perf-properties"
 	// Distinct run ID so the publisher never overwrites the table-suite run;
 	// consumers pair the two through nightly_run_id, not this suffix.
@@ -82,14 +85,29 @@ type preparedPropertiesComparison struct {
 	unshredded *properties.Dataset
 }
 
-// unshreddedVariantSource is the unshredded VARIANT copy's prefix. Unlike the
-// shredded copy it has no Glue parameter: only a dispatch input sets it.
-func unshreddedVariantSource() (string, error) {
-	source := os.Getenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI")
-	if source == "" {
-		return "", fmt.Errorf("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI is not set; dispatch with properties_variant_unshredded_s3_uri")
+// fixtureSHA256 identifies all three copies the comparison reads, so runs on
+// different VARIANT copies never publish the same fixture_version.
+func (p *preparedPropertiesComparison) fixtureSHA256() string {
+	digest := sha256.Sum256([]byte(p.dataset.SHA256 + "\n" + p.variant.SHA256 + "\n" + p.unshredded.SHA256))
+	return hex.EncodeToString(digest[:])
+}
+
+// variantSources returns the shredded and unshredded VARIANT copies' prefixes.
+// Both come from dispatch inputs and must be the shredded/ and unshredded/
+// forms of one pyhoglake fixture root, so the two series differ only in
+// layout. Falling back to the Glue parameter's DuckDB-written canonical copy
+// for the shredded series would compare different writers under these labels.
+func variantSources() (string, string, error) {
+	shredded := os.Getenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI")
+	unshredded := os.Getenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI")
+	if shredded == "" || unshredded == "" {
+		return "", "", fmt.Errorf("dispatch with both properties_variant_s3_uri and properties_variant_unshredded_s3_uri")
 	}
-	return source, nil
+	root, ok := strings.CutSuffix(strings.TrimSuffix(shredded, "/"), "/shredded")
+	if !ok || strings.TrimSuffix(unshredded, "/") != root+"/unshredded" {
+		return "", "", fmt.Errorf("properties_variant_s3_uri and properties_variant_unshredded_s3_uri must be the shredded/ and unshredded/ prefixes of one fixture root")
+	}
+	return shredded, unshredded, nil
 }
 
 func preparePropertiesComparison(ctx context.Context, source string, step core.Step) (*preparedPropertiesComparison, error) {
@@ -122,19 +140,13 @@ func preparePropertiesComparison(ctx context.Context, source string, step core.S
 	if err := dataset.VerifyAthenaTable(ctx, client, database, table); err != nil {
 		return nil, fmt.Errorf("selected fixture must match the preprovisioned Athena properties table; update its mapping when generating the replacement fixture: %w", err)
 	}
-	variantSource := os.Getenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI")
-	if variantSource == "" {
-		if variantSource, err = properties.VariantLocation(ctx, client, database, table); err != nil {
-			return nil, err
-		}
+	variantSource, unshreddedSource, err := variantSources()
+	if err != nil {
+		return nil, err
 	}
 	variant, err := properties.Discover(ctx, s3.NewFromConfig(cfg), variantSource)
 	if err != nil {
 		return nil, fmt.Errorf("discover VARIANT properties fixture: %w", err)
-	}
-	unshreddedSource, err := unshreddedVariantSource()
-	if err != nil {
-		return nil, err
 	}
 	unshredded, err := properties.Discover(ctx, s3.NewFromConfig(cfg), unshreddedSource)
 	if err != nil {

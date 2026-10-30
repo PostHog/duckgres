@@ -22,8 +22,8 @@ Optional environment:
   DUCKGRES_SCENARIO_MAX_RUNTIME
   DUCKGRES_SCENARIO_GO_TEST_TIMEOUT
   DUCKGRES_SCENARIO_PROPERTIES_S3_URI (override; defaults to the Athena properties table location)
-  DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI (override; defaults to the Athena table's VARIANT parameter)
-  DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI (required by the properties comparison; no default)
+  DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI and DUCKGRES_SCENARIO_PROPERTIES_VARIANT_UNSHREDDED_S3_URI
+    (required by the properties comparison: the shredded/ and unshredded/ prefixes of one pyhoglake fixture)
 
 Scenario-specific required environment:
   DUCKGRES_SCENARIO_ORG_ID       (required by successful provisioning scenarios)
