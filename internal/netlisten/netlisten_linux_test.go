@@ -5,9 +5,6 @@ package netlisten
 import (
 	"context"
 	"net"
-	"os"
-	"os/exec"
-	"strings"
 	"syscall"
 	"testing"
 )
@@ -19,23 +16,24 @@ const (
 )
 
 // TestListenBindsPlainTCPSocket is the behavioural test for this package, and it
-// covers both mechanisms at once: the listener built by this package, and the
-// listener a stdlib call builds under the module default from go.mod.
+// covers both mechanisms at once: the listener built here, and the listener a
+// plain stdlib call builds under the module default from go.mod.
 //
-// The control listener comes first on purpose. Without it a passing subject would
-// not prove anything: on a kernel built without CONFIG_MPTCP, or with
-// net.mptcp.enabled=0, every listener is plain TCP whether we ask or not. The
-// control shows this host is one where the distinction is observable, and the
-// test skips where it is not.
+// The control listener forces MPTCP on, which is the only way to find out whether
+// this host can tell the two apart at all. A zero ListenConfig would not work as
+// the control any more: go.mod's directive makes it bind plain TCP, so the
+// control would always fail and the test would always skip.
 func TestListenBindsPlainTCPSocket(t *testing.T) {
-	control, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	controlConfig := &net.ListenConfig{}
+	controlConfig.SetMultipathTCP(true)
+	control, err := controlConfig.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("control listener: %v", err)
 	}
 	defer func() { _ = control.Close() }()
 
 	if got := socketProtocol(t, control); got != ipProtoMPTCP {
-		t.Skipf("host does not bind MPTCP sockets by default (control listener protocol %d, want %d): MPTCP is not compiled in or net.mptcp.enabled=0, so this test cannot distinguish the two behaviours", got, ipProtoMPTCP)
+		t.Skipf("host does not bind MPTCP sockets (control listener protocol %d, want %d): MPTCP is not compiled in or net.mptcp.enabled=0, so this test cannot distinguish the two behaviours", got, ipProtoMPTCP)
 	}
 
 	// The go.mod `godebug multipathtcp=0` directive, observed at the syscall
@@ -61,67 +59,28 @@ func TestListenBindsPlainTCPSocket(t *testing.T) {
 	}
 }
 
-// TestListenBindsPlainTCPSocketUnderGODEBUG proves the helper is load-bearing
-// rather than decorative.
+// TestListenBindsPlainTCPSocketUnderGODEBUG proves the helper is load-bearing at
+// the socket level too.
 //
-// The test above passes because two independent mechanisms both hold MPTCP off,
-// so deleting SetMultipathTCP(false) from Config() would not turn it red: the
-// go.mod default would still bind plain TCP. Here GODEBUG=multipathtcp=1 puts the
-// net package default back on the MPTCP path, leaving the explicit call as the
-// only thing keeping the socket plain. A zero ListenConfig is asserted to bind an
-// MPTCP socket in the same process, so a silent failure to apply the override
-// cannot make this test vacuous.
+// Under GODEBUG=multipathtcp=1 a zero ListenConfig binds an MPTCP socket again, so
+// the explicit SetMultipathTCP(false) inside Listen is the only thing keeping the
+// subject on plain TCP. The control is asserted in the same process, so an
+// override that quietly fails to apply cannot make this test vacuous.
 func TestListenBindsPlainTCPSocketUnderGODEBUG(t *testing.T) {
-	if os.Getenv("NETLISTEN_SOCKET_PROBE") == "1" {
-		probeSocketProtocols(t)
-
-		return
-	}
-
 	if !hostBindsMPTCP(t) {
-		t.Skip("host cannot bind MPTCP sockets, so the GODEBUG override has nothing to observe; covered by TestListenBindsPlainTCPSocket's skip on the same hosts")
+		t.Skip("host cannot bind MPTCP sockets, so the override has nothing to observe")
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestListenBindsPlainTCPSocketUnderGODEBUG$", "-test.v")
-	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "GODEBUG=") {
-			continue
-		}
-		cmd.Env = append(cmd.Env, kv)
-	}
-	cmd.Env = append(cmd.Env, "NETLISTEN_SOCKET_PROBE=1", "GODEBUG=multipathtcp=1")
+	t.Setenv("GODEBUG", "multipathtcp=1")
 
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("child process with GODEBUG=multipathtcp=1 failed: %v\n%s", err, out)
-	}
-}
-
-// probeSocketProtocols runs in the child process, where GODEBUG=multipathtcp=1 is
-// in force.
-func probeSocketProtocols(t *testing.T) {
-	t.Helper()
-
-	controlConfig := &net.ListenConfig{}
-	controlConfig.SetMultipathTCP(true)
-	control, err := controlConfig.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	control, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("control listener: %v", err)
 	}
 	defer func() { _ = control.Close() }()
 
 	if got := socketProtocol(t, control); got != ipProtoMPTCP {
-		t.Fatalf("control listener bound protocol %d, want %d: GODEBUG=multipathtcp=1 did not take effect in this process", got, ipProtoMPTCP)
-	}
-
-	defaultConfig, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("default listener: %v", err)
-	}
-	defer func() { _ = defaultConfig.Close() }()
-
-	if got := socketProtocol(t, defaultConfig); got != ipProtoMPTCP {
-		t.Fatalf("a zero ListenConfig bound protocol %d under GODEBUG=multipathtcp=1, want %d: the override is not applied, so this test could not tell whether netlisten works", got, ipProtoMPTCP)
+		t.Fatalf("control listener bound protocol %d under GODEBUG=multipathtcp=1, want %d: the override is not applied, so this test could not tell whether Listen works", got, ipProtoMPTCP)
 	}
 
 	ln, err := Listen("tcp", "127.0.0.1:0")

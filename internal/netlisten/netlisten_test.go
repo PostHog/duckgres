@@ -2,9 +2,6 @@ package netlisten
 
 import (
 	"net"
-	"os"
-	"os/exec"
-	"strings"
 	"testing"
 )
 
@@ -32,54 +29,47 @@ func TestConfigDisablesMultipathTCP(t *testing.T) {
 	}
 }
 
-// TestConfigDisablesMultipathTCPUnderGODEBUGOverride proves the explicit
-// SetMultipathTCP(false) survives a GODEBUG environment variable that would
-// otherwise re-enable MPTCP on listeners.
+// TestConfigDisablesMultipathTCPUnderGODEBUGOverride is the test that makes the
+// helper load-bearing rather than decorative.
 //
-// This runs in a child process because the net package reads GODEBUG once per
-// setting per process, so a t.Setenv in this process cannot influence a value
-// that earlier tests already forced.
+// The module default already keeps MPTCP off, so deleting SetMultipathTCP(false)
+// from Config() would not turn TestConfigDisablesMultipathTCP red. GODEBUG puts
+// the net package back on the MPTCP path, leaving the explicit call as the only
+// thing holding it; the GODEBUG values that do that for listeners are "1"
+// (everywhere) and "2" (listeners only), see mptcpStatusListen.get in
+// net/dial.go.
 //
-// Two details make the difference between a real test and a green one:
-//
-//   - The child asserts the override took effect (a zero ListenConfig must
-//     report MultipathTCP()==true) before it checks Config(). Without that
-//     control the test passes when the override silently fails to apply, which
-//     is exactly what happens if an inherited GODEBUG entry shadows ours.
-//   - Inherited GODEBUG entries are dropped rather than appended to. The runtime
-//     reads the first GODEBUG= entry in the environment while os.Getenv returns
-//     the last, so appending ours would leave a CI-provided GODEBUG in force and
-//     the whole test inert.
-//
-// Both "1" (everywhere) and "2" (listeners only) enable MPTCP on listeners; see
-// mptcpStatusListen.get in net/dial.go.
+// The control assertion is not decoration either: if the override silently fails
+// to apply, Config() is false for the boring reason and this test would pass
+// without the helper doing anything. Setting GODEBUG through t.Setenv is enough
+// because internal/godebug re-reads its settings when GODEBUG changes, which
+// TestGODEBUGOverrideTakesEffect checks first.
 func TestConfigDisablesMultipathTCPUnderGODEBUGOverride(t *testing.T) {
-	if os.Getenv("NETLISTEN_GODEBUG_PROBE") == "1" {
-		if !(&net.ListenConfig{}).MultipathTCP() {
-			t.Fatalf("GODEBUG=%q did not enable MPTCP on a zero net.ListenConfig, so this test cannot tell a working SetMultipathTCP(false) from a missing one", os.Getenv("GODEBUG"))
-		}
-		if Config().MultipathTCP() {
-			t.Fatalf("GODEBUG=%q re-enabled MPTCP on a Config() listener; an explicit SetMultipathTCP(false) must win over GODEBUG", os.Getenv("GODEBUG"))
-		}
-
-		return
-	}
-
 	for _, mode := range []string{"1", "2"} {
 		t.Run("multipathtcp="+mode, func(t *testing.T) {
-			cmd := exec.Command(os.Args[0], "-test.run=^TestConfigDisablesMultipathTCPUnderGODEBUGOverride$", "-test.v")
-			for _, kv := range os.Environ() {
-				if strings.HasPrefix(kv, "GODEBUG=") {
-					continue
-				}
-				cmd.Env = append(cmd.Env, kv)
-			}
-			cmd.Env = append(cmd.Env, "NETLISTEN_GODEBUG_PROBE=1", "GODEBUG=multipathtcp="+mode)
+			t.Setenv("GODEBUG", "multipathtcp="+mode)
 
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("child process with GODEBUG=multipathtcp=%s failed: %v\n%s", mode, err, out)
+			if !(&net.ListenConfig{}).MultipathTCP() {
+				t.Fatalf("GODEBUG=multipathtcp=%s did not take effect: a zero net.ListenConfig still reports MultipathTCP()==false, so this test could not tell a working SetMultipathTCP(false) from a missing one", mode)
+			}
+			if Config().MultipathTCP() {
+				t.Fatalf("GODEBUG=multipathtcp=%s re-enabled MPTCP on a Config() listener; an explicit SetMultipathTCP(false) must win over GODEBUG", mode)
 			}
 		})
+	}
+}
+
+// TestGODEBUGOverrideTakesEffect pins the assumption the test above relies on:
+// changing GODEBUG at runtime is visible to the net package. If that ever stops
+// holding, the override test would need a child process to stay honest.
+func TestGODEBUGOverrideTakesEffect(t *testing.T) {
+	if (&net.ListenConfig{}).MultipathTCP() {
+		t.Fatal("precondition failed: MPTCP is on before the override, so the module default is not in force")
+	}
+
+	t.Setenv("GODEBUG", "multipathtcp=1")
+
+	if !(&net.ListenConfig{}).MultipathTCP() {
+		t.Fatal("setting GODEBUG=multipathtcp=1 at runtime did not reach the net package; TestConfigDisablesMultipathTCPUnderGODEBUGOverride would then be testing nothing")
 	}
 }

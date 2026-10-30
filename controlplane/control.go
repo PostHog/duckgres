@@ -2890,11 +2890,18 @@ func (cp *ControlPlane) recoverMetricsAfterFailedReload() {
 	addr := cp.cfg.MetricsServer.Addr
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	// Addr is informational only now that Serve takes a listener, but the recovery
+	// path rebinds from it, so it has to stay populated.
 	newSrv := &http.Server{Addr: addr, Handler: mux}
 	cp.cfg.MetricsServer = newSrv
 	go func() {
+		ln, err := netlisten.Listen("tcp", addr)
+		if err != nil {
+			slog.Warn("Recovered metrics listener error.", "addr", addr, "error", err)
+			return
+		}
 		slog.Info("Recovered metrics server after reload failure.", "addr", addr)
-		if err := newSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := newSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			slog.Warn("Recovered metrics server error.", "error", err)
 		}
 	}()

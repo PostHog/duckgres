@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/posthog/duckgres/internal/netlisten"
 )
 
 // InitMetrics starts the Prometheus metrics HTTP server on :9090/metrics
@@ -19,14 +21,25 @@ import (
 func InitMetrics() *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	addr := ":9090"
+	// Addr is informational only now that Serve takes a listener; callers read it
+	// when they rebuild a metrics server after a failed handover.
 	srv := &http.Server{
-		Addr:    ":9090",
+		Addr:    addr,
 		Handler: mux,
 	}
 	go func() {
 		for {
-			slog.Info("Starting metrics server", "addr", srv.Addr)
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			// Rebind each iteration: the listener is recreated after a failed
+			// serve, and it carries the socket options (see internal/netlisten).
+			ln, err := netlisten.Listen("tcp", addr)
+			if err != nil {
+				slog.Warn("Metrics listener error, retrying in 1s.", "addr", addr, "error", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			slog.Info("Starting metrics server", "addr", addr)
+			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 				slog.Warn("Metrics server error, retrying in 1s.", "error", err)
 				time.Sleep(1 * time.Second)
 				continue

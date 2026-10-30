@@ -139,7 +139,12 @@ func main() {
 
 	log.Printf("duckgres admin UI dev server: http://%s  →  proxying /api,/login,/health to %s", *listen, targetURL)
 	log.Printf("serving static assets from %s (edit + refresh, no rebuild)", absStatic)
-	if err := http.ListenAndServe(*listen, mux); err != nil {
+	ln, err := netlisten.Listen("tcp", *listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	if err := srv.Serve(ln); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -10,7 +10,8 @@ until the node kernels are updated.
 
 `ipv4: free inet_opt and ireq_opt after an RCU grace period`
 ([upstream commit e3f33b0a1d89](https://git.kernel.org/linus/e3f33b0a1d89d738e2b913dab519226eaf76e15b),
-backported to 6.1.190, 6.12.113, 7.2.12 and later).
+backported to 6.1.190, 6.6.159, 6.12.113, 6.18.56 and 7.2.10, then to
+mainline 7.3).
 
 `tcp_v4_syn_recv_sock()` hands `ireq->ireq_opt` to the child socket without
 copying it. A retransmitted SYN processed on another CPU can still be building
@@ -31,33 +32,50 @@ is true, `defaultMPTCPEnabledDial` is false). Nothing in Duckgres asks for MPTCP
 it arrives as the net package default, which is why this needs a guard rather
 than an invocation-level fix.
 
-With an MPTCP listener, SYNs are handled by `subflow_syn_recv_sock()`. That
-function calls the same `tcp_v4_syn_recv_sock()` and then, on a few paths, jumps
-to its own `dispose_child` label and tears the child down in the same call — for
-example when a SYN presents a forged `MP_JOIN` option. The window the CVE needs
-("child destroyed while a SYNACK is in flight") stops being a lucky race and
-becomes something a remote caller schedules. Plain TCP needs the child to be
-reset or closed at the wrong moment instead.
+With an MPTCP listener the handshake's final ACK is handled by
+`subflow_syn_recv_sock()`. That function calls the same `tcp_v4_syn_recv_sock()`
+and then, on several paths, jumps to its own `dispose_child` label and tears the
+child down in the same call — for example when an `MP_JOIN` subflow's third ACK
+fails validation (bad HMAC, missing `MPJ_ACK`, port mismatch, subflow limit).
+That puts "child destroyed while a SYNACK is in flight" microseconds after the
+ownership transfer instead of leaving it to chance.
+
+Two things narrow this, and neither closes it: an `MP_JOIN` carrying an unknown
+token is rejected in `subflow_check_req()` with `-EPERM` before any request
+socket is created, so the attacker has to learn a token from an `MP_CAPABLE`
+connection of its own first; and the attacker controls when the child is freed,
+not when the stale SYNACK reader runs, which still requires a retransmitted SYN
+processed on another CPU.
+
+Plain TCP has the same race but needs a rarer teardown: a RST does not free an
+accept-queue child. It is freed after `accept()` and `close()` in userspace, on
+listener teardown (`inet_child_forget`), through `sock_diag` destroy, or via
+`tcp_abort` — all far later than the SYNACK window. The Go security team
+explicitly does not rule out plain TCP exploitation, so treat this as reach
+reduction rather than immunity.
 
 ## What this repository does
 
 1. `godebug multipathtcp=0` in `go.mod`. This pins the pre-1.24 default for every
    binary and test built from the module, including listeners created by
    `http.ListenAndServe` and other helpers we do not construct ourselves.
-2. `internal/netlisten` sets `SetMultipathTCP(false)` explicitly on the listeners
-   we do construct: the control plane's PG listener (through
-   `tableflip.Options.ListenConfig`), the standalone server, the DuckDB service
-   and its local cache-proxy router, the ACME HTTP-01 listener, and the admin
-   devserver. An explicit `SetMultipathTCP(false)` overrides `GODEBUG`, so a
-   deployment environment that sets `GODEBUG=multipathtcp=1` cannot undo it.
+2. `internal/netlisten` sets `SetMultipathTCP(false)` explicitly on every
+   first-party listener: the control plane's PG listener (through
+   `tableflip.Options.ListenConfig`) and its API and metrics servers, the
+   standalone server, the DuckDB service and its local cache-proxy router, the
+   cache proxy's three HTTP servers, the ACME HTTP-01 listener, the boot metrics
+   server, and the admin devserver. An explicit `SetMultipathTCP(false)` overrides
+   `GODEBUG`, so a deployment environment that sets `GODEBUG=multipathtcp=1`
+   cannot undo it for any of them.
 3. Tests, so the invariant does not rot:
    - `internal/netlisten` asserts the module default, the helper, that the helper
      survives `GODEBUG=multipathtcp=1`, and (on MPTCP-capable hosts) that the
      bound socket is `IPPROTO_TCP` where a forced-on control listener gets
      `IPPROTO_MPTCP`.
    - `listener_hygiene_test.go` fails if a new TCP listener bypasses
-     `internal/netlisten`, or if the tableflip upgrader is handed a listen config
-     that does not come from it.
+     `internal/netlisten` — including `tls.Listen` and `http.ListenAndServe` — or
+     if the tableflip upgrader is handed a listen config that is not exactly
+     `netlisten.Config()`.
 
 ## Rollout
 
@@ -86,32 +104,42 @@ Remaining follow-ups, in priority order:
 
 - Update the node kernels to a build carrying the backport. Bottlerocket
   re-resolves the AMI per release, so a node-group or AMI version bump rolls the
-  fleet. Confirm with `uname -r` on the nodes against 6.12.113 / 7.2.12+ (or
-  6.1.190 for 6.1).
+  fleet. Do not decide that from `uname -r`: distributions backport the fix into
+  their own versioning, so a kernel that looks older can be patched and one that
+  looks newer can be missing it. Use the vendor's advisory or the Bottlerocket
+  release notes for the variant in use, or check the source the vendor ships.
 - If a node cannot be updated, `net.mptcp.enabled=0` turns MPTCP off in a
   network namespace. Note what that means here: the sysctl is per-namespace, so
   setting it on the node's root namespace covers host-network processes but
   does nothing for a pod with its own netns, which is where this process runs.
-  For the pod, set it inside the pod network namespace. The fleet's generic app
-  chart already has a privileged `sysctls` init container that does this in a
-  pod's netns (it is what sets `net.ipv4.tcp_migrate_req: "1"` for the Django
-  apps), but Duckgres runs from its own chart, so that values key does not reach
-  these pods — covering them means a change to the Duckgres pod templates. Go falls back to plain TCP when socket creation
-  fails with `ENOPROTOOPT`, so this is safe for us. Either way it is a
+  For the pod it has to be set inside the pod's network namespace, which takes a
+  privileged init container or an equivalent per-pod mechanism; Duckgres is
+  deployed from its own chart, so this is a change to the pod template rather
+  than a values key. Go falls back to plain TCP when socket creation fails with
+  `ENOPROTOOPT`, so the setting is safe for this process. Either way it is a
   deployment change, not a repository change.
 - Where the network path allows it, drop IPv4 TCP packets that carry IP options
   (`ihl > 5`) before they reach a listener. `ireq_opt` only exists for those
   packets, so dropping them removes the precondition for every process on the
-  node, not just this one. nftables has no IP-option match; iptables can express
-  it (`-p tcp --syn -m ipv4options --any -j DROP`), and it is worth checking
-  whether the NLB or the VPC security layer can do it more cheaply.
+  node, not just this one. nftables can express it by header length, which is the
+  simplest form because it needs no option-type knowledge:
+
+  ```sh
+  nft add rule inet filter input tcp flags syn ip hdrlength != 5 counter drop
+  ```
+
+  `ip option` matches (`lsrr`, `ssrr`, `rr`, `ra`) work too, but nothing matches
+  the timestamp option by name. In iptables the mainline match is `u32`
+  (`-p tcp --syn -m u32 --u32 "0>>24&0xF=6:15" -j DROP`); `-m ipv4options` comes
+  from xtables-addons, not the mainline kernel, and is not available on
+  Bottlerocket. Worth checking whether the load balancer or the VPC security
+  layer can drop these more cheaply.
 - The request-socket migration half of the CVE needs
   `net.ipv4.tcp_migrate_req=1` or a `BPF_SK_REUSEPORT_SELECT_OR_MIGRATE` program.
-  Linux defaults to 0 and the Duckgres charts do not set it, but do not assume
-  that fleet-wide: several other application charts in the same clusters do set
-  it to 1, which makes the migration half live for those pods even though the
-  MPTCP half is not (they are not Go processes). Worth passing to whoever owns
-  the CVE response, and worth checking per pod rather than per cluster.
+  Linux defaults it to 0 and the Duckgres charts do not set it, but that is a
+  per-pod question rather than a per-cluster one: check the value in each netns
+  that serves traffic, because a pod that inherits the setting from a template or
+  a host-network process can have it on without the Duckgres manifests saying so.
 
 ## Verifying a running deployment
 
@@ -125,7 +153,7 @@ At runtime, first establish that this pod's network namespace has MPTCP at all:
 ```sh
 # inside the control-plane container
 ls /proc/sys/net/mptcp/          # absent => kernel built without CONFIG_MPTCP
-grep -E '^(MPTCP|MPTCPv6)' /proc/net/protocols   # absent => no MPTCP sockets registered
+grep -E '^(MPTCP|MPTCPv6)' /proc/net/protocols   # absent => kernel built without MPTCP
 ```
 
 `net.mptcp.enabled` is per network namespace, not a node-wide switch: it is
@@ -181,5 +209,7 @@ Four traps in reading that:
 
 Reverting the `go.mod` directive and the `netlisten` call sites restores Go's
 MPTCP-listener default. Nothing else depends on either, so a revert has no data
-or protocol consequence: MPTCP listeners negotiate plain TCP with clients that do
-not speak MPTCP, which is all of them.
+or protocol consequence: MPTCP listeners fall back to plain TCP for clients that
+do not request MPTCP, and the clients we know of (psql, pgx, JDBC, psycopg) do
+not. A client could opt in deliberately (`mptcpize run psql`), which is the one
+case where a revert would change the transport.

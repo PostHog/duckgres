@@ -88,8 +88,10 @@ func TestUpgraderReceivesNetlistenConfig(t *testing.T) {
 			if !ok || key.Name != "ListenConfig" {
 				continue
 			}
-			if got := exprText(src, kv.Value); !strings.Contains(got, "netlisten.Config()") {
-				t.Errorf("tableflip.Options.ListenConfig = %s, want netlisten.Config(): the PG listener would bind an MPTCP socket", got)
+			// Exactly the helper's config, not something that merely mentions it:
+			// a wrapper could call netlisten.Config() and then re-enable MPTCP.
+			if got := exprText(src, kv.Value); got != "netlisten.Config()" {
+				t.Errorf("tableflip.Options.ListenConfig = %s, want exactly netlisten.Config(): the PG listener would bind an MPTCP socket", got)
 			}
 
 			return true
@@ -106,11 +108,17 @@ func TestUpgraderReceivesNetlistenConfig(t *testing.T) {
 
 // tcpListenCalls returns a description of every listener-creating call in path
 // that would bind a TCP socket using the net package default.
+//
+// This is a syntactic check, so it can be evaded: a dot-import, a function value
+// (f := net.Listen), or an aliased import hides the package from it. It catches
+// the shapes people actually write, which is the point; the go.mod directive and
+// code review cover the rest.
 func tcpListenCalls(t *testing.T, path string) []string {
 	t.Helper()
 
 	src := readFile(t, path)
 	f := parseFile(t, path, src)
+	configVars := netlistenConfigVars(f)
 
 	var calls []string
 	ast.Inspect(f, func(n ast.Node) bool {
@@ -122,7 +130,12 @@ func tcpListenCalls(t *testing.T, path string) []string {
 		if !ok {
 			return true
 		}
-		if isNetlisten(sel.X) {
+		// netlisten.Listen(...), netlisten.Config().Listen(...), or the same
+		// config kept in a variable.
+		if isNetlisten(sel.X) || isNetlistenConfigCall(sel.X) {
+			return true
+		}
+		if id, ok := sel.X.(*ast.Ident); ok && configVars[id.Name] {
 			return true
 		}
 		if path == upgraderListenerFile && isUpgrader(sel.X) && sel.Sel.Name == "Listen" {
@@ -132,15 +145,20 @@ func tcpListenCalls(t *testing.T, path string) []string {
 		var networkArgIdx int
 		switch sel.Sel.Name {
 		case "Listen":
-			// net.Listen(network, addr) and upg.Listen(network, addr) take the
-			// network first; (*net.ListenConfig).Listen(ctx, network, addr)
-			// takes it second. net.ListenPacket is deliberately not matched:
-			// it cannot bind a TCP network, so flagging it is only noise.
-			if len(call.Args) == 3 {
-				networkArgIdx = 1
-			}
+			networkArgIdx = listenNetworkArgIdx(sel.X, call.Args)
 		case "ListenTCP":
 			networkArgIdx = 0
+		case "ListenAndServe", "ListenAndServeTLS":
+			// http.ListenAndServe* bind a TCP socket internally, with no way to
+			// pass a listen config, so they are always on the net package
+			// default. The rule is limited to the package-qualified form: a
+			// method with the same name may be ours, like server.Server's, which
+			// binds through netlisten itself.
+			if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "http" {
+				calls = append(calls, exprText(src, call))
+			}
+
+			return true
 		default:
 			return true
 		}
@@ -163,22 +181,63 @@ func tcpListenCalls(t *testing.T, path string) []string {
 	return calls
 }
 
-// isNetlisten reports whether expr is internal/netlisten used either as a
-// package (netlisten.Listen) or as its config (netlisten.Config().Listen).
-func isNetlisten(expr ast.Expr) bool {
-	if pkg, ok := expr.(*ast.Ident); ok && pkg.Name == "netlisten" {
-		return true
+// listenNetworkArgIdx picks the argument that carries the network name. Choosing
+// by argument count alone gets tls.Listen("tcp", addr, config) wrong, which is a
+// three-argument call whose network is still first.
+func listenNetworkArgIdx(recv ast.Expr, args []ast.Expr) int {
+	// net.Listen(network, addr), tls.Listen(network, addr, config).
+	if id, ok := recv.(*ast.Ident); ok && (id.Name == "net" || id.Name == "tls") {
+		return 0
+	}
+	// (*net.ListenConfig).Listen(ctx, network, addr).
+	if len(args) == 3 {
+		return 1
 	}
 
+	return 0
+}
+
+// netlistenConfigVars collects identifiers assigned from netlisten.Config(), so
+// the two-step form is not reported as a violation:
+//
+//	lc := netlisten.Config()
+//	lc.Listen(ctx, "tcp", addr)
+func netlistenConfigVars(f *ast.File) map[string]bool {
+	vars := map[string]bool{}
+
+	ast.Inspect(f, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != len(assign.Rhs) {
+			return true
+		}
+		for i, rhs := range assign.Rhs {
+			if !isNetlistenConfigCall(rhs) {
+				continue
+			}
+			if id, ok := assign.Lhs[i].(*ast.Ident); ok {
+				vars[id.Name] = true
+			}
+		}
+
+		return true
+	})
+
+	return vars
+}
+
+func isNetlistenConfigCall(expr ast.Expr) bool {
 	call, ok := expr.(*ast.CallExpr)
-	if !ok {
+	if !ok || len(call.Args) != 0 {
 		return false
 	}
 	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "Config" {
-		return false
-	}
-	pkg, ok := sel.X.(*ast.Ident)
+
+	return ok && sel.Sel.Name == "Config" && isNetlisten(sel.X)
+}
+
+// isNetlisten reports whether expr is the internal/netlisten package.
+func isNetlisten(expr ast.Expr) bool {
+	pkg, ok := expr.(*ast.Ident)
 
 	return ok && pkg.Name == "netlisten"
 }
