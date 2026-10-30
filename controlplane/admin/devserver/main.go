@@ -36,6 +36,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/posthog/duckgres/internal/netlisten"
 )
 
 func main() {
@@ -170,7 +172,7 @@ func startPortForward(kubeContext, ns, deploy string, localPort, remotePort int)
 
 // freeLocalPort returns an unused localhost TCP port.
 func freeLocalPort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := netlisten.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return 0, err
 	}

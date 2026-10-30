@@ -24,6 +24,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/internal/netkeepalive"
+	"github.com/posthog/duckgres/internal/netlisten"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/flightclient"
@@ -357,6 +358,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	// protocol (SCM_RIGHTS, JSON messages, handover socket).
 	upg, err := tableflip.New(tableflip.Options{
 		UpgradeTimeout: 30 * time.Second,
+		// tableflip binds the client-facing PG listener, so the socket options
+		// have to come from here. Without this the listener is an IPPROTO_MPTCP
+		// socket on any node whose kernel has MPTCP enabled; see
+		// internal/netlisten for why that is not wanted (CVE-2026-98432).
+		ListenConfig: netlisten.Config(),
 	})
 	if err != nil {
 		slog.Error("Failed to create tableflip upgrader.", "error", err)

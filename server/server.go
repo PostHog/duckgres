@@ -22,6 +22,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers "pgx" driver for direct PostgreSQL connections
 	"github.com/posthog/duckgres/internal/netkeepalive"
+	"github.com/posthog/duckgres/internal/netlisten"
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/chsql"
 	"github.com/posthog/duckgres/server/ducklake"
@@ -553,7 +554,7 @@ func New(cfg Config) (*Server, error) {
 
 func (s *Server) ListenAndServe() error {
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
-	listener, err := net.Listen("tcp", addr)
+	listener, err := netlisten.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
