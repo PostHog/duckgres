@@ -46,7 +46,8 @@ func (e dispatchExecutor) runPropertiesComparison(ctx context.Context, step core
 	}
 	hoglakeWith := map[string]any{
 		"org_id": orgID, "uri": step.With["hoglake_uri"], "file": step.With["hoglake_file"],
-		"properties_source": source, "representation": "json", "hoglake_catalog": step.With["hoglake_catalog"],
+		"properties_source": source, "representation": "variant",
+		"properties_variant_source": prepared.variant.Prefix, "hoglake_catalog": step.With["hoglake_catalog"],
 	}
 	if timeout, ok := step.With["hydration_timeout"]; ok {
 		hoglakeWith["hydration_timeout"] = timeout
@@ -73,6 +74,9 @@ func (e dispatchExecutor) runPropertiesComparison(ctx context.Context, step core
 type preparedPropertiesComparison struct {
 	directory string
 	dataset   *properties.Dataset
+	// variant is the canonical copy with the native, shredded VARIANT column
+	// that Trino reads; dataset (the supported copy) omits it for Athena.
+	variant *properties.Dataset
 }
 
 func preparePropertiesComparison(ctx context.Context, source string, step core.Step) (*preparedPropertiesComparison, error) {
@@ -105,6 +109,16 @@ func preparePropertiesComparison(ctx context.Context, source string, step core.S
 	if err := dataset.VerifyAthenaTable(ctx, client, database, table); err != nil {
 		return nil, fmt.Errorf("selected fixture must match the preprovisioned Athena properties table; update its mapping when generating the replacement fixture: %w", err)
 	}
+	variantSource := os.Getenv("DUCKGRES_SCENARIO_PROPERTIES_VARIANT_S3_URI")
+	if variantSource == "" {
+		if variantSource, err = properties.VariantLocation(ctx, client, database, table); err != nil {
+			return nil, err
+		}
+	}
+	variant, err := properties.Discover(ctx, s3.NewFromConfig(cfg), variantSource)
+	if err != nil {
+		return nil, fmt.Errorf("discover VARIANT properties fixture: %w", err)
+	}
 	catalog, err := yaml.Marshal(properties.Catalog())
 	if err != nil {
 		return nil, err
@@ -119,6 +133,6 @@ func preparePropertiesComparison(ctx context.Context, source string, step core.S
 			return nil, err
 		}
 	}
-	fmt.Printf("Selected %d generated properties Parquet objects for the properties comparison.\n", len(dataset.Files))
-	return &preparedPropertiesComparison{directory: dir, dataset: dataset}, nil
+	fmt.Printf("Selected %d supported and %d VARIANT properties Parquet objects for the properties comparison.\n", len(dataset.Files), len(variant.Files))
+	return &preparedPropertiesComparison{directory: dir, dataset: dataset, variant: variant}, nil
 }

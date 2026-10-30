@@ -22,6 +22,18 @@ def location(uri):
     return parsed.netloc, prefix + "/" if prefix else ""
 
 
+# pyarrow (<= 25) surfaces a native Parquet VARIANT group as a plain struct and
+# drops its logical type; the footer's schema text keeps the annotation, e.g.
+# "  optional group field_id=-1 properties_variant (Variant(1)) {". Only
+# top-level columns are matched (two-space indent), the only VARIANT shape
+# Hoglake reads.
+VARIANT_GROUP = re.compile(r"^  (?:optional|required) group field_id=-?\d+ (\S+) \(Variant\(\d+\)\) \{$", re.M)
+
+
+def variant_columns(metadata):
+    return set(VARIANT_GROUP.findall(str(metadata.schema)))
+
+
 def column_type(field):
     t = field.type
     if pa.types.is_boolean(t):
@@ -61,6 +73,7 @@ def inspect_table(objects, read_footer, selected=None):
     for obj in objects:
         metadata = read_footer(obj)
         schema = metadata.schema.to_arrow_schema()
+        variants = variant_columns(metadata)
         if selected is not None and any(schema.names.count(name) != 1 for name in selected):
             raise ValueError("missing selected fixture column")
         for index, field in enumerate(schema):
@@ -70,7 +83,8 @@ def inspect_table(objects, read_footer, selected=None):
                 raise ValueError(
                     f"unsupported identifier {field.name!r}; lowercase column names required"
                 )
-            definition = dict(name=field.name, nullable=True, **column_type(field))
+            kind = {"type": "variant"} if field.name in variants else column_type(field)
+            definition = dict(name=field.name, nullable=True, **kind)
             previous = columns.get(field.name)
             if previous and previous != definition:
                 pair = {previous["type"], definition["type"]}
@@ -184,21 +198,36 @@ def run(store, api, source, catalog):
 
 
 
-def run_properties(store, api, source, catalog, representation):
+def run_properties(store, api, source, catalog, representation, variant_source=None):
     """Register properties in the existing fixture catalog, under its own namespace.
 
-    column_type intentionally remains authoritative: unsupported physical VARIANT
-    representations fail before writes, without coercion or omitted columns.
+    events_supported always comes from ``source`` (the reader-supported copy every
+    engine's JSON queries read). With representation "variant", events_variant
+    comes from ``variant_source`` (default ``source``): the canonical copy that
+    keeps the native, shredded VARIANT column. Column types stay authoritative:
+    a column that is not a native VARIANT group fails before any write, without
+    coercion or omitted columns.
     """
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,62}", catalog):
         raise ValueError("invalid catalog identifier")
     bucket, _ = location(source)
-    objects = sorted(
-        (obj for obj in store.objects(source) if obj["key"].endswith(".parquet")),
-        key=lambda obj: obj["key"],
-    )
+
+    def parquet_objects(uri):
+        return sorted(
+            (obj for obj in store.objects(uri) if obj["key"].endswith(".parquet")),
+            key=lambda obj: obj["key"],
+        )
+
+    objects = parquet_objects(source)
     if not objects:
         raise ValueError("no properties Parquet files in source")
+    variant_objects = objects
+    if representation == "variant" and variant_source:
+        if location(variant_source)[0] != bucket:
+            raise ValueError("properties variant source must share the fixture bucket")
+        variant_objects = parquet_objects(variant_source)
+        if not variant_objects:
+            raise ValueError("no properties Parquet files in variant source")
     metadata = {}
 
     def read_footer(obj):
@@ -207,11 +236,11 @@ def run_properties(store, api, source, catalog, representation):
         return metadata[obj["key"]]
 
     plans = {}
-    projections = [("events_supported", ["event", "timestamp", "properties"])]
+    projections = [("events_supported", objects, ["event", "timestamp", "properties"])]
     if representation == "variant":
-        projections.append(("events_variant", ["event", "timestamp", "properties", "properties_variant"]))
-    for table, selected in projections:
-        columns, files = inspect_table(objects, read_footer, selected)
+        projections.append(("events_variant", variant_objects, ["event", "timestamp", "properties", "properties_variant"]))
+    for table, table_objects, selected in projections:
+        columns, files = inspect_table(table_objects, read_footer, selected)
         expected_types = {"event": "string", "timestamp": "timestamptz", "properties": "string", "properties_variant": "variant"}
         if any(c["type"] != expected_types[c["name"]] for c in columns if c["name"] in expected_types):
             raise ValueError("properties fixture logical column type mismatch")
@@ -221,7 +250,7 @@ def run_properties(store, api, source, catalog, representation):
     root = "/v1/catalogs/" + catalog
     info = api.get(root)
     data_bucket, data_prefix = location(info["data_path"])
-    if bucket != data_bucket or any(not obj["key"].startswith(data_prefix) for obj in objects):
+    if bucket != data_bucket or any(not obj["key"].startswith(data_prefix) for obj in objects + variant_objects):
         raise ValueError("properties files must be inside the existing fixture catalog data_path")
     api.post(root + "/namespaces", {"name": "properties_perf"})
     registrations = []
@@ -399,6 +428,7 @@ def main():
     inputs.add_argument("--source")
     inputs.add_argument("--properties-source")
     parser.add_argument("--properties-representation", choices=("json", "variant"), default="variant")
+    parser.add_argument("--properties-variant-source", help="canonical Parquet prefix holding the native VARIANT column")
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--uri", required=True)
     parser.add_argument(
@@ -410,7 +440,8 @@ def main():
     args = parser.parse_args()
     store, api = S3Store(boto3.client("s3")), RestAPI(args.uri)
     if args.properties_source:
-        result = run_properties(store, api, args.properties_source, args.catalog, args.properties_representation)
+        result = run_properties(store, api, args.properties_source, args.catalog,
+                                args.properties_representation, args.properties_variant_source)
     else:
         result = run(store, api, args.source, args.catalog)
     print(f"Registered frozen fixtures at snapshot {result['snapshot_id']}")
