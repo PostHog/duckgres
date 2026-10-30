@@ -16,6 +16,14 @@ build:
 build-release version="dev":
     go build -ldflags "-X main.version={{version}} -X main.commit=$(git rev-parse --short HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
 
+# Compile every build-tag variant we ship: a plain go build ./... skips the
+# files behind `//go:build kubernetes`, which is how a missing import in one of
+# them reached main once already.
+[group('build')]
+build-tags:
+    go build -tags kubernetes ./...
+    go vet -tags kubernetes ./...
+
 # Build Docker image
 [group('build')]
 docker tag="duckgres:dev":
@@ -508,7 +516,7 @@ scenario-frozen-dbt:
 
 # Lint (matches CI — uses golangci-lint, not go vet)
 [group('test')]
-lint:
+lint: build-tags
     golangci-lint run
 
 # Run what CI runs locally (excluding kind-backed K8s integration)

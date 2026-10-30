@@ -22,6 +22,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/provisioning"
+	"github.com/posthog/duckgres/internal/netlisten"
 	"github.com/posthog/duckgres/server"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
