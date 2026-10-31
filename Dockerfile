@@ -1,14 +1,14 @@
 # Build the admin console SPA (controlplane/admin/ui) so the kubernetes build
 # embeds a FRESH dist/ via //go:embed all:ui/dist, overwriting the committed
 # bundle. Runs before the Go build.
-FROM node:20-bookworm-slim AS uibuilder
+FROM node:24-bookworm-slim AS uibuilder
 WORKDIR /ui
 COPY controlplane/admin/ui/package.json controlplane/admin/ui/package-lock.json ./
 RUN npm ci
 COPY controlplane/admin/ui/ ./
 RUN npm run build
 
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.27-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
 
