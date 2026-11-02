@@ -8,7 +8,7 @@ RUN npm ci
 COPY controlplane/admin/ui/ ./
 RUN npm run build
 
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.27-bookworm@sha256:d9b6a1beb9474adc2a1ce842573639b44b2a0dd49b6669f51d3821baf9ec37c9 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
 
