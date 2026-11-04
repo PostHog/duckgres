@@ -139,7 +139,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
         with:
-          go-version-file: go.mod
+          go-version: "1.27"
 
       # The matrix value configures deployment, but these structural tests
       # exercise every suite and must not inherit one lane's selection.

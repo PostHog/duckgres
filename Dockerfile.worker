@@ -8,7 +8,7 @@
 # surface is the all-in-one duckgres binary (or the CP-only binary in
 # cmd/duckgres-controlplane), which routes queries to whichever worker
 # image the per-tenant `image` config-store column points at.
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.27-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
 

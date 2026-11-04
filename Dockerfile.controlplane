@@ -15,14 +15,14 @@
 # Build the admin console SPA so the kubernetes build embeds a FRESH dist/ via
 # //go:embed all:ui/dist (this is the prod CP image — without this stage it
 # would ship whatever ui/dist was last committed).
-FROM node:20-bookworm-slim AS uibuilder
+FROM node:24-bookworm-slim AS uibuilder
 WORKDIR /ui
 COPY controlplane/admin/ui/package.json controlplane/admin/ui/package-lock.json ./
 RUN npm ci
 COPY controlplane/admin/ui/ ./
 RUN npm run build
 
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.27-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev && rm -rf /var/lib/apt/lists/*
 

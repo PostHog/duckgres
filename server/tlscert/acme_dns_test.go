@@ -28,7 +28,7 @@ func TestLoadOrCreateAccountKey(t *testing.T) {
 	}
 	if key2 == nil {
 		t.Fatal("second loadOrCreateAccountKey returned nil key")
-	} else if key1.D.Cmp(key2.D) != 0 {
+	} else if !key1.Equal(key2) {
 		t.Fatal("loaded key does not match created key")
 	}
 }
