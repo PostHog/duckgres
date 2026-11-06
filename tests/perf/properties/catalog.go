@@ -20,9 +20,11 @@ func Catalog() core.Catalog {
 				expr = `properties_typed."$browser"`
 				qt = targets[4:]
 			case "variant":
+				// Hoglake reads the shredded column and pushes the subscript
+				// down to its $browser sub-column (PostHog/trino#100).
 				expr = `CAST(properties_variant['$browser'] AS VARCHAR)`
 				relation = `"properties_perf"."events_variant"`
-				qt = []core.Protocol{core.ProtocolTrinoCached}
+				qt = []core.Protocol{core.ProtocolTrino, core.ProtocolTrinoCached}
 			}
 			var sql string
 			if intent == "browser_breakdown" {
@@ -33,9 +35,6 @@ func Catalog() core.Catalog {
 			// v2: the fixture became a contiguous multi-day range (about 40x the
 			// v1 single day), so v1 latencies and baselines are not comparable.
 			q := core.Query{QueryID: "properties_" + intent + "_v2__" + rep, IntentID: "properties." + intent + ".v2", Representation: rep, Targets: qt, PGWireSQL: sql}
-			if rep == "variant" {
-				q.SkipReason = "Hoglake does not support the VARIANT representation"
-			}
 			c.Queries = append(c.Queries, q)
 		}
 	}
