@@ -29,8 +29,6 @@ on:
         required: false
         default: ""
         type: string
-  schedule:
-    - cron: "17 8 * * *"
 
 permissions:
   id-token: write
