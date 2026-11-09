@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 )
 
 func TestTrinoFixturePinsSharedCatalogSyncImage(t *testing.T) {
@@ -44,6 +46,37 @@ func TestTrinoFixtureUsesOnlySharedPools(t *testing.T) {
 		if !strings.Contains(string(patch), required) {
 			t.Errorf("fixture does not enable %s", required)
 		}
+	}
+}
+
+func TestTrinoGatewayFixtureRoutesItsServiceHostname(t *testing.T) {
+	body, err := os.ReadFile("trino-gateway.tmpl.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const namespace = "test-namespace"
+	rendered := strings.NewReplacer(
+		"${NAMESPACE}", namespace,
+		"${TRINO_GATEWAY_PRIVATE_KEY}", "    test-key",
+		"${TRINO_GATEWAY_PUBLIC_KEY}", "    test-key",
+	).Replace(string(body))
+	var secret struct {
+		StringData map[string]string `json:"stringData"`
+	}
+	if err := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(rendered), 4096).Decode(&secret); err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		Routing struct {
+			HostnameToPool map[string]string `json:"hostnameToPool"`
+		} `json:"routing"`
+	}
+	if err := utilyaml.Unmarshal([]byte(secret.StringData["config.yaml"]), &config); err != nil {
+		t.Fatal(err)
+	}
+	host := "duckgres-trino-gateway." + namespace + ".svc"
+	if got := config.Routing.HostnameToPool[host]; got != "pool-test" {
+		t.Fatalf("Gateway route for %s = %q, want pool-test", host, got)
 	}
 }
 
