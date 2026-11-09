@@ -284,7 +284,7 @@ column cannot be added to a populated table).
 - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md): Process for upgrading DuckDB/DuckLake versions, canarying builds for a subset of tenants, and global version management.
 - [Node-local Cache Proxy Bypass](docs/runbooks/cache-proxy-bypass.md): Fail-open cache behavior, detection, and recovery.
 - [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
-- [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
+- [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Manually dispatched scenario runs against the configured dev environment.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
 - [Org Connection Admission](docs/runbooks/org-connection-admission.md): Global vCPU admission, exact cleanup ownership, failure recovery, and operational metrics.
 - [Trino Pool Administrative Recovery](docs/runbooks/trino-pool-admin-recovery.md): Explicitly authorized failure retirement of one draining instance, with preview and resumable operator execution.

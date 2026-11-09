@@ -49,8 +49,8 @@ The isolated control plane's default worker request is configurable through
 `DUCKGRES_K8S_WORKER_CPU_REQUEST` and
 `DUCKGRES_K8S_WORKER_MEMORY_REQUEST`; `run.sh` defaults them to `750m` and
 `1536Mi`, respectively, preserving the e2e harness's worker-packing behavior.
-`scenario-dev.yml` explicitly overrides them to 3 CPU and 12Gi for the frozen
-perf workload. Direct `run.sh` callers can make the same explicit override.
+`scenario-dev.yml` explicitly overrides them to 3 CPU and 12Gi for manual
+scenarios. Direct `run.sh` callers can make the same explicit override.
 
 ### Control-plane rollout retirement
 
@@ -134,30 +134,7 @@ The output location must be the same `s3://` prefix enforced by the workgroup.
 Athena uses unique query execution IDs for result object names.
 
 The startup window contains an authenticated `SELECT 1` retry and completes
-before warmup or measured statements run. For the isolated mw-dev cell, use
-`trino_ca_cert_file: /trino-ca/ca.crt`.
-
-`posthog_frozen_perf` enables Trino and Athena and selects the isolated Trino suite. Its
-scenario Job mounts the per-run CA from `duckgres-trino-tls` and passes that
-path through `DUCKGRES_SCENARIO_TRINO_CA_CERT`; the perf adapter verifies the
-coordinator certificate and retries its first authenticated query for the
-bounded Secret-projection window. It also passes the deployed
-`DUCKGRES_K8S_WORKER_CPU_REQUEST` and `DUCKGRES_K8S_WORKER_MEMORY_REQUEST` into
-the perf step, which requests that exact shape through PGWire startup options
-and therefore bypasses the exploratory worker tier. The paired catalog remains the single SQL
-source: production-shaped `ducklake_table` members run through PGWire,
-`hoglake_table` members run through Trino, and `athena_external` members run
-through Athena against Glue tables over the same immutable Parquet objects.
-The raw `read_parquet` file views are still created for table setup and the
-dbt scenario, but are no longer benchmarked. Athena is on-demand, result reuse is disabled, and
-the harness records service-side timing and scanned bytes in
-`query_service_metrics.csv`. Trino rows in the same file carry the
-coordinator's query statistics (splits, physical input, CPU, peak memory, and
-the Trino query ID) for each measured iteration.
-To reproduce the scheduled run, deploy and test with `E2E_SUITE=trino` and the
-same `TRINO_POD_IDENTITY_ROLE` required by the isolated Trino lane. Teardown and
-the scheduled cleanup sweep remove both namespace-local workloads and their
-Pod Identity associations.
+before warmup or measured statements run.
 
 ## Isolated Trino lane
 
@@ -180,12 +157,6 @@ The rendered-blueprint test checks that both workloads retain this pin and
 the coordinator keeps read-only synchronization enabled. A coordinator startup
 error saying `catalog.sync.enabled` was not used means the image lacks sync support;
 do not disable synchronization or relax admission to work around it.
-The frozen benchmark (`posthog_frozen_perf`) is not pinned: it
-always tests the newest PostHog/trino master build, which
-`scripts/resolve_trino_master_image.sh` resolves to a digest-pinned reference
-from the fork's source-ordered `r<position>-<sha>` GHCR tags. `scenario-dev.yml`
-resolves it once per run, records it in the job summary, and accepts a
-`trino_image` dispatch input to benchmark a specific build instead.
 On statement failure, the harness reports the query ID, error codes and a bounded
 exception-class chain alongside the existing top-level message. It excludes nested
 messages, stack traces and response URLs because these can contain credentials or
@@ -203,36 +174,13 @@ pinned image predates. When promoting such a build, set that property to the
 same domain on the lane's coordinator and pass the domain to the harness Job.
 The harness sends the tenant host as the `Host` header against the lane's own
 TLS name, so no DNS or certificate for the tenant host is needed.
-Each Trino worker has requests and limits of 1 CPU and 4Gi. Together they
-match the frozen perf Duckgres worker's aggregate 3 CPU and 12Gi execution
-budget while exercising Trino's distributed execution path. Trino permits 2GB
+Each Trino worker has requests and limits of 1 CPU and 4Gi. Trino permits 2GB
 of query memory per worker and 6GB cluster-wide. The coordinator does not
-execute query tasks (`node-scheduler.include-coordinator=false`) and is
-additional Trino control-plane overhead rather than part of the matched
-execution budget.
+execute query tasks (`node-scheduler.include-coordinator=false`).
 
-The isolated lane explicitly sets `task.max-worker-threads=24` and
-`task.min-drivers=48` per worker, twelve times the pinned engine's expected
-one-CPU defaults of 2 and 4. The latter is a leaf-driver target, not a hard
-limit or a count of simultaneous storage requests. These settings apply to
-both the isolated Trino E2E suite and `posthog_frozen_perf`; they do not change
-shared or production deployments. Worker resources, 3G heaps, query-memory
-limits, coordinator configuration, and aggregation `task.concurrency` remain
-unchanged. This tests whether more overlapping scan work improves throughput
-when the existing CPU budget is underused; it is not a proven speedup.
-
-To validate a branch against the existing frozen benchmark:
-
-```bash
-gh workflow run scenario-dev.yml --ref <branch> -f scenario=posthog_frozen_perf
-```
-
-Compare per-query Trino medians against the prior baseline, checking for query
-errors, worker restarts, CPU throttling, and memory pressure. Higher concurrency
-can increase heap usage and context switching. If it regresses, remove the two
-worker properties in `manifests.trino.tmpl.yaml`
-to restore CPU-derived defaults, then rerun in a fresh isolated deployment.
-Do not patch a running benchmark; let workflow teardown clean up its stack.
+The isolated lane sets `task.max-worker-threads=24` and
+`task.min-drivers=48` per worker. The latter is a leaf-driver target.
+These settings apply to the isolated Trino E2E suite.
 
 `TRINO_TLS_PASSWORD` defaults to `duckgres-e2e-keystore`; it protects only the
 random, two-day, per-run PKCS12 file. `run.sh` generates a fresh CA and leaf
@@ -695,19 +643,6 @@ finalizers are still running.
 | (role) | `github-duckgres-e2e` | dedicated stripped role in the mw-dev account (posthog-cloud-infra) — `eks:DescribeCluster` + Pod Identity association calls + `iam:PassRole`/`iam:GetRole` on the CP and dedicated Trino roles + an EKS access entry for kubectl. The workflow assumes `arn:aws:iam::<MW_DEV_ACCOUNT_ID>:role/github-duckgres-e2e`. |
 | repo setting | "Require approval for all outside collaborators" | the access gate (see below) |
 
-Athena adds no one-time GitHub configuration. Its Terraform unit publishes the
-SSM String parameter `/duckgres/perf/athena` and grants the existing workflow
-OIDC role `ssm:GetParameter` on that exact parameter. The JSON keys are
-`pod_identity_role_arn`, `workgroup_name`, `glue_database_name`, and
-`results_s3_uri`, all derived from the deployed resources. The frozen-perf
-workflow loads them with `bash scripts/scenario_athena_config.sh` and exports
-the existing scenario environment variables before deployment. The loader
-requires AWS CLI, jq, and an explicit `AWS_REGION`; it fails without exporting
-partial settings if fetching or validation fails. Apply the infrastructure
-first, and fix configuration in Terraform rather than editing SSM manually.
-Direct local scenario invocations still accept the documented explicit Athena
-environment variables.
-
 The `scenario-dev` workflow requests a 16,200-second session from
 `github-duckgres-e2e`, matching its 270-minute job timeout. The role's
 `max_session_duration` in posthog-cloud-infra must be at least 16,200 seconds
@@ -829,74 +764,6 @@ NAMESPACE="duckgres-ci-pr-${LANE_ID:?}" PR_NUMBER="$LANE_ID" KUBE_CONTEXT=postho
   CP_POD_IDENTITY_ROLE=arn:aws:iam::<mw-dev-account-id>:role/duckgres-control-plane-dev \
   bash tests/mw-dev/run.sh deploy
 ```
-
-### Running the combined Trino perf comparison
-
-The scheduled workflow and manual `posthog_frozen_perf` selection run all five
-benchmark targets in one scenario, namespace, and result set. Dataset and Hoglake
-registration run once. Measurements run sequentially: `pgwire_uncached`,
-`pgwire_cached`, `trino`, `trino_cached`, then `athena`.
-The former `posthog_frozen_perf_trino_cached` selection has been removed; use
-`posthog_frozen_perf` instead. Omit the workflow's `duckgres_image` override so the
-control-plane build explicitly persists the expected baseline cache setting.
-
-For local invocation, set `SCENARIO_NAME=posthog_frozen_perf` and `E2E_SUITE=trino`
-before both `tests/mw-dev/run.sh deploy` and `test-scenario`. Use the existing lane
-credentials, images, and namespace requirements. The harness starts three Trino
-clusters: the managed onboarding cluster, an uncached benchmark cluster, and a
-cached benchmark cluster. Each has one coordinator and three 1-CPU/4Gi workers;
-the total worker reservation is 9 CPU/36Gi, while each measured target retains a
-3-CPU/12Gi execution budget. Separate discovery services, catalog-store cells,
-and ephemeral volumes isolate their state.
-
-The managed tenant catalog is left untouched. The runner reads its properties,
-then creates fixture catalogs in the two benchmark cells with the same authorized
-tenant catalog name. Both point to the shared fixture Hoglake catalog and use the
-read-only Pod Identity; only their explicit cache setting differs. Tenant
-credentials and OPA authorization remain unchanged. The admin credential is used
-only for creation; measurements authenticate as the tenant. Existing catalog
-properties must match exactly, and no catalog is dropped or switched between
-benchmark phases.
-
-`run.sh` supplies these runner settings automatically. Direct runner invocations
-must supply them for the isolated deployment:
-
-| Variable | Harness value / purpose |
-| --- | --- |
-| `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN` | Throwaway catalog database connection |
-| `DUCKGRES_SCENARIO_TRINO_PERF_URL` | HTTPS endpoint of `duckgres-trino-perf` |
-| `DUCKGRES_SCENARIO_TRINO_PERF_CELL_ID` | Managed cell ID with `-perf` suffix |
-| `DUCKGRES_SCENARIO_TRINO_CACHED_URL` | HTTPS endpoint of `duckgres-trino-cached` |
-| `DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID` | Baseline cell ID with `-cached` suffix |
-| `DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE` | `/trino-admin/admin-password` |
-
-There are no implicit cached endpoint or credential defaults. Never point this
-setup at a shared dev/prod catalog store or coordinator. A `perf_queries` step may
-select both Trino targets; `with.targets` can select a subset for focused local
-runs, while the checked-in scenario runs all five.
-
-By default the workflow uses the newest PostHog/trino master build, whose Hoglake
-connector honors `fs.cache.enabled`. An older Trino image override may ignore the
-property; its two labels then distinguish requested configuration, not verified
-caching behavior.
-
-Each lane asserts one cache mode for managed Hoglake catalogs. The per-PR Trino
-lane sets `DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED=true`. It checks that
-the tenant's published catalog row has `fs.cache.enabled=true`, then queries
-that catalog. Frozen perf leaves the variable unset and requires the uncached
-baseline: its runner rejects a cached managed tenant catalog. Both fixtures load
-an Alluxio cache manager by construction. Their Trino pods select only
-`kubernetes.io/arch: arm64` with no NodePool toleration, so the cache emptyDir
-sits on the node's EBS root volume, not instance-store NVMe. Production pool
-blueprints are verified outside this repository.
-See `tests/perf/README.md` for cache budgets and result-history caveats.
-
-If setup or readiness fails, preserve artifacts and inspect logs for
-`duckgres-trino`, `duckgres-trino-perf`, and `duckgres-trino-cached` deployments. Check catalog-store cell
-IDs, TLS service names, auth projections, and cache-manager configuration. Run
-`tests/mw-dev/run.sh diagnostics`, then the normal `teardown`, and redeploy a fresh
-namespace before retrying. Namespace teardown removes all three clusters, fixture
-catalog rows in the throwaway database, and all ephemeral cache volumes.
 
 ### Shared-pool startup acceptance
 
@@ -1071,37 +938,6 @@ Missing prerequisites fail deployment before namespace mutation. Cleanup waits
 for fixture writers to terminate and deletes only the numeric PR's exact prefix.
 The initialized metadata-loss protection has unit regression coverage; this
 lane does not corrupt the server database to simulate metadata loss.
-
-The frozen performance workflow also discovers the dedicated managed storage
-base and configures managed Hoglake admission. It uses the same Hoglake server
-pin, which supports atomic table creation, but keeps the frozen-data read-only
-Pod Identity for fixture reads. The control plane owns the tenant's managed
-catalog; the importer registers immutable Parquet in a separate `<org>-frozen`
-catalog containing `posthog` and `properties_perf` namespaces. Its data path is
-the frozen bucket root, while each import enumerates only its exact source prefix.
-The importer registers footers only (deferred stats), so every file starts with
-`stats_state=pending` and carries no column bounds until the Hoglake hydrator
-reads its footer. Each import therefore waits until every file it registered is
-`provided` before the step completes (default 600s), and
-fails the scenario if any file is `failed` or the wait times out: a benchmark
-over stat-less files measures no file pruning at all. Transient API errors
-during the wait are retried until the deadline. For frozen perf, `run.sh` sets
-the isolated server's `HOGLAKE_HYDRATOR_INTERVAL_MS` to 10s rather than the
-15-minute server default (which every other lane keeps), whose only early sweep
-happens at startup, before any import. The `setup_hoglake` step's optional
-`hydration_timeout` (a duration, e.g. `10m`) overrides the wait's default.
-The two isolated benchmark cells use the read-only Pod Identity instead of assuming
-the managed tenant storage role. It does not copy, rewrite or grant writes to the frozen dataset.
-
-For local frozen runs, supply `HOGLAKE_DATA_PATH` with the dedicated
-`s3://<bucket>/trino/` base before deployment. Missing configuration fails before
-namespace mutation. Managed Hoglake rejects public deprovision by design, so the
-frozen scenario leaves cleanup to the workflow's always-run `run.sh teardown`.
-Direct/local scenario invocations must run that teardown even after failures;
-it removes the isolated Duckling and namespace before cleaning the scoped managed
-storage prefix. Do not use the frozen source prefix as `HOGLAKE_DATA_PATH`.
-Collect `run.sh diagnostics` and preserve scenario artifacts before teardown, then
-redeploy a fresh isolated stack before retrying.
 
 ## Isolated Trino recovery boundary
 

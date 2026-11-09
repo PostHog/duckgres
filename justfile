@@ -504,11 +504,6 @@ scenario-provision-rejection:
 scenario-frozen-metadata:
     ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml
 
-# Run the dev frozen dataset perf scenario
-[group('test')]
-scenario-frozen-perf:
-    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml
-
 # Run the dev frozen dataset dbt scenario
 [group('test')]
 scenario-frozen-dbt:

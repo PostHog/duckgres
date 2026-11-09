@@ -5,31 +5,18 @@ an isolated Duckgres stack in mw-dev. It uses the same `tests/mw-dev` harness
 as `e2e-mw-dev` for cluster access, isolated namespace deployment, pod
 identity, diagnostics, and teardown.
 
-## Scheduled Runs
+## Manual Runs
 
-The daily scheduled trigger runs `posthog_frozen_perf`, which creates
-production-shaped DuckLake tables from the frozen dataset, executes equivalent
-PGWire, Trino, and on-demand Athena queries, and publishes the comparison history.
-Scheduled runs no longer execute `full-suite`.
+Choose a scenario YAML file under `tests/mw-dev/scenario/scenarios/` without the
+`.yaml` suffix. The default `full-suite` exercises frozen dataset metadata,
+PGWire queries, and dbt with one warehouse lifecycle. Use `fast-suite` to omit
+dbt, or select `provision_rejection`, `provision_smoke`,
+`posthog_frozen_metadata`, or `posthog_frozen_dbt` for focused debugging.
+The workflow checks the scenario name and file before deploying the stack.
 
-Manual runs remain selectable and default to `full-suite`, which covers the
-frozen dataset metadata, legacy perf, and dbt workloads with one shared
-warehouse lifecycle.
-
-Scenario jobs override the shared harness's default worker request to 3 CPU and
-12Gi memory for the frozen PGWire perf workload. The isolated Trino workers
-use the same aggregate execution resources. This adds process headroom for
-repeated full-dataset aggregates without changing DuckDB's thread count. The
-shared e2e workflow keeps the harness defaults documented in
-`tests/mw-dev/README.md`.
-
-To omit dbt, manually run the workflow with `scenario` set to `fast-suite`.
-The input directly names a YAML file under
-`tests/mw-dev/scenario/scenarios/`, without the `.yaml` suffix. This also makes
-targeted scenarios such as `provision_rejection`, `provision_smoke`,
-`posthog_frozen_metadata`, `posthog_frozen_perf`, and `posthog_frozen_dbt`
-individually runnable. Invalid or missing scenario names fail before a payload
-Job is created.
+Scenario jobs request 3 CPU and 12Gi for the Duckgres worker. Direct
+`tests/mw-dev/run.sh` callers can set the same resource requests. The cross-engine
+warehouse benchmark runs from the managed warehouse perftest runner.
 
 ## Required Repository Configuration
 
@@ -40,7 +27,6 @@ execute inside Kubernetes.
 Configure these repository secrets:
 
 - `MW_DEV_ACCOUNT_ID`
-- `MW_DEV_TRINO_POD_IDENTITY_ROLE`
 
 Configure these repository variables:
 
@@ -48,23 +34,6 @@ Configure these repository variables:
 - `TS_WIF_CLIENT_ID_MW_DEV`
 - `TS_WIF_AUDIENCE_MW_DEV`
 - `MW_DEV_SCENARIO_PERF_SECRET_ID`
-
-Athena requires no additional GitHub settings. Terraform publishes its
-configuration to the SSM String parameter `/duckgres/perf/athena` in the dev
-account and grants the workflow's existing OIDC role `ssm:GetParameter` on
-that parameter only. Apply this infrastructure before enabling Athena runs.
-For frozen perf, `scripts/scenario_athena_config.sh` loads and validates the
-JSON after AWS authentication and before deploying the isolated stack. Other
-scenarios do not load it. The parameter contains `pod_identity_role_arn`,
-`workgroup_name`, `glue_database_name`, and `results_s3_uri`, derived from
-Terraform resources; they are configuration identifiers, not credentials.
-
-The Athena values must identify an engine-v3 on-demand workgroup, a Glue
-database with explicit `events` and `persons` external tables over the frozen
-Parquet prefixes, and an encrypted S3 result root ending in `/`. Disable
-workgroup result reuse and configure lifecycle expiry on the result root. The
-scenario still disables result reuse on every query and validates that the
-effective result location remains under the configured root.
 
 `MW_DEV_SCENARIO_PERF_SECRET_ID` names the AWS Secrets Manager JSON secret used
 only by historical perf publishing. The secret must contain `host`, `port`,
@@ -80,14 +49,6 @@ The harness also injects `DUCKGRES_SCENARIO_ORG_ID=ci-pr-<workflow-run-id>-cnpg`
 for successful CNPG scenarios. That name matches the Crossplane composition's
 exact CI credential ownership boundary and the harness's cleanup convention.
 
-The scenario Job uses the dedicated `duckgres-scenario` ServiceAccount. Its
-Pod Identity role needs only Athena query APIs for the configured workgroup,
-read-only Glue metadata access to the benchmark database, read/list access to
-the frozen dataset, and result-prefix access (plus the configured KMS key when
-SSE-KMS is used). The workflow deployer needs `iam:PassRole`/`iam:GetRole` for
-that role. Teardown and the stale-run sweep already delete every Pod Identity
-association in the disposable namespace.
-
 For a direct local run with `just scenario`, set
 `DUCKGRES_SCENARIO_ORG_ID` explicitly to an authorized, disposable org id.
 The local runner has no default because reusing a fixed warehouse identity can
@@ -95,13 +56,6 @@ collide with another run. Scenario-specific frozen-dataset variables remain
 required as reported by `scripts/scenario_run.sh --check-env`.
 
 ## Failure Recovery
-
-If loading `/duckgres/perf/athena` fails, confirm the Athena Terraform apply
-completed, the workflow is using the expected AWS account/region, and its
-OIDC role has the exact-parameter read grant. Invalid or incomplete JSON fails
-before deployment and exports no partial settings. Fix the Terraform source
-and apply it again rather than editing the parameter manually. Rerun the
-workflow after the parameter and permission are available.
 
 Every scenario sub-run provisions its own org or warehouse name and includes
 cleanup steps. The isolated stack also tears down the temporary namespace after
@@ -117,27 +71,13 @@ uploadable in a visible `*.partial/` directory with an
   published in the GitHub Actions job summary.
 - `step_results.csv` contains per-step duration, status, and error class.
 - `events.jsonl` contains the execution timeline.
-- `perf/query_service_metrics.csv` separates Athena and Trino
-  queue/planning/engine time and records bytes scanned; Trino rows add split
-  counts, physical input rows, CPU time, peak memory, and the Trino query ID,
-  which is the first thing to check when a Trino latency moves.
-
-The frozen perf catalog (`tests/perf/queries/ducklake_posthog_tables.yaml`)
-also declares perf gate expectations: upper bounds on Trino split counts and
-bytes scanned for the metadata-only counts. A broken bound, or a bounded
-metric that was not captured, fails `perf_queries` after its artifacts are
-written; the step log and error list every violation with the observed value,
-the bound, and the Trino query ID, and `perf/query_service_metrics.csv` has
-the per-iteration numbers. Raise a bound only with evidence that the new plan
-is intended; see `tests/perf/README.md` for the syntax.
-
 Perf query errors mark the `perf_queries` DAG step failed. They do not stop
 independent sibling branches: for example, `dbt_models` still runs because it
 depends on `setup_frozen_views`, not `perf_queries`. Only true dependants are
 skipped, and `always_run` teardown still executes. The final workflow result is
 reported after all eligible steps and artifact collection finish.
 
-After teardown, scheduled and manually dispatched runs on `main` publish any
+After teardown, manually dispatched runs on `main` publish any
 collected `perf/summary.json`, `perf/query_results.csv`, and (when it has rows)
 `perf/query_service_metrics.csv` into the persistent scenario perf result
 schema. Publishing runs with `if: always()` so measured
@@ -152,9 +92,3 @@ If cleanup did not complete, the scenario-created org is
 control plane. Also inspect the workflow diagnostics from
 `tests/mw-dev/run.sh diagnostics`; the namespace is
 `duckgres-ci-pr-<workflow-run-id>`.
-
-If an Athena query times out, the driver calls `StopQueryExecution`. A hard pod
-termination can still leave result objects, so S3 lifecycle expiry is the
-reliable cleanup backstop. Check the Athena query history for scan-limit or
-catalog errors, confirm the workgroup did not override results outside the
-configured root, and rerun after fixing the private Glue/IAM configuration.

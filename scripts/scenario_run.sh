@@ -21,12 +21,10 @@ Optional environment:
   DUCKGRES_SCENARIO_DBT_BIN
   DUCKGRES_SCENARIO_MAX_RUNTIME
   DUCKGRES_SCENARIO_GO_TEST_TIMEOUT
-  DUCKGRES_SCENARIO_PROPERTIES_S3_URI (override; defaults to the Athena properties table location)
 
 Scenario-specific required environment:
   DUCKGRES_SCENARIO_ORG_ID       (required by successful provisioning scenarios)
   DUCKGRES_SCENARIO_FROZEN_S3_URI (required by frozen dataset scenarios)
-  DUCKGRES_SCENARIO_TRINO_CA_CERT (required by Trino scenarios)
 USAGE
 }
 

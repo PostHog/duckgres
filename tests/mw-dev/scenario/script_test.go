@@ -33,7 +33,7 @@ func TestScenarioRunScriptValidatesRequiredEnvVars(t *testing.T) {
 
 func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	script := filepath.Join("..", "..", "..", "scripts", "scenario_run.sh")
-	cmd := exec.Command("bash", script, "--check-env", "tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml")
+	cmd := exec.Command("bash", script, "--check-env", "tests/mw-dev/scenario/scenarios/full-suite.yaml")
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"DUCKGRES_SCENARIO_API_BASE=http://127.0.0.1",
@@ -44,26 +44,19 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 
 	out, err := cmd.CombinedOutput()
 	if err == nil {
-		t.Fatal("expected script to fail without frozen perf required env vars")
+		t.Fatal("expected script to fail without full-suite required env vars")
 	}
 	text := string(out)
 	for _, name := range []string{
 		"DUCKGRES_SCENARIO_ORG_ID",
 		"DUCKGRES_SCENARIO_FROZEN_S3_URI",
-		"DUCKGRES_SCENARIO_TRINO_CA_CERT",
-		"DUCKGRES_SCENARIO_ATHENA_REGION",
-		"DUCKGRES_SCENARIO_ATHENA_WORKGROUP",
-		"DUCKGRES_SCENARIO_ATHENA_DATABASE",
-		"DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI",
-		"DUCKGRES_K8S_WORKER_CPU_REQUEST",
-		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST",
 	} {
 		if !strings.Contains(text, name) {
 			t.Fatalf("script output %q missing %s", text, name)
 		}
 	}
 	if strings.Contains(text, "DUCKGRES_SCENARIO_FLIGHT") {
-		t.Fatalf("frozen perf scenario should not require the deprecated Flight endpoint; output: %q", text)
+		t.Fatalf("full-suite should not require the deprecated Flight endpoint; output: %q", text)
 	}
 }
 
@@ -76,8 +69,8 @@ func TestDevScenarioWorkflowPreservesIsolationCleanupAndPublishing(t *testing.T)
 	workflow := string(raw)
 
 	for _, required := range []string{
-		"PR_NUMBER: ${{ github.run_id }}${{ matrix.id_suffix }}",
-		"NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ matrix.id_suffix }}",
+		"PR_NUMBER: ${{ github.run_id }}\n",
+		"NAMESPACE: duckgres-ci-pr-${{ github.run_id }}\n",
 		"- name: Teardown\n        if: always()\n        run: tests/mw-dev/run.sh teardown",
 		"github.ref == 'refs/heads/main'",
 		"--connection-secret-stdin",
@@ -91,6 +84,9 @@ func TestDevScenarioWorkflowPreservesIsolationCleanupAndPublishing(t *testing.T)
 		"use_shared_dev:",
 		"USE_SHARED_DEV",
 		"SCENARIO_SHARED_",
+		"posthog_frozen_perf",
+		"coverage_target:",
+		"properties_s3_uri:",
 		"DUCKGRES_SCENARIO_API_BASE: ${{ secrets.",
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET: ${{ secrets.",
 		"DUCKGRES_SCENARIO_PG_HOST: ${{ secrets.",

@@ -2,17 +2,10 @@
 
 This package contains the golden-query performance harness.
 
-Manual-only extended coverage scenarios exercise twelve additional workload shapes in
-`queries/ducklake_posthog_coverage.yaml`. They retain separate `perf-coverage/`
-artifacts and versioned intent IDs. These queries are excluded from standard
-nightly runs and execute only when explicitly dispatched. For the focused uncached DuckDB run,
-baseline recording, runtime estimates, and failure recovery, see the
-[coverage runbook](../../docs/runbooks/perf-coverage.md). Frozen standard and extended benchmarks
-use three Trino workers at 7 CPU / 28 GiB each and one DuckDB worker at
-21 CPU / 84 GiB, matching aggregate worker resources. Trino uses a 20 GiB JVM
-heap, 10 GiB per-worker query cap, and 30 GiB cluster-wide query cap.
-Historical 3 CPU / 12 GiB results require a new baseline before comparison to
-this larger profile; see the runbook for scheduling prerequisites.
+The checked-in full and fast scenarios use this harness for PGWire queries.
+For historical methodology of the retired cross-engine scenarios, see the
+[coverage runbook](../../docs/runbooks/perf-coverage.md) and
+[properties runbook](../../docs/runbooks/properties-perf.md).
 
 ## Protocol Drivers
 
@@ -50,13 +43,9 @@ one protocol from changing another protocol's cache context.
 
 ### DuckDB cache comparison
 
-`posthog_frozen_perf` runs five separately labeled targets in one result set,
-in order: **`pgwire_uncached` (baseline)**, `pgwire_cached`, `trino`, `trino_cached`, `athena`.
-Both DuckDB variants use identical queries, worker resource requests, warmup
-counts, and measured iterations. Each variant finishes before the next begins.
-Dataset registration runs once and both Trino clusters share the same Hoglake
-catalog. Legacy `pgwire` catalogs
-keep their existing behavior and are not relabeled as uncached history.
+The harness supports separate `pgwire_uncached` and `pgwire_cached` targets for
+isolated workers. The original `pgwire` target retains its existing behavior
+and result label.
 
 Only the perf driver changes cache settings. It pins its PGWire connection and
 applies `SET GLOBAL` before that variant's first warmup and outside query timing:
@@ -74,13 +63,9 @@ phase. A lost pinned connection fails the query instead of silently connecting
 to an unconfigured worker. Worker startup and production configuration are
 unchanged.
 
-Use the isolated scenario workflow for this comparison. Local
-`just scenario-frozen-perf` runs require a dedicated test warehouse: these
-settings affect the underlying worker globally, and the two variants must not
-run concurrently against a shared worker. The scenario's sequential phases
-also work when connections reuse the same worker. If cache setup fails, inspect
-the artifact errors and recreate the test stack; do not publish fallback runs
-under either explicit cache-mode label. Teardown removes the test workers.
+Use a dedicated test warehouse for cache comparisons. These settings affect
+the underlying worker globally, so the two variants must run sequentially.
+If cache setup fails, inspect the artifact errors and recreate the test stack.
 
 Warmup does not imply that the entire dataset fits in memory. Query-local
 buffering, prefetching, DuckLake catalog caching, and separate cache
@@ -89,8 +74,6 @@ end-to-end read path. The full-corpus paired catalog uses `_v5` query and
 intent IDs to separate its methodology from `balanced_v4`, which also measured
 raw Parquet views on PGWire and alternated them with the DuckLake tables on the
 same worker, so the table measurements shared cache state with their raw twin.
-The frozen
-scenario retains this catalog and optionally appends the properties comparison described below.
 
 ## Paired Query Catalogs
 
@@ -320,107 +303,3 @@ Optional artifact publisher:
 - `-perf-output-base`: base output directory.
 - `-perf-run-id`: fixed run id.
 - `-perf-pgwire-dsn`: use an existing PGWire endpoint instead of auto-start.
-
-### Cached Trino comparison
-
-The scheduled workflow and manual `posthog_frozen_perf` scenario use separate
-uncached and cached benchmark clusters, in addition to the managed onboarding
-cluster. Each has its own discovery service, catalog-store cell and cache volumes.
-The managed catalog supplies the baseline properties but is never modified. Both
-benchmark catalogs retain the tenant's authorized name and credentials, point to
-one fixture Hoglake catalog containing `posthog` and `properties_perf` namespaces,
-and read immutable S3 objects through the fixture Pod Identity. The runner creates
-them once with explicit `fs.cache.enabled=false` and `true` respectively, and
-verifies persisted properties before measurements. Teardown removes the isolated
-stack and catalog metadata; it never deletes fixture objects.
-Both clusters load the same Alluxio and memory cache managers.
-Each node has a 16GB disk-cache budget in a 20Gi ephemeral volume, with 64kB pages
-and a seven-day TTL. For connectors that use this cache, entries persist between
-queries/iterations until eviction or teardown; one warm-up does not guarantee
-every replica holds the complete working set. Each comparison cluster uses
-three workers at 7 CPU / 28 GiB each, matching the DuckDB worker's aggregate
-21 CPU / 84 GiB budget. The auxiliary bootstrap cluster retains three workers
-at 1 CPU / 4 GiB each; cache volumes reserve additional storage.
-
-The frozen suite runs the newest PostHog/trino master build, whose Hoglake
-connector honors `fs.cache.enabled` through Trino's shared filesystem module
-(PostHog/trino#43). Builds before that change ignored the property, so every
-`trino_cached` result from the pinned build, through the 2026-09-23 08:35 UTC
-nightly, measured an uncached cluster under the cached label. The baseline also does not guarantee cold JVM, OS, or
-storage-service caches. Keep the protocol labels separate in history.
-
-Trino `physicalInputBytes` can include bytes served from cache. Use cache-manager
-external-read/hit counters to distinguish storage traffic from cached reads.
-
-## Published properties workload
-
-The frozen-perf scenario runs its existing catalog and frozen dataset first,
-unchanged. A `properties_comparison` step then compares browser properties on
-its generated contiguous multi-day fixture. By default, it reads the S3 location of the
-existing `properties_events_supported` Athena table. Scheduled runs therefore
-include properties without a workflow input. Override the location with
-`DUCKGRES_SCENARIO_PROPERTIES_S3_URI` (workflow input `properties_s3_uri`); the
-selected prefix must still match that table. A missing default fails the phase
-instead of silently omitting measurements. No new repository secret is required.
-
-Generate matching files for a contiguous range of full days (see the runbook)
-before changing the table location; a size change bumps the properties intent
-IDs. Queries cover the entire selected prefix, with one warmup and four measured
-iterations. Merely filtering a large mixed-day file set does not guarantee small
-scans. The runner does not generate data or enforce a row-count limit.
-
-The properties catalog measures JSON with `duckgres (vanilla)`, `duckgres (cache)`,
-`trino (vanilla)` and `trino (cache)`, plus STRUCT with Athena, so every engine
-covers every properties intent. Athena executes only STRUCT;
-its complete ordered results must match the shared Duckgres/Trino JSON baseline
-for each intent before properties measurements start. `trino (cache+variant)` is explicitly
-unsupported until Hoglake supports VARIANT: its two comparisons emit `skipped`
-rows with a reason and no timings. Skipped rows use iteration zero and are
-excluded from measured/warmup query counts.
-
-Both suites of one nightly publish under the same dataset version
-(`posthog-file-views-v1`, shared through a YAML anchor in the scenario), with
-three columns on `runs` and `query_results`:
-
-- `suite` (`tables` | `properties` | `coverage`, a closed set in `core`, validated when the
-  step starts so a typo fails before hours of measurement);
-- `nightly_run_id`, the table-suite run's ID, which pairs a nightly's suites
-  explicitly (a standalone run is its own nightly);
-- `fixture_version`, the hash of the selected properties object inventory.
-
-The properties suite keeps its own `perf-properties/` directory and a distinct
-`-properties` run ID, so the publisher never overwrites one result set with the
-other. `fixture_version` records which fixture each properties run measured; it
-does not by itself stop a history chart from spanning a fixture change, so
-regenerating the fixture is a deliberate history break. The publisher's schema
-bootstrap adds the columns and classifies rows published before they existed
-(by the `-properties` suffix they used to carry); rows with explicit values are
-never touched. A summary without a suite publishes as `tables`. Only
-main-branch runs publish to the shared database.
-
-All properties preparation happens after the original result files are complete,
-so a properties setup or validation failure cannot prevent their publication.
-Failures still fail the scenario and trigger cleanup. See the
-[properties runbook](../../docs/runbooks/properties-perf.md) for fixture preparation,
-catalog registration, and recovery.
-
-Scenario Trino connections require `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID`
-(no default), matching the baseline coordinator's `catalog-store.cell-id`.
-The isolated workflow supplies it; local runs must set it. The public readiness
-API cell ID is used only for API identity validation, not catalog-store lookups.
-
-### Benchmark worker connection startup
-
-Frozen core and extended scenario runs default PostgreSQL connection startup to
-360 seconds, allowing the server's five-minute worker-acquisition budget plus
-headroom for cold worker startup. Other scenarios retain a 10-second default.
-Override with `DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT` (seconds) when invoking
-`tests/mw-dev/run.sh`. This timeout is passed into the scenario Job; query
-execution timeouts and measured query durations are unchanged.
-
-If a run reports `pin pgwire cache-variant connection` timeouts, inspect
-control-plane worker-acquisition logs and pod scheduling/startup events. The
-cache-variant driver retains its initial setup error, so one failed connection
-can mark every query for that target as failed. Resolve worker readiness or
-connection-timeout configuration before rerunning; these are not query latency
-measurements.

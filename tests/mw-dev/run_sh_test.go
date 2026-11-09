@@ -102,9 +102,6 @@ func TestDiagnosticsHarnessPodJSONPathParses(t *testing.T) {
 }
 
 func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
-	// Scenario workflows export these before running the script tests.
-	t.Setenv("SCENARIO_NAME", "posthog_frozen_perf")
-	t.Setenv("SCENARIO_POD_IDENTITY_ROLE", "")
 	fakes := newRunSHFakes(t)
 	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
 	for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
@@ -113,14 +110,19 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 		}
 	}
 
+	const image = "example.invalid/trino:pinned"
 	cmd := runSHCommand(t, fakes.binDir, "deploy",
 		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
 		"E2E_SUITE=trino",
+		"TRINO_IMAGE="+image,
 		"TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-dev",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("Trino deploy failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "Trino image: "+image) {
+		t.Fatalf("Trino deploy did not use its configured image: %s", out)
 	}
 
 	calls := fakes.calls(t)
@@ -134,24 +136,6 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 		if !strings.Contains(calls, want) {
 			t.Errorf("Trino deploy did not start %s with %d replicas through the deployment resource; calls:\n%s", deployment, replicas, calls)
 		}
-	}
-}
-
-func TestDeployCreatesDedicatedScenarioPodIdentityForAthenaPerf(t *testing.T) {
-	fakes := newRunSHFakes(t)
-	cmd := runSHCommand(t, fakes.binDir, "deploy",
-		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
-		"SCENARIO_NAME=posthog_frozen_perf",
-		"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/athena-perf",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Athena perf deploy failed: %v\n%s", err, out)
-	}
-	calls := fakes.calls(t)
-	want := "aws eks create-pod-identity-association --region us-east-1 --cluster-name test-cluster --namespace duckgres-ci-pr-123 --service-account duckgres-scenario --role-arn arn:aws:iam::123456789012:role/athena-perf"
-	if !strings.Contains(calls, want) {
-		t.Fatalf("deploy did not create dedicated scenario Pod Identity; calls:\n%s", calls)
 	}
 }
 
@@ -432,9 +416,6 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
 		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
 		"SCENARIO_NAME=fast-suite",
-		"DUCKGRES_SCENARIO_ATHENA_WORKGROUP=benchmark",
-		"DUCKGRES_SCENARIO_ATHENA_DATABASE=benchmark_frozen",
-		"DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI=s3://benchmark-results/root/",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -449,14 +430,6 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 		"serviceAccountName: duckgres-scenario",
 		"value: \"isolated-test-secret\"",
 		"name: DUCKGRES_SCENARIO_ORG_ID, value: \"ci-pr-123-cnpg\"",
-		"name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: \"/trino-ca/ca.crt\"",
-		"name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN\n              valueFrom: { secretKeyRef: { name: duckgres-config-store-credentials, key: dsn } }",
-		"name: DUCKGRES_SCENARIO_ATHENA_REGION, value: \"us-east-1\"",
-		"name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: \"benchmark\"",
-		"name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: \"benchmark_frozen\"",
-		"name: DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI, value: \"s3://benchmark-results/root/\"",
-		"name: trino-ca, mountPath: /trino-ca, readOnly: true",
-		"name: trino-ca, secret: { secretName: duckgres-trino-tls, optional: true",
 		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f pod/duckgres-scenario-pod",
 		"-c scenario",
 		"kubectl --context test-context -n duckgres-ci-pr-123 wait --for=jsonpath={.status.containerStatuses[?(@.name==\"scenario\")].state.terminated.reason} pod/duckgres-scenario-pod",
@@ -467,9 +440,17 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 			t.Fatalf("selected scenario missing expected call %q; calls:\n%s", want, calls)
 		}
 	}
-	for _, unwanted := range []string{"scenario-provision-rejection", "scenario-provision-smoke", "scenario-full-suite"} {
+	for _, unwanted := range []string{
+		"scenario-provision-rejection",
+		"scenario-provision-smoke",
+		"scenario-full-suite",
+		"DUCKGRES_SCENARIO_ATHENA_",
+		"DUCKGRES_SCENARIO_TRINO_",
+		"duckgres-config-store-credentials",
+		"secretName: trino-auth",
+	} {
 		if strings.Contains(calls, unwanted) {
-			t.Fatalf("selected scenario unexpectedly ran %q; calls:\n%s", unwanted, calls)
+			t.Fatalf("selected scenario unexpectedly included %q; calls:\n%s", unwanted, calls)
 		}
 	}
 	if !strings.Contains(calls, "s3://posthog-duckgres-scenario-frozen-data-mw-dev/frozen_v1/") {
@@ -1132,9 +1113,6 @@ func TestE2EHarnessCoversRemoteBinaryCopy(t *testing.T) {
 }
 
 func TestDeployCreatesConfiguredSecretDirectoryPrivately(t *testing.T) {
-	t.Setenv("SCENARIO_NAME", "posthog_frozen_perf")
-	t.Setenv("SCENARIO_POD_IDENTITY_ROLE", "")
-	t.Setenv("E2E_SUITE", "trino")
 	fakes := newRunSHFakes(t)
 	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "generated", "secrets")
 
@@ -1194,13 +1172,6 @@ func TestScenarioPodIsProtectedFromKarpenterDisruption(t *testing.T) {
 	annotations, _ := metadata["annotations"].(map[string]any)
 	if got := annotations["karpenter.sh/do-not-disrupt"]; got != "true" {
 		t.Fatalf("scenario Pod karpenter.sh/do-not-disrupt = %v, want true", got)
-	}
-	env := deploymentContainerEnv(manifest, "scenario")
-	if got := env["DUCKGRES_K8S_WORKER_CPU_REQUEST"]; got != "$DUCKGRES_K8S_WORKER_CPU_REQUEST" {
-		t.Fatalf("scenario worker CPU env = %q, want deployed standard worker CPU", got)
-	}
-	if got := env["DUCKGRES_K8S_WORKER_MEMORY_REQUEST"]; got != "$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" {
-		t.Fatalf("scenario worker memory env = %q, want deployed standard worker memory", got)
 	}
 }
 
@@ -1797,11 +1768,6 @@ func newRunSHFakes(t *testing.T) runSHFakes {
 		t.Fatalf("write fake internal secret: %v", err)
 	}
 
-	writeFake(t, binDir, "resolve-trino-master-image", `#!/usr/bin/env bash
-printf 'resolve-trino-master-image\n' >> "$RUN_SH_TEST_CALLS"
-echo `+fakeTrinoMasterImage+`
-`)
-
 	writeFake(t, binDir, "kubectl", `#!/usr/bin/env bash
 printf 'kubectl %s\n' "$*" >> "$RUN_SH_TEST_CALLS"
 
@@ -2056,12 +2022,10 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 		"AWS_REGION=us-east-1",
 		"E2E_SUITE=neutral",
 		"SCENARIO_NAME=full-suite",
-		"SCENARIO_POD_IDENTITY_ROLE=",
 		"SCENARIO_ARTIFACTS_DIR="+filepath.Join(filepath.Dir(binDir), "scenario-artifacts"),
 		"DUCKGRES_CI_SECRET_DIR="+filepath.Join(filepath.Dir(binDir), "secrets"),
-		// Workflows export a pinned TRINO_IMAGE; clear it so frozen perf resolves.
+		// Use the pinned Trino image unless a test supplies an override.
 		"TRINO_IMAGE=",
-		"TRINO_MASTER_IMAGE_RESOLVER="+filepath.Join(binDir, "resolve-trino-master-image"),
 	)
 	for _, value := range extraEnv {
 		if value == "E2E_SUITE=trino" {
@@ -2175,56 +2139,5 @@ func TestTrinoCacheManagersHaveWritableBoundedStorage(t *testing.T) {
 	}
 	if configs != 2 || deployments != 2 {
 		t.Fatalf("found %d configs and %d deployments", configs, deployments)
-	}
-}
-
-const fakeTrinoMasterImage = "example.invalid/trino:master@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
-func TestFrozenPerfDeploysNewestTrinoMasterImage(t *testing.T) {
-	for _, tc := range []struct {
-		name, override, want string
-		resolves             bool
-	}{
-		{name: "resolved", want: fakeTrinoMasterImage, resolves: true},
-		{name: "override", override: "example.invalid/trino:pinned", want: "example.invalid/trino:pinned"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fakes := newRunSHFakes(t)
-			writeFake(t, fakes.binDir, "envsubst", `#!/usr/bin/env bash
-printf 'trino-image %s\n' "${TRINO_IMAGE:-unset}" >> "$RUN_SH_TEST_CALLS"
-cat
-`)
-			secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
-			for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
-				if err := os.WriteFile(filepath.Join(secretDir, name), []byte("test-tls-material\n"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "E2E_SUITE=trino",
-				"SCENARIO_NAME=posthog_frozen_perf", "TRINO_IMAGE="+tc.override,
-				"TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-test",
-				"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/scenario-test")
-			if out, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("deploy: %v\n%s", err, out)
-			}
-			calls := fakes.calls(t)
-			if got := strings.Count(calls, "resolve-trino-master-image\n"); tc.resolves != (got == 1) || got > 1 {
-				t.Fatalf("resolver ran %d times (want resolve=%v): %s", got, tc.resolves, calls)
-			}
-			var images []string
-			for _, line := range strings.Split(calls, "\n") {
-				if image, ok := strings.CutPrefix(line, "trino-image "); ok && image != "unset" {
-					images = append(images, image)
-				}
-			}
-			if len(images) == 0 {
-				t.Fatalf("no Trino manifest was rendered: %s", calls)
-			}
-			for _, image := range images {
-				if image != tc.want {
-					t.Fatalf("rendered Trino image %q, want %q", image, tc.want)
-				}
-			}
-		})
 	}
 }
