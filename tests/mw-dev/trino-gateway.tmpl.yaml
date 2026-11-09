@@ -28,7 +28,8 @@ ${TRINO_GATEWAY_PUBLIC_KEY}
       password: ${CONFIG_STORE_PASSWORD}
       driver: org.postgresql.Driver
     routing:
-      defaultRoutingGroup: pool-test
+      hostnameToPool:
+        duckgres-trino-gateway.${NAMESPACE}.svc: pool-test
     monitor:
       taskDelay: 1s
     clusterStatsConfiguration:
