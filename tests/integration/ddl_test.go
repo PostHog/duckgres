@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"database/sql"
 	"testing"
 )
 
@@ -330,10 +331,9 @@ func TestDDLTruncate(t *testing.T) {
 	mustExec(t, testHarness.DuckgresDB, "DROP TABLE IF EXISTS ddl_truncate_test")
 }
 
-// TestDDLComment tests COMMENT ON
 func TestDDLComment(t *testing.T) {
-	// Create test objects
 	mustExec(t, testHarness.DuckgresDB, "CREATE TABLE ddl_comment_test (id INTEGER, name TEXT)")
+	t.Cleanup(func() { _, _ = testHarness.DuckgresDB.Exec("DROP TABLE IF EXISTS ddl_comment_test") })
 
 	tests := []QueryTest{
 		{
@@ -349,8 +349,53 @@ func TestDDLComment(t *testing.T) {
 	}
 	runQueryTests(t, tests)
 
-	// Cleanup
-	mustExec(t, testHarness.DuckgresDB, "DROP TABLE IF EXISTS ddl_comment_test")
+	db := openCatalogConn(t, "ducklake")
+	var tableComment, columnComment sql.NullString
+	if err := db.QueryRow("SELECT comment FROM duckdb_tables() WHERE database_name = current_database() AND table_name = 'ddl_comment_test'").Scan(&tableComment); err != nil {
+		t.Fatal(err)
+	}
+	if !tableComment.Valid || tableComment.String != "Test table for comments" {
+		t.Fatalf("persisted table comment = %v", tableComment)
+	}
+	if err := db.QueryRow("SELECT comment FROM duckdb_columns() WHERE database_name = current_database() AND table_name = 'ddl_comment_test' AND column_name = 'name'").Scan(&columnComment); err != nil {
+		t.Fatal(err)
+	}
+	if !columnComment.Valid || columnComment.String != "User name" {
+		t.Fatalf("persisted column comment = %v", columnComment)
+	}
+	tx, err := testHarness.DuckgresDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("COMMENT ON TABLE ddl_comment_test IS 'committed state'"); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.QueryRow("SELECT comment FROM duckdb_tables() WHERE database_name = current_database() AND table_name = 'ddl_comment_test'").Scan(&tableComment); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if !tableComment.Valid || tableComment.String != "committed state" {
+		_ = tx.Rollback()
+		t.Fatalf("transactional table comment = %v", tableComment)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT comment FROM duckdb_tables() WHERE database_name = current_database() AND table_name = 'ddl_comment_test'").Scan(&tableComment); err != nil {
+		t.Fatal(err)
+	}
+	if !tableComment.Valid || tableComment.String != "committed state" {
+		t.Fatalf("committed table comment = %v", tableComment)
+	}
+	mustExec(t, testHarness.DuckgresDB, "COMMENT ON TABLE ddl_comment_test IS NULL")
+	if err := db.QueryRow("SELECT comment FROM duckdb_tables() WHERE database_name = current_database() AND table_name = 'ddl_comment_test'").Scan(&tableComment); err != nil {
+		t.Fatal(err)
+	}
+	if tableComment.Valid {
+		t.Fatalf("cleared table comment = %v", tableComment)
+	}
+
 }
 
 // TestDDLConstraints tests constraint-related DDL

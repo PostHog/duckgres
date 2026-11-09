@@ -1017,6 +1017,26 @@ func TestTranspile_DDL_DuckLakeMode(t *testing.T) {
 			input:    "CREATE TABLE orders (id INTEGER, user_id INTEGER, FOREIGN KEY (user_id) REFERENCES users(id))",
 			excludes: "FOREIGN KEY",
 		},
+		{
+			name:     "persist table comment",
+			input:    "COMMENT ON TABLE users IS 'snapshot state'",
+			contains: "COMMENT ON TABLE users IS 'snapshot state'",
+		},
+		{
+			name:     "clear table comment",
+			input:    "COMMENT ON TABLE users IS NULL",
+			contains: "COMMENT ON TABLE users IS NULL",
+		},
+		{
+			name:     "persist column comment",
+			input:    "COMMENT ON COLUMN users.name IS 'display name'",
+			contains: "COMMENT ON COLUMN users.name IS 'display name'",
+		},
+		{
+			name:     "persist view comment",
+			input:    "COMMENT ON VIEW active_users IS 'active accounts'",
+			contains: "COMMENT ON VIEW active_users IS 'active accounts'",
+		},
 	}
 
 	tr := New(Config{DuckLakeMode: true})
@@ -1026,6 +1046,9 @@ func TestTranspile_DDL_DuckLakeMode(t *testing.T) {
 			result, err := tr.Transpile(tt.input)
 			if err != nil {
 				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if result.IsNoOp {
+				t.Fatal("DDL must execute rather than silently succeed as a no-op")
 			}
 			upperSQL := strings.ToUpper(result.SQL)
 			if tt.contains != "" && !strings.Contains(upperSQL, strings.ToUpper(tt.contains)) {
@@ -1080,7 +1103,7 @@ func TestTranspile_DDL_NoOps(t *testing.T) {
 		{"ALTER TABLE DROP DEFAULT", "ALTER TABLE users ALTER COLUMN status DROP DEFAULT", "ALTER TABLE"},
 		{"REINDEX", "REINDEX TABLE users", "REINDEX"},
 		{"CLUSTER", "CLUSTER users USING idx_name", "CLUSTER"},
-		{"COMMENT ON", "COMMENT ON TABLE users IS 'User accounts'", "COMMENT"},
+		{"COMMENT ON DATABASE", "COMMENT ON DATABASE analytics IS 'Analytics database'", "COMMENT"},
 		{"REFRESH MATERIALIZED VIEW", "REFRESH MATERIALIZED VIEW my_view", "REFRESH MATERIALIZED VIEW"},
 	}
 
@@ -5001,6 +5024,32 @@ func TestClassifierCovers_PgCatalogViews(t *testing.T) {
 			if cls.Direct {
 				t.Errorf("Classify(%q) = Direct, but %q is in PgCatalogTransform.ViewMappings. "+
 					"Add a detection pattern to Classify().", sql, viewName)
+			}
+		})
+	}
+}
+
+func TestTranspile_CommentQualifiedTargets(t *testing.T) {
+	tests := []struct{ input, target string }{
+		{"COMMENT ON TABLE analytics.public.users IS 'table'", "ducklake.main.users"},
+		{`COMMENT ON TABLE "analytics"."public"."users" IS 'table'`, "ducklake.main.users"},
+		{"COMMENT ON VIEW analytics.reporting.users IS 'view'", "ducklake.reporting.users"},
+		{"COMMENT ON COLUMN analytics.public.users.name IS 'column'", "ducklake.main.users.name"},
+		{"COMMENT ON TABLE public.users IS 'table'", "main.users"},
+		{"COMMENT ON COLUMN public.users.name IS 'column'", "main.users.name"},
+		{"COMMENT ON TABLE other.public.users IS 'table'", "other.public.users"},
+		{"COMMENT ON COLUMN analytics.users.name IS 'column'", "analytics.users.name"},
+		{"COMMENT ON TABLE ducklake.public.users IS 'table'", "ducklake.public.users"},
+	}
+	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "analytics"})
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.IsNoOp || !strings.Contains(result.SQL, tt.target) {
+				t.Errorf("Transpile(%q) = %+v, want executable comment on %q", tt.input, result, tt.target)
 			}
 		})
 	}

@@ -423,6 +423,8 @@ func (az *queryAuthorizer) authorizeWriteStatement(node *pg_query.Node) error {
 		return az.authorizeRenameStatement(typed.RenameStmt)
 	case *pg_query.Node_CopyStmt:
 		return az.authorizeCopyStatement(typed.CopyStmt)
+	case *pg_query.Node_CommentStmt:
+		return az.authorizeCommentStatement(typed.CommentStmt)
 	}
 	return &QueryAccessError{Reason: "this statement is unavailable to project connections"}
 }
@@ -478,6 +480,32 @@ func (az *queryAuthorizer) authorizeRenameStatement(stmt *pg_query.RenameStmt) e
 	return az.authorizeWriteTarget(stmt.GetRelation())
 }
 
+func (az *queryAuthorizer) authorizeCommentStatement(stmt *pg_query.CommentStmt) error {
+	object := stmt.GetObject().GetList()
+	if object == nil {
+		return &QueryAccessError{Reason: "this statement is unavailable to project connections"}
+	}
+	parts := object.Items
+	switch stmt.GetObjtype() {
+	case pg_query.ObjectType_OBJECT_TABLE, pg_query.ObjectType_OBJECT_VIEW:
+	case pg_query.ObjectType_OBJECT_COLUMN:
+		if len(parts) == 0 || parts[len(parts)-1].GetString_() == nil {
+			return &QueryAccessError{Reason: "this statement is unavailable to project connections"}
+		}
+		parts = parts[:len(parts)-1]
+	default:
+		return &QueryAccessError{Reason: "this statement is unavailable to project connections"}
+	}
+	catalog, schema, relation, ok := qualifiedRelationNameParts(parts)
+	if !ok {
+		return &QueryAccessError{Reason: "project connections may only comment on schema-qualified project objects"}
+	}
+	if strings.EqualFold(schema, "pg_catalog") || strings.EqualFold(schema, "information_schema") {
+		return &QueryAccessError{Reason: "project connections may only comment on project objects"}
+	}
+	return az.authorizeQualifiedRelation(catalog, schema, relation)
+}
+
 // authorizeCopyStatement admits only COPY <relation> FROM STDIN. The file and
 // PROGRAM forms read or write outside the project entirely, and COPY … TO
 // STDOUT is an export path no scoped mode has (a project reader cannot use it
@@ -503,8 +531,12 @@ func qualifiedNameParts(object *pg_query.Node) (catalog, schema, relation string
 	if list == nil {
 		return "", "", "", false
 	}
-	parts := make([]string, 0, len(list.Items))
-	for _, item := range list.Items {
+	return qualifiedRelationNameParts(list.Items)
+}
+
+func qualifiedRelationNameParts(items []*pg_query.Node) (catalog, schema, relation string, ok bool) {
+	parts := make([]string, 0, len(items))
+	for _, item := range items {
 		str := item.GetString_()
 		if str == nil {
 			return "", "", "", false

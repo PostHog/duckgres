@@ -745,6 +745,20 @@ extensions:
 
 ## DuckLake Integration
 
+`COMMENT ON TABLE`, `COMMENT ON COLUMN`, and `COMMENT ON VIEW` persist in DuckLake.
+Use `IS NULL` to clear a comment. Committed comments are visible from other connections.
+Project writers can comment only on their allowed schema-qualified objects; project readers cannot change comments.
+
+To verify a table comment after a write, query `duckdb_tables()` through an internal connection:
+
+```sql
+COMMENT ON TABLE ducklake.main.example_table IS 'example metadata';
+SELECT comment FROM duckdb_tables()
+WHERE database_name = 'ducklake' AND schema_name = 'main' AND table_name = 'example_table';
+```
+
+If a workflow depends on a comment, verify that the value is present before retrying dependent work.
+
 DuckLake provides a SQL-based lakehouse format. When configured, the DuckLake catalog is automatically attached on connection:
 
 ```yaml

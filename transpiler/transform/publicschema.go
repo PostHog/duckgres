@@ -34,6 +34,12 @@ func (t *PublicSchemaTransform) Transform(tree *pg_query.ParseResult, _ *Result)
 	changed := false
 
 	WalkFunc(tree, func(node *pg_query.Node) bool {
+		if parts := commentRelationName(node.GetCommentStmt()); len(parts) == 2 {
+			if schema := parts[0].GetString_(); schema != nil && strings.EqualFold(schema.Sval, "public") {
+				schema.Sval = "main"
+				changed = true
+			}
+		}
 		rv := node.GetRangeVar()
 		if rv == nil {
 			return true
