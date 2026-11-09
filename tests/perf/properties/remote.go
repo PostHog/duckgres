@@ -60,6 +60,24 @@ func Discover(ctx context.Context, client S3Client, uri string) (*Dataset, error
 	return dataset, nil
 }
 
+// VariantLocationParameter names the Glue table parameter holding the
+// canonical prefix whose Parquet files keep the native, shredded VARIANT
+// column. The supported prefix (the table location) omits it for Athena.
+const VariantLocationParameter = "duckgres.properties_variant_location"
+
+// VariantLocation reads the canonical VARIANT prefix recorded on the
+// preprovisioned Athena table, so the fixture's two copies are selected together.
+func VariantLocation(ctx context.Context, client GlueClient, database, table string) (string, error) {
+	out, err := client.GetTable(ctx, &glue.GetTableInput{DatabaseName: aws.String(database), Name: aws.String(table)})
+	if err != nil {
+		return "", fmt.Errorf("read Athena table parameters: %w", err)
+	}
+	if out.Table == nil || out.Table.Parameters[VariantLocationParameter] == "" {
+		return "", fmt.Errorf("athena table has no %s parameter; record the canonical VARIANT prefix when generating the fixture", VariantLocationParameter)
+	}
+	return out.Table.Parameters[VariantLocationParameter], nil
+}
+
 type GlueClient interface {
 	GetTable(context.Context, *glue.GetTableInput, ...func(*glue.Options)) (*glue.GetTableOutput, error)
 }
