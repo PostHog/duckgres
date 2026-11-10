@@ -4,27 +4,7 @@
 
 The scenario runner executes end-to-end managed-warehouse flows against a configured dev environment. The first smoke scenario provisions a warehouse, waits for readiness, runs `SELECT 1` over PGWire with managed-hostname SNI, then deprovisions and verifies cleanup.
 
-The default full workload uses one `full-suite.yaml` scenario: it provisions a fresh dev warehouse, creates read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, runs metadata exploration, perf queries, and dbt models, then deprovisions. `fast-suite.yaml` follows the same flow without dbt. The standalone provisioning, frozen metadata, perf, and dbt scenarios remain available for focused debugging.
-
-The frozen-perf scenario compares Duckgres raw views and DuckLake tables,
-Trino Hoglake tables, and Athena external tables over the same immutable S3 files.
-`posthog_frozen_perf` runs `trino` with `fs.cache.enabled=false` and
-`trino_cached` with it set to `true`, using two clusters in one throwaway namespace.
-Dataset setup runs once; all five targets execute sequentially into one result set.
-By default the scenario runs the newest PostHog/trino master build, whose Hoglake
-connector honors that flag (PostHog/trino#43). An older `trino_image` override
-may ignore it, so its `trino_cached` results measure an uncached cluster; see
-`tests/perf/README.md` for the affected result history. The runner requires the
-managed tenant catalog to stay uncached, so leave
-`DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED` unset (false) for this
-scenario. Both modes run the full seven-query corpus, with one warmup and four
-measured iterations.
-
-The scenario deployment creates a namespace-local Hoglake server and metadata
-PostgreSQL database. Setup registers the frozen `events` and `persons` Parquet
-files in the org's Hoglake catalog without copying or rewriting S3 data. Namespace
-teardown removes the server and metadata database. Duckgres continues to use
-DuckLake for its PGWire measurements.
+The default full workload uses one `full-suite.yaml` scenario: it provisions a fresh dev warehouse, creates read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, runs metadata exploration, perf queries, and dbt models, then deprovisions. `fast-suite.yaml` follows the same flow without dbt. The standalone provisioning, frozen metadata, and dbt scenarios remain available for focused debugging.
 
 ## Required Environment
 
@@ -58,40 +38,14 @@ Frozen dataset scenarios additionally require:
 export DUCKGRES_SCENARIO_FROZEN_S3_URI="s3://<dev-managed-bucket>/frozen_v1/"
 ```
 
-The targeted frozen perf scenario also requires the standard Duckgres worker
-shape deployed with the scenario stack:
-
-```bash
-export DUCKGRES_K8S_WORKER_CPU_REQUEST="3"
-export DUCKGRES_K8S_WORKER_MEMORY_REQUEST="12Gi"
-export DUCKGRES_SCENARIO_ATHENA_REGION="<aws-region>"
-export DUCKGRES_SCENARIO_ATHENA_WORKGROUP="<on-demand-workgroup>"
-export DUCKGRES_SCENARIO_ATHENA_DATABASE="<glue-database>"
-export DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI="s3://<results-bucket>/<prefix>/"
-```
-
-The full and fast suites exercise PGWire only. The targeted frozen perf
-scenario compares PGWire on DuckLake, Trino on Hoglake, and on-demand Athena. It records per-query
-success and failure rows in `query_results.csv` and Athena and Trino service
-details (Trino splits and physical input included) in
-`query_service_metrics.csv`.
-Measured query errors fail the perf DAG step after its artifacts are written;
-independent sibling steps continue to run.
+The full and fast suites exercise PGWire and record per-query results in
+`query_results.csv`. Measured query errors fail the perf DAG step after writing
+its artifacts, and independent sibling steps continue.
 
 A `perf_queries` step can set `with.targets` to a non-empty subset of the
 catalog's targets. Optional `with.worker_cpu` and `with.worker_memory` values
 are sent as PGWire startup options. Both default to empty, which leaves worker
 selection to the server; set both for resource-controlled comparisons.
-
-For the frozen-perf scenario, `tests/mw-dev/run.sh` automatically supplies
-`DUCKGRES_TRINO_MANAGED_HOGLAKE_URI` to the control plane and
-`DUCKGRES_SCENARIO_HOGLAKE_URI` to the runner. It also supplies the cached Trino endpoint/cell and a mounted admin password
-file for creating the second catalog. See [the deployment runbook](../../tests/mw-dev/README.md#running-the-combined-trino-perf-comparison)
-for direct-runner settings and failure recovery. No catalog configuration is supplied
-by the caller. The bootstrap coordinator belongs to a disposable shared pool;
-the comparison clusters retain their isolated catalog partitions. `HOGLAKE_IMAGE` can override
-the pinned server image. The scenario image includes Python, boto3, and pyarrow
-for reading Parquet footers from S3 during setup.
 
 Do not commit concrete dev endpoints, secrets, org IDs, or private bucket names.
 
@@ -127,20 +81,6 @@ Run targeted frozen metadata exploration:
 just scenario-frozen-metadata
 ```
 
-Run frozen perf queries:
-
-```bash
-just scenario-frozen-perf
-```
-
-This runs, in order: raw-view setup, source-column preflight, explicit PostHog
-table DDL, registration of the frozen Parquet files in DuckLake, then partition
-and file-metadata validation, followed by Hoglake registration for Trino. Registration reads Parquet footers but does not
-rewrite the fixture rows, so the raw-view and DuckLake-table queries use the
-same frozen S3 objects as Hoglake. Validation checks the declared schema and partition
-metadata plus exact source/registered file-list equality. Neither `fast-suite`
-nor `full-suite` enables these tables yet.
-
 Run frozen dbt lifecycle:
 
 ```bash
@@ -171,11 +111,6 @@ The targeted frozen metadata scenario uses:
 - `tests/mw-dev/scenario/sql/setup_frozen_views.sql`
 - `tests/mw-dev/scenario/sql/metadata_catalog.yaml`
 
-The frozen perf scenario uses:
-
-- `tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml`
-- `tests/perf/queries/ducklake_frozen.yaml`
-
 Perf artifacts are written under `artifacts/scenario/<run_id>/perf/` using the existing `tests/perf/core` artifact schema, including `query_results.csv`, `query_service_metrics.csv`, `summary.json`, and `server_metrics.prom`.
 
 The frozen dbt scenario uses:
@@ -185,7 +120,7 @@ The frozen dbt scenario uses:
 
 dbt artifacts are written under `artifacts/scenario/<run_id>/dbt/`, including per-command stdout/stderr logs, `target/` artifacts, and dbt logs. Install `dbt-postgres` locally or set `DUCKGRES_SCENARIO_DBT_BIN` to the dbt executable to use.
 
-The frozen dbt workload requests a 2 CPU, 4Gi worker through the dbt connection's `duckgres.worker_cpu` and `duckgres.worker_memory` startup options. It also sets `with.connect_timeout: 360`, long enough for the control plane's five-minute worker queue to provision a cold Karpenter node. Frozen perf requests the scenario stack's standard worker shape through the same startup GUCs; `scenario-dev` currently configures 3 CPU and 12Gi, matching the aggregate execution resources of its three Trino workers. This explicit sizing bypasses the exploratory worker tier so every measured PGWire query uses the comparison resource budget. A `dbt_run` or `perf_queries` step can opt into a different worker shape with `with.worker_cpu` and `with.worker_memory`.
+The frozen dbt workload requests a 2 CPU, 4Gi worker through the dbt connection's `duckgres.worker_cpu` and `duckgres.worker_memory` startup options. It also sets `with.connect_timeout: 360`, long enough for the control plane's five-minute worker queue to provision a cold Karpenter node. A `dbt_run` or `perf_queries` step can opt into a different worker shape with `with.worker_cpu` and `with.worker_memory`.
 
 `perf_queries` defaults `with.fail_on_query_errors` to `true`. A measured query
 error therefore marks that DAG step failed and appears in the scenario result,
@@ -215,14 +150,3 @@ The smoke scenario has an `always_run` deprovision step, but an interrupted proc
 4. If deletion does not complete, inspect the dev control-plane logs and the managed warehouse deprovision runbook.
 
 Use placeholders in shared notes and PRs; keep concrete dev values local.
-
-## Frozen PostHog Table Setup Recovery
-
-If the targeted frozen-perf setup or validation fails, retain the scenario error:
-it identifies missing required fixture column names, schema/partition drift, or a
-non-sensitive parity check. Do not edit the raw views to mask it. The warehouse is
-disposable and the next targeted run creates a new one; within a retried setup the
-transaction deletes both destination tables before inserting, so it cannot duplicate
-rows after partial setup. Refresh the fixture only after confirming the pinned
-backfill mapping remains appropriate; change the pin and mappings together when
-upstream production schema changes.

@@ -8,24 +8,8 @@ on:
         required: true
         default: full-suite
         type: string
-      coverage_target:
-        description: Extended target; all runs each configuration in a separate job (manual only)
-        required: false
-        default: all
-        type: choice
-        options: [all, pgwire_uncached, pgwire_cached, trino, trino_cached, athena]
-      properties_s3_uri:
-        description: Properties Parquet S3 prefix override; blank uses the existing Athena table location
-        required: false
-        default: ""
-        type: string
       duckgres_image:
         description: Existing Duckgres image to deploy instead of building this SHA
-        required: false
-        default: ""
-        type: string
-      trino_image:
-        description: Trino image for posthog_frozen_perf; blank uses the newest PostHog/trino master build
         required: false
         default: ""
         type: string
@@ -39,51 +23,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  plan:
-    runs-on: ubuntu-24.04
-    outputs:
-      matrix: ${{ steps.targets.outputs.matrix }}
-      trino_image: ${{ steps.trino.outputs.image }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Select scenario targets
-        id: targets
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          python3 - <<'PYTHON'
-          import json, os
-          with open(os.environ["GITHUB_EVENT_PATH"]) as event_file:
-              inputs = json.load(event_file).get("inputs") or {}
-          scenario = "posthog_frozen_perf" if os.environ["EVENT_NAME"] == "schedule" else inputs.get("scenario", "")
-          targets = ["pgwire_uncached", "pgwire_cached", "trino", "trino_cached", "athena"]
-          if scenario == "posthog_frozen_perf_extended":
-              selected = inputs.get("coverage_target") or "all"
-              if selected not in ["all", *targets]:
-                  raise SystemExit("Unsupported extended coverage target")
-              jobs = [{"target": target, "id_suffix": str(i + 1), "artifact_suffix": "-" + target}
-                      for i, target in enumerate(targets) if selected in ("all", target)]
-          else:
-              jobs = [{"target": "pgwire_uncached", "id_suffix": "", "artifact_suffix": ""}]
-          needs_trino = scenario == "posthog_frozen_perf" or (
-              scenario == "posthog_frozen_perf_extended" and any(j["target"].startswith("trino") for j in jobs))
-          if needs_trino and inputs.get("duckgres_image"):
-              raise SystemExit("Trino comparisons require the control-plane image built from this revision; omit duckgres_image")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              print("matrix=" + json.dumps({"include": jobs}, separators=(",", ":")), file=output)
-              print("needs_trino=" + str(needs_trino).lower(), file=output)
-          PYTHON
-      - name: Resolve shared Trino image
-        id: trino
-        if: steps.targets.outputs.needs_trino == 'true'
-        env:
-          TRINO_IMAGE_OVERRIDE: ${{ inputs.trino_image }}
-        run: |
-          set -euo pipefail
-          image="${TRINO_IMAGE_OVERRIDE:-$(scripts/resolve_trino_master_image.sh)}"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "Trino image: \`$image\`" >> "$GITHUB_STEP_SUMMARY"
-
   scenario-runner-image:
     uses: ./.github/workflows/_image-build.yml
     with:
@@ -96,7 +35,7 @@ jobs:
       ecr-role: ${{ vars.AWS_ECR_SHARED_SERVICES_PRS_PUBLISH_IAM_ROLE }}
 
   duckgres-image:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.duckgres_image == '' }}
+    if: ${{ inputs.duckgres_image == '' }}
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: Dockerfile
@@ -114,48 +53,40 @@ jobs:
       ecr-role: ${{ vars.AWS_ECR_SHARED_SERVICES_PRS_PUBLISH_IAM_ROLE }}
 
   scenario:
-    name: ${{ github.event_name == 'schedule' && 'posthog_frozen_perf' || inputs.scenario }}${{ matrix.artifact_suffix }}
-    needs: [plan, scenario-runner-image, duckgres-image]
-    if: ${{ always() && needs.plan.result == 'success' && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.duckgres_image != '')) }}
+    name: ${{ inputs.scenario }}
+    needs: [scenario-runner-image, duckgres-image]
+    if: ${{ always() && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (needs.duckgres-image.result == 'skipped' && inputs.duckgres_image != '')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 270
-    strategy:
-      fail-fast: false
-      # Sequential targets avoid benchmark resource contention. Each gets a fresh timeout.
-      max-parallel: 1
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     env:
-      SCENARIO_NAME: ${{ github.event_name == 'schedule' && 'posthog_frozen_perf' || inputs.scenario }}
+      SCENARIO_NAME: ${{ inputs.scenario }}
       SCENARIO_RUNNER_IMAGE: ${{ needs.scenario-runner-image.outputs.image }}
-      WORKER_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
-      CONTROLPLANE_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
+      WORKER_IMAGE: ${{ inputs.duckgres_image || needs.duckgres-image.outputs.image }}
+      CONTROLPLANE_IMAGE: ${{ inputs.duckgres_image || needs.duckgres-image.outputs.image }}
       KUBE_CONTEXT: posthog-mw-dev
       CLUSTER_NAME: posthog-mw-dev
       EKS_CLUSTER_NAME: posthog-mw-dev
       AWS_REGION: us-east-1
       CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev
-      # Frozen perf uses a namespace-local Trino cell. The dedicated role is
-      # consumed only when E2E_SUITE selects that isolated deployment.
-      TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
-      E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || (inputs.scenario == 'posthog_frozen_perf_extended' && (matrix.target == 'trino' || matrix.target == 'trino_cached'))) && 'trino' || 'neutral' }}
-      DUCKGRES_SCENARIO_COVERAGE_TARGET: ${{ matrix.target }}
-      PR_NUMBER: ${{ github.run_id }}${{ matrix.id_suffix }}
-      NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ matrix.id_suffix }}
-      TRINO_IMAGE: ${{ needs.plan.outputs.trino_image }}
+      E2E_SUITE: neutral
+      PR_NUMBER: ${{ github.run_id }}
+      NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
-      # Match the benchmark Trino fleet: three 7-CPU / 28Gi workers.
-      # Non-benchmark scenarios retain their existing small resource budget.
-      DUCKGRES_K8S_WORKER_CPU_REQUEST: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '21' || '3' }}
-      DUCKGRES_K8S_WORKER_MEMORY_REQUEST: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '84Gi' || '12Gi' }}
-      # The perf driver passes explicit sizing GUCs: keep their admission caps aligned.
-      DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '21' || '8' }}
-      DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '84Gi' || '16Gi' }}
+      DUCKGRES_K8S_WORKER_CPU_REQUEST: "3"
+      DUCKGRES_K8S_WORKER_MEMORY_REQUEST: "12Gi"
+      DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU: "8"
+      DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY: "16Gi"
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Scenario dev target selected
-        run: echo "Deploying an isolated Duckgres stack for $SCENARIO_NAME."
+        run: |
+          if [[ ! "$SCENARIO_NAME" =~ ^[a-z0-9_-]+$ ]] || [[ ! -f "tests/mw-dev/scenario/scenarios/$SCENARIO_NAME.yaml" ]]; then
+            echo "Select a checked-in scenario YAML name without the .yaml suffix." >&2
+            exit 2
+          fi
+          echo "Deploying an isolated Duckgres stack for $SCENARIO_NAME."
 
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
@@ -174,10 +105,6 @@ jobs:
           # collect artifacts and tear down the isolated namespace.
           role-duration-seconds: 16200
 
-      - name: Discover managed Hoglake configuration
-        if: env.E2E_SUITE == 'trino'
-        run: bash tests/mw-dev/discover-hoglake.sh
-
       - name: Connect to Tailscale
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
         with:
@@ -190,24 +117,6 @@ jobs:
 
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
-
-      - name: Load frozen perf identity and Athena configuration
-        if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_extended' || env.SCENARIO_NAME == 'posthog_frozen_perf_extended_uncached'
-        run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
-
-      - name: Load properties fixture override
-        if: env.SCENARIO_NAME == 'posthog_frozen_perf'
-        run: |
-          source=$(jq -r '.inputs.properties_s3_uri // ""' "$GITHUB_EVENT_PATH")
-          if [ -n "$source" ]; then
-            echo "::add-mask::$source"
-            if [[ "$source" =~ ^s3://[^[:space:]]+$ ]]; then
-              echo "DUCKGRES_SCENARIO_PROPERTIES_S3_URI=$source" >> "$GITHUB_ENV"
-            else
-              echo "::warning::Invalid properties prefix; the properties comparison will fail after original benchmarks complete."
-              echo "DUCKGRES_SCENARIO_PROPERTIES_S3_URI=invalid" >> "$GITHUB_ENV"
-            fi
-          fi
 
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy
@@ -242,7 +151,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: scenario-dev-${{ env.SCENARIO_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}${{ matrix.artifact_suffix }}
+          name: scenario-dev-${{ env.SCENARIO_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/scenario-dev/
           if-no-files-found: warn
           retention-days: 14
@@ -255,7 +164,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -d '' perf_summaries < <(
-            find artifacts/scenario-dev -type f \( -path '*/perf/summary.json' -o -path '*/perf-properties/summary.json' -o -path '*/perf-coverage/summary.json' \) -print0 2>/dev/null | sort -z
+            find artifacts/scenario-dev -type f -path '*/perf/summary.json' -print0 2>/dev/null | sort -z
           )
           if [ "${#perf_summaries[@]}" -eq 0 ]; then
             echo "No scenario perf artifact was produced; skipping historical publish."

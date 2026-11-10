@@ -170,18 +170,11 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 }
 
 func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
-	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	const scenarioOrgID = "ci-pr-123-cnpg"
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
-	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
-	setAthenaPerfEnv(t)
-	t.Setenv("DUCKGRES_K8S_WORKER_CPU_REQUEST", "3")
-	t.Setenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST", "12Gi")
 
 	for _, scenarioFile := range []string{
 		"posthog_frozen_metadata.yaml",
-		"posthog_frozen_perf.yaml",
 		"posthog_frozen_dbt.yaml",
 		"fast-suite.yaml",
 		"full-suite.yaml",
@@ -460,181 +453,6 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 	}
 }
 
-func TestFrozenPerfScenarioUsesSupportedStepsAndOriginalCatalog(t *testing.T) {
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
-	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
-	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
-	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
-	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
-	setAthenaPerfEnv(t)
-	t.Setenv("DUCKGRES_K8S_WORKER_CPU_REQUEST", "3")
-	t.Setenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST", "12Gi")
-
-	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
-	if err != nil {
-		t.Fatalf("load frozen perf scenario: %v", err)
-	}
-	resolved, err := resolveRunTemplates(scenario, "scenario-frozen-perf-20260102t030405z")
-	if err != nil {
-		t.Fatalf("resolve templates: %v", err)
-	}
-
-	foundPerf := false
-	for _, step := range resolved.Steps {
-		if !dispatchSupports(step.Type) {
-			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
-		}
-		if containsTemplate(step.With) {
-			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
-		}
-		if step.ID != "perf_queries" {
-			continue
-		}
-		foundPerf = true
-		catalogFile, ok := step.With["catalog_file"].(string)
-		if !ok || !filepath.IsAbs(catalogFile) {
-			t.Fatalf("perf catalog_file = %#v, want absolute path", step.With["catalog_file"])
-		}
-		if !strings.HasSuffix(catalogFile, filepath.Join("perf", "queries", "ducklake_posthog_tables.yaml")) {
-			t.Fatalf("perf catalog_file = %q, want original checked-in corpus", catalogFile)
-		}
-		if runID, _ := step.With["run_id"].(string); runID != "scenario-frozen-perf-20260102t030405z" {
-			t.Fatalf("perf run_id = %q, want scenario run id", runID)
-		}
-		if _, ok := step.With["flight_addr"]; ok {
-			t.Fatal("frozen perf scenario should not configure the deprecated Flight endpoint")
-		}
-		assertPerfQueryErrorsFailStep(t, step)
-		assertPerfTargetsPGWireTrinoAndAthena(t, step)
-		if got, _ := step.With["trino_ca_cert_file"].(string); got != "/tmp/test-trino-ca.crt" {
-			t.Fatalf("perf Trino CA file = %q, want resolved environment path", got)
-		}
-		if got, _ := step.With["worker_cpu"].(string); got != "3" {
-			t.Fatalf("perf worker_cpu = %q, want standard worker CPU", got)
-		}
-		if got, _ := step.With["worker_memory"].(string); got != "12Gi" {
-			t.Fatalf("perf worker_memory = %q, want standard worker memory", got)
-		}
-		if got, _ := step.With["athena_output_location"].(string); got != "s3://benchmark-results/root/" {
-			t.Fatalf("Athena output location = %q, want workgroup-enforced results prefix", got)
-		}
-	}
-	if !foundPerf {
-		t.Fatal("expected frozen perf scenario to include a perf_queries step")
-	}
-}
-
-func TestFrozenPerfScenarioRunsOptionalPropertiesAfterOriginalPerf(t *testing.T) {
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
-	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
-	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
-	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
-	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
-	setAthenaPerfEnv(t)
-	t.Setenv("DUCKGRES_K8S_WORKER_CPU_REQUEST", "3")
-	t.Setenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST", "12Gi")
-
-	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
-	if err != nil {
-		t.Fatalf("load frozen perf scenario: %v", err)
-	}
-	resolved, err := resolveRunTemplates(scenario, "scenario-frozen-perf-20260102t030405z")
-	if err != nil {
-		t.Fatalf("resolve templates: %v", err)
-	}
-
-	steps := make(map[string]core.Step, len(resolved.Steps))
-	for _, step := range resolved.Steps {
-		steps[step.ID] = step
-	}
-	comparison, ok := steps["properties_comparison"]
-	if !ok || comparison.Type != stepTypePropertiesComparison {
-		t.Fatal("expected optional properties comparison step")
-	}
-	if got := comparison.DependsOn; len(got) != 1 || got[0] != "perf_queries" {
-		t.Fatalf("properties dependencies = %#v, want original perf first", got)
-	}
-	// One nightly publishes both suites under one dataset, so the dashboard's
-	// comparison sees them together.
-	if got, want := comparison.With["dataset_version"], steps["perf_queries"].With["dataset_version"]; got == nil || got != want {
-		t.Fatalf("properties dataset_version = %#v, want the perf_queries dataset %#v", got, want)
-	}
-	for _, name := range scenario.RequiredEnv {
-		if name == "DUCKGRES_SCENARIO_PROPERTIES_S3_URI" {
-			t.Fatal("properties fixture must remain optional")
-		}
-	}
-	waitTrino, ok := steps["wait_trino_ready"]
-	if !ok {
-		t.Fatal("expected Trino readiness step")
-	}
-	if got := waitTrino.DependsOn; len(got) != 1 || got[0] != "wait_ready" {
-		t.Fatalf("Trino readiness dependencies = %#v, want [wait_ready]", got)
-	}
-	provisionRequest, _ := steps["provision"].With["request"].(map[string]any)
-	trinoRequest, _ := provisionRequest["trino"].(map[string]any)
-	if enabled, _ := trinoRequest["enabled"].(bool); !enabled {
-		t.Fatalf("Trino provision request = %#v, want enabled", provisionRequest["trino"])
-	}
-	hoglake := steps["setup_hoglake"]
-	if hoglake.Type != scenarioperf.StepTypeSetupHoglake || len(hoglake.DependsOn) != 1 || hoglake.DependsOn[0] != "validate_posthog_tables" {
-		t.Fatalf("Hoglake setup must follow original table validation: %#v", hoglake)
-	}
-	if file, _ := hoglake.With["file"].(string); file == "" {
-		t.Fatal("missing Hoglake setup script")
-	} else if _, err := os.Stat(file); err != nil {
-		t.Fatal(err)
-	}
-	if got := steps["perf_queries"].DependsOn; len(got) != 2 || got[0] != "setup_hoglake" || got[1] != "wait_trino_ready" {
-		t.Fatalf("perf dependencies = %#v, want original setup only", got)
-	}
-}
-
-func TestComposedFrozenSuitesDoNotEnablePostHogTableSetup(t *testing.T) {
-	for _, scenarioFile := range []string{"fast-suite.yaml", "full-suite.yaml"} {
-		t.Run(scenarioFile, func(t *testing.T) {
-			scenario, err := core.LoadScenario(filepath.Join("scenarios", scenarioFile))
-			if err != nil {
-				t.Fatalf("load scenario: %v", err)
-			}
-			for _, step := range scenario.Steps {
-				if step.ID == "setup_posthog_tables" || step.ID == "validate_posthog_tables" {
-					t.Fatalf("%s must not enable %s before scheduled rollout", scenarioFile, step.ID)
-				}
-			}
-		})
-	}
-}
-
-func TestPostHogTableSetupDoesNotRewriteRows(t *testing.T) {
-	setupFile := filepath.Join("sql", "setup_posthog_tables.sql")
-	raw, err := os.ReadFile(setupFile)
-	if err != nil {
-		t.Fatalf("read posthog table setup: %v", err)
-	}
-	sql := string(raw)
-	for _, unwanted := range []string{
-		"INSERT INTO posthog.events",
-		"INSERT INTO posthog.persons",
-		"SET preserve_insertion_order",
-	} {
-		if strings.Contains(sql, unwanted) {
-			t.Fatalf("posthog setup must register files, not contain %q", unwanted)
-		}
-	}
-}
-
-func TestPostHogTableValidationDoesNotWarmTableData(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("sql", "validate_posthog_tables.sql"))
-	if err != nil {
-		t.Fatalf("read posthog table validation: %v", err)
-	}
-	sql := string(raw)
-	if strings.Contains(sql, "FROM posthog.events") || strings.Contains(sql, "FROM posthog.persons") {
-		t.Fatal("posthog registration validation must not scan table rows before perf")
-	}
-}
-
 func TestFrozenDBTScenarioUsesSupportedStepsAndRelativeProject(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
@@ -710,22 +528,6 @@ func assertPerfTargetsOnlyPGWire(t *testing.T, step core.Step) {
 	if !ok || len(targets) != 1 || targets[0] != "pgwire" {
 		t.Fatalf("perf step %s targets = %#v, want [pgwire]", step.ID, step.With["targets"])
 	}
-}
-
-func assertPerfTargetsPGWireTrinoAndAthena(t *testing.T, step core.Step) {
-	t.Helper()
-	targets, ok := step.With["targets"].([]any)
-	if !ok || len(targets) != 5 || targets[0] != "pgwire_uncached" || targets[1] != "pgwire_cached" || targets[2] != "trino" || targets[3] != "trino_cached" || targets[4] != "athena" {
-		t.Fatalf("perf step %s targets = %#v, want [pgwire_uncached pgwire_cached trino trino_cached athena]", step.ID, step.With["targets"])
-	}
-}
-
-func setAthenaPerfEnv(t *testing.T) {
-	t.Helper()
-	t.Setenv("DUCKGRES_SCENARIO_ATHENA_REGION", "us-east-1")
-	t.Setenv("DUCKGRES_SCENARIO_ATHENA_WORKGROUP", "benchmark")
-	t.Setenv("DUCKGRES_SCENARIO_ATHENA_DATABASE", "benchmark_frozen")
-	t.Setenv("DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI", "s3://benchmark-results/root/")
 }
 
 func TestFrozenDBTProjectModelsRealisticProductAnalyticsWorkload(t *testing.T) {
@@ -883,9 +685,7 @@ func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error
 		return e.provision.ExecuteStep(ctx, step)
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return e.sql.ExecuteStep(ctx, step)
-	case stepTypePropertiesComparison:
-		return e.runPropertiesComparison(ctx, step)
-	case scenarioperf.StepTypePerfQueries, scenarioperf.StepTypeSetupHoglake:
+	case scenarioperf.StepTypePerfQueries:
 		return e.perf.ExecuteStep(ctx, step)
 	case scenariodbt.StepTypeDBTRun:
 		return e.dbt.ExecuteStep(ctx, step)
@@ -907,7 +707,7 @@ func dispatchSupports(stepType string) bool {
 		return true
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return true
-	case scenarioperf.StepTypePerfQueries, scenarioperf.StepTypeSetupHoglake, stepTypePropertiesComparison:
+	case scenarioperf.StepTypePerfQueries:
 		return true
 	case scenariodbt.StepTypeDBTRun:
 		return true
@@ -997,7 +797,7 @@ func resolveScenarioFilePaths(s core.Scenario, baseDir string) core.Scenario {
 		}
 		with := make(map[string]any, len(step.With))
 		for k, v := range step.With {
-			if k == "file" || k == "catalog_file" || k == "project_dir" || k == "profiles_dir" || k == "hoglake_file" {
+			if k == "file" || k == "catalog_file" || k == "project_dir" || k == "profiles_dir" {
 				if file, ok := v.(string); ok && file != "" && !filepath.IsAbs(file) && !strings.HasPrefix(file, "${env:") {
 					v = filepath.Clean(filepath.Join(baseDir, file))
 				}

@@ -18,7 +18,7 @@ func TestHoglakeCleanupRejectsForeignNamespaceAndBroadPrefix(t *testing.T) {
 	}
 	script := string(raw)
 	identityStart := strings.Index(script, "require_pr_identity() {")
-	identityEnd := strings.Index(script[identityStart:], "\nfrozen_perf_scenario()") + identityStart
+	identityEnd := strings.Index(script[identityStart:], "\n}\n") + identityStart + len("\n}\n")
 	cleanupStart := strings.Index(script, "# BEGIN isolated Hoglake cleanup")
 	cleanupEnd := strings.Index(script, "# END isolated Hoglake cleanup")
 	for _, tc := range []struct {
@@ -48,67 +48,59 @@ func TestHoglakeCleanupRejectsForeignNamespaceAndBroadPrefix(t *testing.T) {
 }
 
 // The per-PR lane enables the cache for managed Hoglake catalogs so trino.sh
-// can assert enabled mode. Frozen perf leaves it unset because its runner
-// requires an uncached managed tenant catalog. Neither lane sets the DuckLake
-// setting.
-func TestTrinoDeployEnablesHoglakeFilesystemCacheOutsideFrozenPerf(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		env  []string
-		want map[string]string
-	}{
-		{"per-PR lane", nil, map[string]string{"DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED": "true"}},
-		{"frozen perf", []string{"SCENARIO_NAME=posthog_frozen_perf", "SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/scenario-dev"}, map[string]string{}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newRunSHFakes(t)
-			secretDir := filepath.Join(filepath.Dir(f.binDir), "secrets")
-			for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
-				if err := os.WriteFile(filepath.Join(secretDir, name), []byte("test-tls-material\n"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			env := append([]string{"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "E2E_SUITE=trino", "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-dev"}, tc.env...)
-			if out, err := runSHCommand(t, f.binDir, "deploy", env...).CombinedOutput(); err != nil {
-				t.Fatalf("Trino deploy failed: %v\n%s", err, out)
-			}
-			const prefix = "kubectl --context test-context -n duckgres-ci-pr-123 patch deployment duckgres-control-plane --type=strategic -p "
-			var patches []string
-			for _, line := range strings.Split(f.calls(t), "\n") {
-				if strings.HasPrefix(line, prefix) {
-					patches = append(patches, strings.TrimPrefix(line, prefix))
-				}
-			}
-			if len(patches) != 1 {
-				t.Fatalf("found %d managed Hoglake control-plane patches, want 1", len(patches))
-			}
-			var patch struct {
+// can assert enabled mode. The DuckLake setting is separate.
+func TestTrinoDeployEnablesHoglakeFilesystemCache(t *testing.T) {
+	f := newRunSHFakes(t)
+	secretDir := filepath.Join(filepath.Dir(f.binDir), "secrets")
+	for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
+		if err := os.WriteFile(filepath.Join(secretDir, name), []byte("test-tls-material\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := []string{
+		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+		"E2E_SUITE=trino",
+		"TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-dev",
+	}
+	if out, err := runSHCommand(t, f.binDir, "deploy", env...).CombinedOutput(); err != nil {
+		t.Fatalf("Trino deploy failed: %v\n%s", err, out)
+	}
+	const prefix = "kubectl --context test-context -n duckgres-ci-pr-123 patch deployment duckgres-control-plane --type=strategic -p "
+	var patches []string
+	for _, line := range strings.Split(f.calls(t), "\n") {
+		if strings.HasPrefix(line, prefix) {
+			patches = append(patches, strings.TrimPrefix(line, prefix))
+		}
+	}
+	if len(patches) != 1 {
+		t.Fatalf("found %d managed Hoglake control-plane patches, want 1", len(patches))
+	}
+	var patch struct {
+		Spec struct {
+			Template struct {
 				Spec struct {
-					Template struct {
-						Spec struct {
-							Containers []struct {
-								Name string
-								Env  []struct{ Name, Value string }
-							}
-						}
+					Containers []struct {
+						Name string
+						Env  []struct{ Name, Value string }
 					}
 				}
 			}
-			if err := json.Unmarshal([]byte(patches[0]), &patch); err != nil {
-				t.Fatalf("parse control-plane patch %s: %v", patches[0], err)
+		}
+	}
+	if err := json.Unmarshal([]byte(patches[0]), &patch); err != nil {
+		t.Fatalf("parse control-plane patch %s: %v", patches[0], err)
+	}
+	got := map[string]string{}
+	for _, container := range patch.Spec.Template.Spec.Containers {
+		for _, env := range container.Env {
+			if strings.Contains(env.Name, "FILESYSTEM_CACHE") {
+				got[env.Name] = env.Value
 			}
-			got := map[string]string{}
-			for _, container := range patch.Spec.Template.Spec.Containers {
-				for _, env := range container.Env {
-					if strings.Contains(env.Name, "FILESYSTEM_CACHE") {
-						got[env.Name] = env.Value
-					}
-				}
-			}
-			if !maps.Equal(got, tc.want) {
-				t.Fatalf("control-plane cache settings = %v, want %v", got, tc.want)
-			}
-		})
+		}
+	}
+	want := map[string]string{"DUCKGRES_TRINO_HOGLAKE_FILESYSTEM_CACHE_ENABLED": "true"}
+	if !maps.Equal(got, want) {
+		t.Fatalf("control-plane cache settings = %v, want %v", got, want)
 	}
 }
 
