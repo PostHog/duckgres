@@ -529,3 +529,60 @@ func TestInformationSchemaSequencesAndRoutinesCompatViews(t *testing.T) {
 		t.Errorf("compat views leaked into information_schema_views_compat: %d rows", count)
 	}
 }
+
+// Regression test for #1019: untyped NULL columns in the information_schema.columns
+// compat view resolve to INTEGER, which breaks clients (e.g. Metabase) that compare
+// udt_schema to a string literal.
+func TestInformationSchemaColumnsCompatUDTColumnsAreVarchar(t *testing.T) {
+	for _, duckLake := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ducklake=%v", duckLake), func(t *testing.T) {
+			db, err := sql.Open("duckdb", ":memory:")
+			if err != nil {
+				t.Fatalf("Failed to open database: %v", err)
+			}
+			defer func() { _ = db.Close() }()
+
+			if duckLake {
+				if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
+					t.Fatalf("Failed to attach ducklake catalog: %v", err)
+				}
+			}
+			if err := initInformationSchema(db, duckLake); err != nil {
+				t.Fatalf("Failed to init information_schema: %v", err)
+			}
+			if duckLake {
+				if _, err := db.Exec("USE ducklake"); err != nil {
+					t.Fatalf("Failed to switch to ducklake catalog: %v", err)
+				}
+			}
+			if _, err := db.Exec("CREATE TABLE users(id INTEGER)"); err != nil {
+				t.Fatalf("Failed to create test table: %v", err)
+			}
+
+			rows, err := db.Query(`DESCRIBE SELECT udt_catalog, udt_schema, udt_name FROM memory.main.information_schema_columns_compat`)
+			if err != nil {
+				t.Fatalf("DESCRIBE failed: %v", err)
+			}
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var name, typ string
+				var a, b, c, d sql.NullString
+				if err := rows.Scan(&name, &typ, &a, &b, &c, &d); err != nil {
+					t.Fatalf("scan: %v", err)
+				}
+				if typ != "VARCHAR" {
+					t.Errorf("%s type = %s, want VARCHAR", name, typ)
+				}
+			}
+
+			// The Metabase column-sync predicate must bind against a string literal.
+			var n int
+			if err := db.QueryRow(`
+				SELECT count(*) FROM memory.main.information_schema_columns_compat c
+				WHERE c.udt_schema IN ('public', 'pg_catalog') AND c.table_name = 'users'
+			`).Scan(&n); err != nil {
+				t.Fatalf("udt_schema string comparison failed: %v", err)
+			}
+		})
+	}
+}
