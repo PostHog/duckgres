@@ -54,6 +54,12 @@ func (t *LogicalCatalogTransform) Transform(tree *pg_query.ParseResult, _ *Resul
 			if n.RenameStmt != nil && t.rewriteRangeVar(n.RenameStmt.Relation) {
 				changed = true
 			}
+		case *pg_query.Node_CommentStmt:
+			if parts := commentRelationName(n.CommentStmt); len(parts) == 3 {
+				if t.rewriteQualifiedName(parts) {
+					changed = true
+				}
+			}
 		case *pg_query.Node_DropStmt:
 			if n.DropStmt != nil && t.rewriteDropObjects(n.DropStmt.Objects) {
 				changed = true
@@ -78,27 +84,44 @@ func (t *LogicalCatalogTransform) rewriteRangeVar(rv *pg_query.RangeVar) bool {
 
 func (t *LogicalCatalogTransform) rewriteDropObjects(objects []*pg_query.Node) bool {
 	changed := false
-
-	for _, obj := range objects {
-		list := obj.GetList()
-		if list == nil || len(list.Items) < 3 {
-			continue
+	for _, object := range objects {
+		if list := object.GetList(); list != nil && t.rewriteQualifiedName(list.Items) {
+			changed = true
 		}
-
-		catalog := list.Items[0].GetString_()
-		if catalog == nil || !strings.EqualFold(catalog.Sval, t.LogicalDatabaseName) {
-			continue
-		}
-
-		catalog.Sval = t.PhysicalCatalogName
-		if t.MapPublicToMain {
-			schema := list.Items[1].GetString_()
-			if schema != nil && strings.EqualFold(schema.Sval, "public") {
-				schema.Sval = "main"
-			}
-		}
-		changed = true
 	}
-
 	return changed
+}
+
+func (t *LogicalCatalogTransform) rewriteQualifiedName(parts []*pg_query.Node) bool {
+	if len(parts) < 3 {
+		return false
+	}
+	catalog := parts[0].GetString_()
+	if catalog == nil || !strings.EqualFold(catalog.Sval, t.LogicalDatabaseName) {
+		return false
+	}
+	catalog.Sval = t.PhysicalCatalogName
+	if t.MapPublicToMain {
+		schema := parts[1].GetString_()
+		if schema != nil && strings.EqualFold(schema.Sval, "public") {
+			schema.Sval = "main"
+		}
+	}
+	return true
+}
+
+func commentRelationName(stmt *pg_query.CommentStmt) []*pg_query.Node {
+	object := stmt.GetObject().GetList()
+	if object == nil {
+		return nil
+	}
+	switch stmt.GetObjtype() {
+	case pg_query.ObjectType_OBJECT_TABLE, pg_query.ObjectType_OBJECT_VIEW:
+		return object.Items
+	case pg_query.ObjectType_OBJECT_COLUMN:
+		if len(object.Items) > 0 {
+			return object.Items[:len(object.Items)-1]
+		}
+	}
+	return nil
 }
