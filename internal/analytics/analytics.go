@@ -20,7 +20,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/posthog/posthog-go"
+	"github.com/posthog/posthog-go/v2"
 )
 
 // GroupTypeOrg is the PostHog group type used to attribute events to an org.
