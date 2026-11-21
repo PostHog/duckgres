@@ -3,7 +3,7 @@ package analytics
 import (
 	"testing"
 
-	"github.com/posthog/posthog-go"
+	"github.com/posthog/posthog-go/v2"
 )
 
 // fakeEnqueuer captures enqueued messages for assertions.
