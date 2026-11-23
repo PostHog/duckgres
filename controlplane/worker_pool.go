@@ -15,10 +15,6 @@ const DefaultK8sWorkerServiceAccount = "duckgres-worker"
 // a pod that DuckDB's memory_limit can take, so the request always covers it.
 const MinWorkerMemoryRequestPercent = 75
 
-// workerMemoryRequestPercentMinBytes is the smallest worker memory limit that
-// WorkerMemoryRequestPercent applies to.
-const workerMemoryRequestPercentMinBytes = 64 << 30
-
 const DefaultWorkerSpawnRetryAfter = 45 * time.Second
 
 // WorkerCapacityExhaustedError is returned when a worker can't be acquired

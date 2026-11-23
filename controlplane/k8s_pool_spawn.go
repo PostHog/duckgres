@@ -713,6 +713,10 @@ func (p *K8sWorkerPool) workerResourcesForProfile(profile WorkerProfile) corev1.
 	return corev1.ResourceRequirements{Requests: requests, Limits: limits}
 }
 
+// workerMemoryRequestPercentMinBytes is the smallest worker memory limit that
+// WorkerMemoryRequestPercent applies to.
+const workerMemoryRequestPercentMinBytes = 64 << 30
+
 // workerMemoryRequestForLimit returns the memory request of a worker pod with
 // the given memory limit: workerMemoryRequestPercent of the limit for a large
 // worker, and the limit itself for every other worker.
