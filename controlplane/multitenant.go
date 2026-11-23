@@ -289,6 +289,7 @@ func SetupMultiTenant(
 		ServiceAccount:               cfg.K8s.ServiceAccount,
 		WorkerCPURequest:             cfg.K8s.WorkerCPURequest,
 		WorkerMemoryRequest:          cfg.K8s.WorkerMemoryRequest,
+		WorkerMemoryRequestPercent:   cfg.K8s.WorkerMemoryRequestPercent,
 		WorkerNodeSelector:           parseNodeSelector(cfg.K8s.WorkerNodeSelector),
 		WorkerTolerationKey:          cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue:        cfg.K8s.WorkerTolerationValue,

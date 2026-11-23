@@ -166,6 +166,11 @@ type K8sConfig struct {
 	WorkerPriorityClassName string // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
 	AWSRegion               string // AWS region for STS client
 
+	// WorkerMemoryRequestPercent sets the memory request of large worker pods as
+	// a percent of their memory limit (env-only
+	// DUCKGRES_K8S_WORKER_MEMORY_REQUEST_PERCENT). 0 or 100 = equal to the limit.
+	WorkerMemoryRequestPercent int
+
 	// Reshard runner pod shape (env-only DUCKGRES_RESHARD_POD_CPU /
 	// DUCKGRES_RESHARD_POD_MEMORY; requests=limits, Guaranteed QoS). Empty =
 	// built-in defaults (2 CPU / 8Gi). Reshard ops run in dedicated per-op

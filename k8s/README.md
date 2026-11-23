@@ -75,6 +75,7 @@ Key flags for Kubernetes multitenant mode:
 | `--k8s-worker-configmap` | `DUCKGRES_K8S_WORKER_CONFIGMAP` | ConfigMap name for worker config |
 | - | `DUCKGRES_K8S_WORKER_CPU_REQUEST` | Default worker pod CPU request/limit. Local manifests set `500m`; production should override for workload needs. |
 | - | `DUCKGRES_K8S_WORKER_MEMORY_REQUEST` | Default worker pod memory request/limit. Local manifests set `512Mi`; production should override for workload needs. |
+| - | `DUCKGRES_K8S_WORKER_MEMORY_REQUEST_PERCENT` | Memory request of worker pods of 64Gi or more, as a percent (75-100) of their memory limit. Unset = 100 (Guaranteed QoS). A lower value packs large workers closer together; the limit and DuckDB's `memory_limit` do not change. |
 
 The worker Secret setting is a base name for per-worker RPC Secrets. Each worker pod gets its own derived Secret containing its RPC bearer token and TLS material. If the derived Secret does not exist, the control plane creates it before spawning the pod.
 

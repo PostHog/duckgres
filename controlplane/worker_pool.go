@@ -9,6 +9,16 @@ import (
 )
 
 const DefaultK8sWorkerServiceAccount = "duckgres-worker"
+
+// MinWorkerMemoryRequestPercent is the lowest accepted memory request of a
+// worker pod, as a percent of its memory limit. It equals the largest share of
+// a pod that DuckDB's memory_limit can take, so the request always covers it.
+const MinWorkerMemoryRequestPercent = 75
+
+// workerMemoryRequestPercentMinBytes is the smallest worker memory limit that
+// WorkerMemoryRequestPercent applies to.
+const workerMemoryRequestPercentMinBytes = 64 << 30
+
 const DefaultWorkerSpawnRetryAfter = 45 * time.Second
 
 // WorkerCapacityExhaustedError is returned when a worker can't be acquired
@@ -120,6 +130,7 @@ type K8sWorkerPoolConfig struct {
 	ServiceAccount               string                                       // ServiceAccount name for worker pods (default: "duckgres-worker")
 	WorkerCPURequest             string                                       // CPU request for worker pods (e.g., "500m"). Empty = BestEffort.
 	WorkerMemoryRequest          string                                       // Memory request for worker pods (e.g., "1Gi"). Empty = BestEffort.
+	WorkerMemoryRequestPercent   int                                          // Memory request of large worker pods as a percent of the memory limit. 0 or 100 = equal to the limit.
 	WorkerNodeSelector           map[string]string                            // Node selector for worker pods. Nil = no selector.
 	WorkerTolerationKey          string                                       // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
 	WorkerTolerationValue        string                                       // Taint value for worker pod NoSchedule toleration.

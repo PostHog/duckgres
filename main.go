@@ -408,6 +408,7 @@ func main() {
 				ServiceAccount:               resolved.K8sWorkerServiceAccount,
 				WorkerCPURequest:             resolved.K8sWorkerCPURequest,
 				WorkerMemoryRequest:          resolved.K8sWorkerMemoryRequest,
+				WorkerMemoryRequestPercent:   resolved.K8sWorkerMemoryRequestPercent,
 				WorkerNodeSelector:           resolved.K8sWorkerNodeSelector,
 				WorkerTolerationKey:          resolved.K8sWorkerTolerationKey,
 				WorkerTolerationValue:        resolved.K8sWorkerTolerationValue,

@@ -149,7 +149,7 @@ only) it:
   spawn-storm bug's placeholder cost. Fleet size is only the CEILING, never
   the target — an idle-worker leak cannot pull the placeholder count up (the
   amplification failure of the retired demand-proportional mode);
-- slot SIZE = the componentwise max worker shape spawned in the last 7 days,
+- slot SIZE = the componentwise max of the worker requests spawned in the last 7 days,
   falling back to the live fleet's max shape, then to the pool's
   configured/default worker request (fresh empty cluster). Client-sized (GUC)
   workers can exceed any configured maximum, so sizing from observed spawns is

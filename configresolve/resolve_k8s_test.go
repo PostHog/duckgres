@@ -94,6 +94,37 @@ func TestResolveEffectiveRejectsInvalidClientIdleTimeoutMax(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveK8sWorkerMemoryRequestPercent(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  int
+		warns int
+	}{
+		{"", 0, 0},
+		{"75", 75, 0},
+		{"100", 100, 0},
+		{"74", 0, 1},
+		{"101", 0, 1},
+		{"75%", 0, 1},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			var warned []string
+			resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
+				if key == "DUCKGRES_K8S_WORKER_MEMORY_REQUEST_PERCENT" {
+					return tc.value
+				}
+				return ""
+			}, func(msg string) { warned = append(warned, msg) })
+			if resolved.K8sWorkerMemoryRequestPercent != tc.want {
+				t.Fatalf("K8sWorkerMemoryRequestPercent = %d, want %d", resolved.K8sWorkerMemoryRequestPercent, tc.want)
+			}
+			if len(warned) != tc.warns {
+				t.Fatalf("warnings = %v, want %d", warned, tc.warns)
+			}
+		})
+	}
+}
+
 func TestResolveEffectiveParsesK8sWorkerDefaultTTL(t *testing.T) {
 	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
 		if key == "DUCKGRES_K8S_WORKER_DEFAULT_TTL" {

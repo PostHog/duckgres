@@ -193,6 +193,27 @@ func TestReconcileHeadroomFreshClusterFallsBackToDefaultShape(t *testing.T) {
 	}
 }
 
+// The configured fallback shape reserves what a real worker of that shape
+// requests, so it follows the lowered memory request of a large worker.
+func TestReconcileHeadroomFallbackUsesWorkerMemoryRequest(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	emulateGenerateName(cs)
+	p := newHeadroomPool(cs, &fakeSpawnLogStore{})
+	p.workerCPURequest = "15"
+	p.workerMemoryRequest = "120Gi"
+	p.workerMemoryRequestPercent = 75
+
+	p.reconcileHeadroom(context.Background())
+
+	pods := listHeadroomPods(t, cs)
+	if len(pods) != 1 {
+		t.Fatalf("expected 1 placeholder, got %d", len(pods))
+	}
+	if got := pods[0].Spec.Containers[0].Resources.Requests.Memory().Value(); got != 90<<30 {
+		t.Fatalf("placeholder memory request = %d, want 90Gi", got)
+	}
+}
+
 // The fleet-relative cap bounds a spawn storm: peak burst 50 with 20 live
 // workers is capped at ceil(25% × 20) = 5 — fleet size is the CEILING, never
 // the target, so a big fleet alone (peak 0) still gets only the floor.

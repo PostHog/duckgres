@@ -75,6 +75,9 @@ type K8sWorkerPool struct {
 	workerTolerationValue   string            // taint value for NoSchedule toleration
 	workerPriorityClassName string            // PriorityClass for worker pods (preempts overprovision pause pods)
 
+	// Memory request of large workers as a percent of the limit; 0 = equal to the limit.
+	workerMemoryRequestPercent int
+
 	// Headroom controller holds preemptible low-priority placeholder pods so a
 	// worker spawn schedules immediately (preempting a placeholder) instead of
 	// waiting on a fresh Karpenter node. Slot count and size are derived
@@ -202,6 +205,7 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerTolerationValue:   cfg.WorkerTolerationValue,
 		workerPriorityClassName: cfg.WorkerPriorityClassName,
 
+		workerMemoryRequestPercent:   cfg.WorkerMemoryRequestPercent,
 		placeholderImage:             cfg.PlaceholderImage,
 		placeholderPriorityClassName: cfg.PlaceholderPriorityClassName,
 

@@ -105,6 +105,7 @@ type Resolved struct {
 	K8sWorkerServiceAccount         string
 	K8sWorkerCPURequest             string
 	K8sWorkerMemoryRequest          string
+	K8sWorkerMemoryRequestPercent   int
 	K8sWorkerNodeSelector           string
 	K8sWorkerTolerationKey          string
 	K8sWorkerTolerationValue        string
@@ -208,6 +209,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
 	k8sWorkerServiceAccount := controlplane.DefaultK8sWorkerServiceAccount
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
+	var k8sWorkerMemoryRequestPercent int
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
 	var k8sReshardPodCPU, k8sReshardPodMemory string
 	var k8sExploratoryTierEnabled bool
@@ -807,6 +809,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST"); v != "" {
 		k8sWorkerMemoryRequest = v
 	}
+	if v := getenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST_PERCENT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= controlplane.MinWorkerMemoryRequestPercent && n <= 100 {
+			k8sWorkerMemoryRequestPercent = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_MEMORY_REQUEST_PERCENT (want " + strconv.Itoa(controlplane.MinWorkerMemoryRequestPercent) + "-100): " + v)
+		}
+	}
 	if v := getenv("DUCKGRES_K8S_WORKER_NODE_SELECTOR"); v != "" {
 		k8sWorkerNodeSelector = v
 	}
@@ -1196,6 +1205,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerServiceAccount:         k8sWorkerServiceAccount,
 		K8sWorkerCPURequest:             k8sWorkerCPURequest,
 		K8sWorkerMemoryRequest:          k8sWorkerMemoryRequest,
+		K8sWorkerMemoryRequestPercent:   k8sWorkerMemoryRequestPercent,
 		K8sWorkerNodeSelector:           k8sWorkerNodeSelector,
 		K8sWorkerTolerationKey:          k8sWorkerTolerationKey,
 		K8sWorkerTolerationValue:        k8sWorkerTolerationValue,

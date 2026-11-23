@@ -287,7 +287,8 @@ func (p *K8sWorkerPool) headroomTarget(ctx context.Context) (headroomPlan, bool)
 			slog.Warn("Headroom: invalid default worker memory for placeholder sizing.", "value", p.workerMemoryRequest, "error", err)
 			return headroomPlan{}, false
 		}
-		memBytes = q.Value()
+		req := p.workerMemoryRequestForLimit(q)
+		memBytes = req.Value()
 	}
 	plan.cpu = *resource.NewMilliQuantity(cpuMillis, resource.DecimalSI)
 	plan.mem = *resource.NewQuantity(memBytes, resource.BinarySI)

@@ -533,8 +533,8 @@ func (p *K8sWorkerPool) spawnReservedWorkerForSlot(ctx context.Context, id int, 
 
 // workerResources returns resource requests and limits for a worker pod.
 // Set via DUCKGRES_K8S_WORKER_CPU_REQUEST / DUCKGRES_K8S_WORKER_MEMORY_REQUEST.
-// Returns empty (BestEffort) if neither is set.
-// When set, limits are equal to requests (Guaranteed QoS).
+// Limits are equal to requests (Guaranteed QoS), except for the memory request
+// of a large worker when workerMemoryRequestPercent is below 100.
 func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 	return p.workerResourcesForProfile(WorkerProfile{})
 }
@@ -650,11 +650,12 @@ func (p *K8sWorkerPool) workerPodEnv(secretName string, workerResources corev1.R
 }
 
 // workerMemoryHygieneEnv derives the memory/thread env vars for a worker pod
-// from its resolved resource requests. See the call site comment in
-// spawnWorker for why these must be set before any session exists.
+// from its resolved resources. Memory comes from the limit (the pod cgroup):
+// the request can be lower, see workerMemoryRequestPercent. See the call site
+// comment in spawnWorker for why these must be set before any session exists.
 func workerMemoryHygieneEnv(res corev1.ResourceRequirements) []corev1.EnvVar {
 	var env []corev1.EnvVar
-	if mem, ok := res.Requests[corev1.ResourceMemory]; ok {
+	if mem, ok := res.Limits[corev1.ResourceMemory]; ok {
 		memBytes := uint64(mem.Value())
 		if lim := duckdbMemoryLimitForPodMemory(memBytes); lim != "" {
 			env = append(env, corev1.EnvVar{Name: "DUCKGRES_MEMORY_LIMIT", Value: lim})
@@ -674,9 +675,10 @@ func workerMemoryHygieneEnv(res corev1.ResourceRequirements) []corev1.EnvVar {
 // workerResourcesForProfile builds the pod resource requirements for a worker of
 // the given profile: the profile's CPU/Memory when set, otherwise the pool-global
 // request (today's behavior). Requests are mirrored to Limits so the pod is
-// Guaranteed QoS — required before bin-packing colocated workers. A colocated
-// profile always carries non-empty CPU/Memory (resolver-enforced), so it never
-// degrades to BestEffort.
+// Guaranteed QoS — required before bin-packing colocated workers. The one
+// exception is the memory request of a large worker, which
+// workerMemoryRequestPercent can lower. A colocated profile always carries
+// non-empty CPU/Memory (resolver-enforced), so it never degrades to BestEffort.
 func (p *K8sWorkerPool) workerResourcesForProfile(profile WorkerProfile) corev1.ResourceRequirements {
 	// Workers must never be BestEffort: with no pod anti-affinity, resource
 	// requests are the ONLY thing keeping two workers from overcommitting a
@@ -706,5 +708,23 @@ func (p *K8sWorkerPool) workerResourcesForProfile(profile WorkerProfile) corev1.
 	for k, v := range requests {
 		limits[k] = v.DeepCopy()
 	}
+	memLimit := limits[corev1.ResourceMemory]
+	requests[corev1.ResourceMemory] = p.workerMemoryRequestForLimit(memLimit)
 	return corev1.ResourceRequirements{Requests: requests, Limits: limits}
+}
+
+// workerMemoryRequestForLimit returns the memory request of a worker pod with
+// the given memory limit: workerMemoryRequestPercent of the limit for a large
+// worker, and the limit itself for every other worker.
+//
+// DuckDB's memory_limit is at most 75% of the pod (workerMemoryHeadroomBytes),
+// so a request of at least MinWorkerMemoryRequestPercent still reserves all of
+// it. Only the headroom above memory_limit is shared between the workers of a
+// node. Small workers are excluded: they use most of their headroom.
+func (p *K8sWorkerPool) workerMemoryRequestForLimit(limit resource.Quantity) resource.Quantity {
+	pct := int64(p.workerMemoryRequestPercent)
+	if pct < MinWorkerMemoryRequestPercent || pct >= 100 || limit.Value() < workerMemoryRequestPercentMinBytes {
+		return limit.DeepCopy()
+	}
+	return *resource.NewQuantity(limit.Value()*pct/100, resource.BinarySI)
 }

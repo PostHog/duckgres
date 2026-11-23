@@ -3356,6 +3356,54 @@ func TestWorkerResources_NeitherSet(t *testing.T) {
 	}
 }
 
+// A lowered memory request applies to large workers only. Their limit and their
+// CPU stay as they are, and every other worker keeps Guaranteed QoS.
+func TestWorkerResources_MemoryRequestPercent(t *testing.T) {
+	cases := []struct {
+		name    string
+		percent int
+		memory  string
+		want    string
+	}{
+		{"unset keeps request equal to limit", 0, "360Gi", "360Gi"},
+		{"100 keeps request equal to limit", 100, "360Gi", "360Gi"},
+		{"below the minimum is ignored", 50, "360Gi", "360Gi"},
+		{"75 percent of a large worker", 75, "360Gi", "270Gi"},
+		{"75 percent of the pool default", 75, "120Gi", "90Gi"},
+		{"smallest large worker", 75, "64Gi", "48Gi"},
+		{"small worker keeps request equal to limit", 75, "32Gi", "32Gi"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := &K8sWorkerPool{workerMemoryRequestPercent: tc.percent}
+			res := pool.workerResourcesForProfile(WorkerProfile{CPU: "32", Memory: tc.memory})
+			if got, want := res.Requests.Memory().Value(), resource.MustParse(tc.want); got != want.Value() {
+				t.Fatalf("memory request = %d, want %s", got, tc.want)
+			}
+			if got, want := res.Limits.Memory().Value(), resource.MustParse(tc.memory); got != want.Value() {
+				t.Fatalf("memory limit = %d, want %s", got, tc.memory)
+			}
+			if req, lim := res.Requests.Cpu(), res.Limits.Cpu(); req.Cmp(*lim) != 0 || req.String() != "32" {
+				t.Fatalf("cpu request/limit = %s/%s, want 32/32", req, lim)
+			}
+		})
+	}
+}
+
+// The request must always cover DuckDB's memory_limit. Only the headroom above
+// it can be shared between the workers of a node.
+func TestWorkerMemoryRequestCoversDuckDBMemoryLimit(t *testing.T) {
+	pool := &K8sWorkerPool{workerMemoryRequestPercent: MinWorkerMemoryRequestPercent}
+	for gib := int64(1); gib <= 512; gib++ {
+		limit := *resource.NewQuantity(gib<<30, resource.BinarySI)
+		req := pool.workerMemoryRequestForLimit(limit)
+		duckDB := uint64(limit.Value()) - workerMemoryHeadroomBytes(uint64(limit.Value()))
+		if uint64(req.Value()) < duckDB {
+			t.Fatalf("%dGi worker: request %d is below the DuckDB memory_limit %d", gib, req.Value(), duckDB)
+		}
+	}
+}
+
 func TestSetWorkerResources(t *testing.T) {
 	pool := &K8sWorkerPool{
 		workerCPURequest:    "500m",
@@ -4557,7 +4605,12 @@ func TestWorkerMemoryHygieneEnv(t *testing.T) {
 		if mem != "" {
 			req[corev1.ResourceMemory] = resource.MustParse(mem)
 		}
-		return corev1.ResourceRequirements{Requests: req}
+		return corev1.ResourceRequirements{Requests: req, Limits: req}
+	}
+	lowRequest := mk("32", "360Gi")
+	lowRequest.Requests = corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("32"),
+		corev1.ResourceMemory: resource.MustParse("270Gi"),
 	}
 	cases := []struct {
 		name     string
@@ -4576,6 +4629,9 @@ func TestWorkerMemoryHygieneEnv(t *testing.T) {
 		// "4GB" here would turn the 40% reserve into 50%.
 		{"fractional-GiB budget is not truncated to whole GB", mk("4", "8Gi"), map[string]string{
 			"DUCKGRES_MEMORY_LIMIT": "4915MB", "GOMEMLIMIT": "1024MiB", "DUCKGRES_THREADS": "10"}},
+		// Memory sizing follows the limit (the pod cgroup), not a lowered request.
+		{"request below limit", lowRequest, map[string]string{
+			"DUCKGRES_MEMORY_LIMIT": "270GB", "GOMEMLIMIT": "46080MiB", "DUCKGRES_THREADS": "80"}},
 		{"no requests -> no env", corev1.ResourceRequirements{}, map[string]string{}},
 	}
 	for _, tc := range cases {
