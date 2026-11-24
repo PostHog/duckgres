@@ -107,7 +107,7 @@ Operational guidance: allow the import to complete, then manually deduplicate af
 | SCHEMA (create/drop/cascade) | ✅ | `ddl_test.go::TestDDLSchemas` | |
 | SEQUENCE / SERIAL / nextval/currval | ⛔ | `catalog_test.go::TestCatalogPgGetSerialSequence` | `pg_get_serial_sequence` returns NULL — not supported |
 | TYPE / ENUM / DOMAIN / composite | ❌ | — | Unmapped DuckDB ENUM/STRUCT/etc. fall back to OidText |
-| COMMENT ON table/column | ✅ | `ddl_test.go::TestDDLComment` | |
+| COMMENT ON table/column/view | ✅ | `ddl_test.go::TestDDLComment`; transpiler qualified-target tests | Persists in DuckLake; table/column readback, committed updates, and clearing are asserted |
 | Partitioning / inheritance | ⛔ | — | `pg_partitioned_table`, `pg_inherits` are empty stubs |
 
 ---

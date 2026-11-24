@@ -294,3 +294,44 @@ func TestQueryAccessPolicyNilIsUnrestricted(t *testing.T) {
 		t.Fatalf("nil policy should be unrestricted: %v", err)
 	}
 }
+
+func TestQueryAccessPolicyComments(t *testing.T) {
+	allowed := []string{
+		"COMMENT ON TABLE team_42.events IS 'snapshot'",
+		"COMMENT ON TABLE ducklake.team_42.events IS NULL",
+		"COMMENT ON VIEW shadow_42_models.revenue IS 'model'",
+		"COMMENT ON COLUMN team_42.events.event IS 'event name'",
+		"COMMENT ON COLUMN ducklake.team_42.events.event IS NULL",
+		"COMMENT ON TABLE posthog.events_prod IS 'snapshot'",
+	}
+	writer := projectUserPolicy()
+	reader := projectUserPolicy()
+	reader.ReadOnly = true
+	for _, query := range allowed {
+		if err := writer.Authorize(query); err != nil {
+			t.Errorf("writer Authorize(%q): %v", query, err)
+		}
+		if err := reader.Authorize(query); err == nil {
+			t.Errorf("reader Authorize(%q) succeeded", query)
+		}
+	}
+	denied := []string{
+		"COMMENT ON TABLE team_7.events IS 'snapshot'",
+		"COMMENT ON COLUMN ducklake.team_7.events.event IS 'event name'",
+		"COMMENT ON TABLE memory.team_42.events IS 'snapshot'",
+		"COMMENT ON TABLE events IS 'snapshot'",
+		"COMMENT ON COLUMN events.event IS 'event name'",
+		"COMMENT ON TABLE posthog.persons_prod IS 'snapshot'",
+		"COMMENT ON TABLE pg_catalog.pg_class IS 'catalog'",
+		"COMMENT ON TABLE information_schema.tables IS 'catalog'",
+		"COMMENT ON SCHEMA team_42 IS 'schema'",
+		"COMMENT ON DATABASE ducklake IS 'database'",
+		"COMMENT ON SEQUENCE team_42.event_ids IS 'sequence'",
+		"COMMENT ON TABLE team_42.events IS 'snapshot'; COMMENT ON TABLE team_7.events IS 'snapshot'",
+	}
+	for _, query := range denied {
+		if err := writer.Authorize(query); err == nil {
+			t.Errorf("writer Authorize(%q) succeeded", query)
+		}
+	}
+}

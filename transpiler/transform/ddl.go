@@ -113,6 +113,10 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 			}
 
 		case *pg_query.Node_CommentStmt:
+			switch n.CommentStmt.GetObjtype() {
+			case pg_query.ObjectType_OBJECT_TABLE, pg_query.ObjectType_OBJECT_COLUMN, pg_query.ObjectType_OBJECT_VIEW:
+				continue
+			}
 			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "COMMENT"
