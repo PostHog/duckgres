@@ -1,14 +1,14 @@
 # Build the admin console SPA (controlplane/admin/ui) so the kubernetes build
 # embeds a FRESH dist/ via //go:embed all:ui/dist, overwriting the committed
 # bundle. Runs before the Go build.
-FROM node:24-bookworm-slim AS uibuilder
+FROM node:24-bookworm-slim@sha256:873f586f3794f52281bd039bf02c048a0be08fde619338f9941bad1eb6b34530 AS uibuilder
 WORKDIR /ui
 COPY controlplane/admin/ui/package.json controlplane/admin/ui/package-lock.json ./
 RUN npm ci
 COPY controlplane/admin/ui/ ./
 RUN npm run build
 
-FROM golang:1.27-bookworm AS builder
+FROM golang:1.27-bookworm@sha256:ce59b41415e2524ae99926fe1f37ce48ba8c194dcbd2a56a65436cdcefa2bd34 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
 
@@ -75,7 +75,7 @@ RUN CGO_ENABLED=1 \
       ./duckdbservice
 RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
 
-FROM chainguard/wolfi-base:latest
+FROM chainguard/wolfi-base:latest@sha256:5172a213d2bba8b1c9ca11957db65562b52b0f9844583a0347318ea5fd8e3aa5
 
 # postgresql-18-client provides pg_dump/pg_restore, used by the control-plane
 # reshard runner's pre-flip catalog backup (docs/design/resharding.md). Pinned
