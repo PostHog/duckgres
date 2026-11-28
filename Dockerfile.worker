@@ -8,7 +8,7 @@
 # surface is the all-in-one duckgres binary (or the CP-only binary in
 # cmd/duckgres-controlplane), which routes queries to whichever worker
 # image the per-tenant `image` config-store column points at.
-FROM golang:1.27-bookworm AS builder
+FROM golang:1.27-bookworm@sha256:ce59b41415e2524ae99926fe1f37ce48ba8c194dcbd2a56a65436cdcefa2bd34 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
 
@@ -159,7 +159,7 @@ RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
       echo "Verified: duckgres-worker linked against duckdb-go-bindings@$embedded" ; \
     fi
 
-FROM chainguard/wolfi-base:latest
+FROM chainguard/wolfi-base:latest@sha256:5172a213d2bba8b1c9ca11957db65562b52b0f9844583a0347318ea5fd8e3aa5
 
 # libstdc++ is the C++ runtime the CGO-linked DuckDB engine needs — present
 # implicitly on debian-slim, but not in wolfi-base.
